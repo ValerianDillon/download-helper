@@ -19,7 +19,7 @@ tsconfig.json
 
 - `package.json` の `files` で `download-helper.js` と `download-helper.ts` を配布対象に指定
 - `download-helper.js` はgit管理対象。ビルド後に差分があればコミットすること
-- npm パッケージとしてではなく `github:ValerianDillon/download-helper#release/X.X.X` で参照される
+- npm パッケージとしてではなく `github:ValerianDillon/download-helper#vX.X.X` (git tag) で参照される
 
 ## 技術スタック
 
@@ -49,5 +49,11 @@ tsconfig.json
 
 ## Git運用
 
-- リリースは `release/X.X.X` ブランチで管理
 - コミットの author/committer は ValerianDillon であること
+
+## リリース手順
+
+1. `package.json` の `version` を更新
+2. `npm run build`
+3. コミット・push
+4. `git tag vX.X.X && git push origin vX.X.X`
