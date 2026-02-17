@@ -283,10 +283,11 @@ export class FileObject {
     return this.fileObj.url;
   }
   equals(obj) {
-    if (typeof obj != "object") {
+    if (typeof obj !== "object" || obj === null) {
       return false;
     }
-    return obj.name === this.fileObj.name && obj.url === this.fileObj.url;
+    const candidate = obj;
+    return candidate.name === this.fileObj.name && candidate.url === this.fileObj.url;
   }
 }
 
@@ -480,70 +481,77 @@ export class DownloadHelper {
     await pump();
   }
   isDownloadJsonObj(target) {
+    if (typeof target !== "object" || target === null) {
+      console.error("ダウンロード用オブジェクトの型が不正(対象がobjectでない)", target);
+      return false;
+    }
+    const t = target;
     switch (true) {
-      case typeof target !== "object":
-        console.error("ダウンロード用オブジェクトの型が不正(対象がobjectでない)", target);
+      case typeof t.postCount !== "number":
+        console.error("ダウンロード用オブジェクトの型が不正(postCountが数値でない)", t.postCount);
         return false;
-      case typeof target.postCount !== "number":
-        console.error("ダウンロード用オブジェクトの型が不正(postCountが数値でない)", target.postCount);
+      case typeof t.fileCount !== "number":
+        console.error("ダウンロード用オブジェクトの型が不正(fileCountが数値でない)", t.fileCount);
         return false;
-      case typeof target.fileCount !== "number":
-        console.error("ダウンロード用オブジェクトの型が不正(fileCountが数値でない)", target.fileCount);
+      case typeof t.id !== "string":
+        console.error("ダウンロード用オブジェクトの型が不正(idが文字列でない)", t.id);
         return false;
-      case typeof target.id !== "string":
-        console.error("ダウンロード用オブジェクトの型が不正(idが文字列でない)", target.id);
+      case typeof t.url !== "string":
+        console.error("ダウンロード用オブジェクトの型が不正(urlが文字列でない)", t.url);
         return false;
-      case typeof target.url !== "string":
-        console.error("ダウンロード用オブジェクトの型が不正(urlが文字列でない)", target.url);
+      case !Array.isArray(t.posts):
+        console.error("ダウンロード用オブジェクトの型が不正(postsが配列でない)", t.posts);
         return false;
-      case !Array.isArray(target.posts):
-        console.error("ダウンロード用オブジェクトの型が不正(postsが配列でない)", target.posts);
-        return false;
-      case !Array.isArray(target.tags):
-        console.error("ダウンロード用オブジェクトの型が不正(tagsが配列でない)", target.tags);
+      case !Array.isArray(t.tags):
+        console.error("ダウンロード用オブジェクトの型が不正(tagsが配列でない)", t.tags);
         return false;
     }
-    return !target.posts.some((it) => {
+    return !t.posts.some((it) => {
+      if (typeof it !== "object" || it === null) {
+        console.error("ダウンロード用オブジェクトの型が不正(postsの値にobjectでないものが含まれる)", it, t.posts);
+        return true;
+      }
+      const p = it;
       switch (true) {
-        case typeof it !== "object":
-          console.error("ダウンロード用オブジェクトの型が不正(postsの値にobjectでないものが含まれる)", it, target.posts);
+        case typeof p.informationText !== "string":
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にinformationTextが文字列でないものが含まれる)", p.informationText, t.posts);
           return true;
-        case typeof it.informationText !== "string":
-          console.error("ダウンロード用オブジェクトの型が不正(postsの値にinformationTextが文字列でないものが含まれる)", it.informationText, target.posts);
+        case typeof p.htmlText !== "string":
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にhtmlTextが文字列でないものが含まれる)", p.htmlText, t.posts);
           return true;
-        case typeof it.htmlText !== "string":
-          console.error("ダウンロード用オブジェクトの型が不正(postsの値にhtmlTextが文字列でないものが含まれる)", it.htmlText, target.posts);
+        case !Array.isArray(p.files):
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にfilesが配列でないものが含まれる)", p.files, t.posts);
           return true;
-        case !Array.isArray(it.files):
-          console.error("ダウンロード用オブジェクトの型が不正(postsの値にfilesが配列でないものが含まれる)", it.files, target.posts);
+        case !Array.isArray(p.tags):
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にtagsが配列でないものが含まれる)", p.tags, t.posts);
           return true;
-        case !Array.isArray(it.tags):
-          console.error("ダウンロード用オブジェクトの型が不正(postsの値にtagsが配列でないものが含まれる)", it.tags, target.posts);
-          return true;
-        case it.files.some((f) => {
+        case p.files.some((f) => {
+          if (typeof f !== "object" || f === null) {
+            console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にオブジェクトでないものが含まれる)", f, p.files);
+            return true;
+          }
+          const fo = f;
+          const cover = p.cover;
           switch (true) {
-            case typeof f !== "object":
-              console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にオブジェクトでないものが含まれる)", f, it.files);
+            case typeof fo.url !== "string":
+              console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にurlが文字列でないものが含まれる)", fo.url, p.files);
               return true;
-            case typeof f.url !== "string":
-              console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にurlが文字列でないものが含まれる)", f.url, it.files);
+            case typeof fo.originalName !== "string":
+              console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にoriginalNameが文字列でないものが含まれる)", fo.originalName, p.files);
               return true;
-            case typeof f.originalName !== "string":
-              console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にoriginalNameが文字列でないものが含まれる)", f.originalName, it.files);
+            case typeof fo.encodedName !== "string":
+              console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にencodedNameが文字列でないものが含まれる)", fo.encodedName, p.files);
               return true;
-            case typeof f.encodedName !== "string":
-              console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にencodedNameが文字列でないものが含まれる)", f.encodedName, it.files);
-              return true;
-            case it.cover === undefined:
+            case cover === undefined:
               return false;
-            case typeof it.cover !== "object":
-              console.error("ダウンロード用オブジェクトの型が不正(postsの値にcoverがobjectでないものが含まれる)", it.cover, target.posts);
+            case typeof cover !== "object":
+              console.error("ダウンロード用オブジェクトの型が不正(postsの値にcoverがobjectでないものが含まれる)", cover, t.posts);
               return true;
-            case typeof it.cover?.url !== "string":
-              console.error("ダウンロード用オブジェクトの型が不正(postsのcoverの値にurlが文字列でないものが含まれる)", it.cover?.url, it.cover);
+            case typeof cover?.url !== "string":
+              console.error("ダウンロード用オブジェクトの型が不正(postsのcoverの値にurlが文字列でないものが含まれる)", cover?.url, cover);
               return true;
-            case typeof it.cover?.name !== "string":
-              console.error("ダウンロード用オブジェクトの型が不正(postsのcoverの値にnameが文字列でないものが含まれる)", it.cover?.name, it.cover);
+            case typeof cover?.name !== "string":
+              console.error("ダウンロード用オブジェクトの型が不正(postsのcoverの値にnameが文字列でないものが含まれる)", cover?.name, cover);
               return true;
             default:
               return false;
