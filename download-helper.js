@@ -16,7 +16,14 @@ export class DownloadUtils {
     request.open("GET", url, false);
     request.withCredentials = true;
     request.send(null);
-    return JSON.parse(request.responseText);
+    if (request.status < 200 || request.status >= 300) {
+      throw new Error(`HTTP ${request.status}: ${url}`);
+    }
+    try {
+      return JSON.parse(request.responseText);
+    } catch {
+      throw new Error(`JSON parse error: ${url}`);
+    }
   }
   encodeFileName(name) {
     return name.replace(/\//g, "／").replace(/\\/g, "＼").replace(/,/g, "，").replace(/:/g, "：").replace(/\*/g, "＊").replace(/"/g, "“").replace(/</g, "＜").replace(/>/g, "＞").replace(/\|/g, "｜").trim();
@@ -64,7 +71,7 @@ export class DownloadUtils {
     }
   }
   async embedScript(url, integrity) {
-    return new Promise((resolve, reject) => {
+    const scriptPromise = new Promise((resolve, reject) => {
       const script = document.createElement("script");
       script.src = url;
       if (integrity) {
@@ -75,6 +82,8 @@ export class DownloadUtils {
       script.onerror = (e) => reject(e);
       document.head.appendChild(script);
     });
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error(`Script load timeout: ${url}`)), 30000));
+    return Promise.race([scriptPromise, timeout]);
   }
 }
 
@@ -179,10 +188,11 @@ export class PostObject {
     }
   }
   getAudioLinkTag(fileObject) {
-    const filePath = this.getCurrentFilePath(fileObject);
-    return `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}"><div class="post card">
+    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
+    return `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">
 ` + `<div class="card-header">${this.utils.escapeHtml(fileObject.getOriginalName())}</div>
-` + `<audio class="card-img-top" src="${filePath}" controls/>
+` + `<audio class="card-img-top" src="${escapedPath}" controls/>
 </div></a>`;
   }
   getLinkTag(url, title) {
@@ -193,23 +203,26 @@ export class PostObject {
 ` + `</svg> ${this.utils.escapeHtml(title)}</p></div></a>`;
   }
   getFileLinkTag(fileObject) {
-    const filePath = this.getCurrentFilePath(fileObject);
-    return `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}">` + `<div class="post card text-center"><p class="pt-2">
+    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
+    return `<a class="hl" href="${escapedPath}" download="${escapedDownload}">` + `<div class="post card text-center"><p class="pt-2">
 ` + `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-download" viewBox="0 0 16 16">
 ` + `<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>
 ` + `<path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/>
 ` + `</svg> ${this.utils.escapeHtml(fileObject.getOriginalName() + fileObject.getOriginalExtension())}</p></div></a>`;
   }
   getImageLinkTag(fileObject) {
-    const filePath = this.getCurrentFilePath(fileObject);
-    return `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}"><div class="post card">
-` + `<img class="card-img-top" src="${filePath}" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>
+    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
+    return `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">
+` + `<img class="card-img-top" src="${escapedPath}" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>
 </div></a>`;
   }
   getVideoLinkTag(fileObject) {
-    const filePath = this.getCurrentFilePath(fileObject);
-    return `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}"><div class="post card">
-` + `<video class="card-img-top" src="${filePath}" controls/>
+    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
+    return `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">
+` + `<video class="card-img-top" src="${escapedPath}" controls/>
 </div></a>`;
   }
   getCurrentFilePath(fileObject) {
@@ -304,12 +317,12 @@ export class DownloadHelper {
     this.utils = utils;
   }
   bootCSS = {
-    href: "https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/css/bootstrap.min.css",
-    integrity: "sha384-giJF6kkoqNQ00vy+HMDP7azOuL0xtbfIcaT9wjKHr8RbDVddVHyTfAAsrekwKmP1"
+    href: "https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css",
+    integrity: "sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB"
   };
   bootJS = {
-    src: "https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/js/bootstrap.bundle.min.js",
-    integrity: "sha384-ygbV9kiqUc6oa4msXn9868pTtWMgiQaeYH7/t7LECLbyPA2x65Kgf80OJFdroafW"
+    src: "https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js",
+    integrity: "sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI"
   };
   polyfillJS = {
     src: "https://cdn.jsdelivr.net/npm/web-streams-polyfill@2.0.2/dist/ponyfill.min.js",
@@ -350,28 +363,25 @@ export class DownloadHelper {
     input.className = "form-control";
     input.placeholder = "ここにJSONを貼り付け";
     inputDiv.appendChild(input);
-    const buttonDiv = document.createElement("div");
-    buttonDiv.className = "input-group-append";
     const button = document.createElement("button");
     button.className = "btn btn-outline-secondary btn-labeled";
     button.type = "button";
     button.innerText = "Download";
-    buttonDiv.appendChild(button);
-    inputDiv.appendChild(buttonDiv);
+    inputDiv.appendChild(button);
     bodyDiv.appendChild(inputDiv);
     const progressDiv = document.createElement("div");
     progressDiv.className = "progress mb-3";
     progressDiv.style.width = "400px";
     const progress = document.createElement("div");
     progress.className = "progress-bar";
-    progress["role"] = "progressbar";
-    progress["aria-valuemin"] = "0";
-    progress["aria-valuemax"] = "100";
-    progress["aria-valuenow"] = "0";
     progress.style.width = "0%";
     progress.innerText = "0%";
+    progressDiv.setAttribute("role", "progressbar");
+    progressDiv.setAttribute("aria-valuemin", "0");
+    progressDiv.setAttribute("aria-valuemax", "100");
+    progressDiv.setAttribute("aria-valuenow", "0");
     const setProgress = (n) => {
-      progress["aria-valuenow"] = `${n}`;
+      progressDiv.setAttribute("aria-valuenow", `${n}`);
       progress.style.width = `${n}%`;
       progress.innerText = `${n}%`;
     };
@@ -389,7 +399,7 @@ export class DownloadHelper {
     checkBoxDiv.appendChild(checkBox);
     const checkBoxLabel = document.createElement("label");
     checkBoxLabel.className = "form-check-label";
-    checkBoxLabel["for"] = "LogCheck";
+    checkBoxLabel.setAttribute("for", "LogCheck");
     checkBoxLabel.innerText = "ログを自動スクロール";
     checkBoxDiv.appendChild(checkBoxLabel);
     infoDiv.appendChild(checkBoxDiv);
@@ -448,6 +458,7 @@ export class DownloadHelper {
       async pull(ctrl) {
         const startTime = Math.floor(Date.now() / 1000);
         let count = 0;
+        let failedCount = 0;
         const enqueue = (fileBits, path) => ctrl.enqueue(new File(fileBits, `${encodedId}/${path}`));
         log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
         enqueue([ui.createRootHtmlFromPosts(downloadObj)], "index.html");
@@ -471,11 +482,14 @@ export class DownloadHelper {
             if (blob) {
               enqueue([blob], `${post.encodedName}/${file.encodedName}`);
             } else {
+              failedCount++;
               console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
               log(`${file.encodedName}のダウンロードに失敗`);
             }
             count++;
             setTimeout(() => {
+              if (count <= 0)
+                return;
               const remain = Math.floor(Math.abs(Math.floor(Date.now() / 1000) - startTime) * (downloadObj.fileCount - count) / count);
               const h = remain / (60 * 60) | 0;
               const m = Math.ceil((remain - 60 * 60 * h) / 60);
@@ -484,6 +498,11 @@ export class DownloadHelper {
             }, 0);
             await utils.sleep(100);
           }
+        }
+        if (failedCount > 0) {
+          log(`完了 (${failedCount}件のダウンロードに失敗)`);
+        } else {
+          log("完了");
         }
         ctrl.close();
       }
@@ -603,7 +622,7 @@ export class DownloadHelper {
 <body>
 <div class="main" id="main">
 `;
-    const body = `<nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top"><div class="container-fluid">
+    const body = `<nav class="navbar navbar-expand-lg bg-dark fixed-top" data-bs-theme="dark"><div class="container-fluid">
 ` + `<a class="navbar-brand" href="${escapedUrl}">${escapedId}</a>
 ` + `<button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#dd" aria-controls="dd" aria-expanded="false" aria-label="Toggle navigation">
 ` + `<span class="navbar-toggler-icon"></span>

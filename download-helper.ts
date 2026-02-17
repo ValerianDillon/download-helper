@@ -92,7 +92,14 @@ export class DownloadUtils {
     request.open('GET', url, false);
     request.withCredentials = true;
     request.send(null);
-    return JSON.parse(request.responseText) as T;
+    if (request.status < 200 || request.status >= 300) {
+      throw new Error(`HTTP ${request.status}: ${url}`);
+    }
+    try {
+      return JSON.parse(request.responseText) as T;
+    } catch {
+      throw new Error(`JSON parse error: ${url}`);
+    }
   }
 
   /**
@@ -213,7 +220,7 @@ export class DownloadUtils {
    * @param url
    */
   async embedScript(url: string, integrity?: string) {
-    return new Promise((resolve, reject) => {
+    const scriptPromise = new Promise((resolve, reject) => {
       const script = document.createElement('script');
       script.src = url;
       if (integrity) {
@@ -224,6 +231,10 @@ export class DownloadUtils {
       script.onerror = (e) => reject(e);
       document.head.appendChild(script);
     });
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Script load timeout: ${url}`)), 30000),
+    );
+    return Promise.race([scriptPromise, timeout]);
   }
 }
 
@@ -358,11 +369,12 @@ export class PostObject {
   }
 
   getAudioLinkTag(fileObject: FileObject): string {
-    const filePath = this.getCurrentFilePath(fileObject);
+    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
     return (
-      `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}"><div class="post card">\n` +
+      `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">\n` +
       `<div class="card-header">${this.utils.escapeHtml(fileObject.getOriginalName())}</div>\n` +
-      `<audio class="card-img-top" src="${filePath}" controls/>\n</div></a>`
+      `<audio class="card-img-top" src="${escapedPath}" controls/>\n</div></a>`
     );
   }
 
@@ -377,9 +389,10 @@ export class PostObject {
   }
 
   getFileLinkTag(fileObject: FileObject): string {
-    const filePath = this.getCurrentFilePath(fileObject);
+    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
     return (
-      `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}">` +
+      `<a class="hl" href="${escapedPath}" download="${escapedDownload}">` +
       `<div class="post card text-center"><p class="pt-2">\n` +
       `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-download" viewBox="0 0 16 16">\n` +
       `<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>\n` +
@@ -389,18 +402,20 @@ export class PostObject {
   }
 
   getImageLinkTag(fileObject: FileObject): string {
-    const filePath = this.getCurrentFilePath(fileObject);
+    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
     return (
-      `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}"><div class="post card">\n` +
-      `<img class="card-img-top" src="${filePath}" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>\n</div></a>`
+      `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">\n` +
+      `<img class="card-img-top" src="${escapedPath}" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>\n</div></a>`
     );
   }
 
   getVideoLinkTag(fileObject: FileObject): string {
-    const filePath = this.getCurrentFilePath(fileObject);
+    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
     return (
-      `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}"><div class="post card">\n` +
-      `<video class="card-img-top" src="${filePath}" controls/>\n</div></a>`
+      `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">\n` +
+      `<video class="card-img-top" src="${escapedPath}" controls/>\n</div></a>`
     );
   }
 
@@ -525,16 +540,16 @@ export class DownloadHelper {
    * bootstrapのCSS情報
    */
   bootCSS = {
-    href: 'https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/css/bootstrap.min.css',
-    integrity: 'sha384-giJF6kkoqNQ00vy+HMDP7azOuL0xtbfIcaT9wjKHr8RbDVddVHyTfAAsrekwKmP1',
+    href: 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css',
+    integrity: 'sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB',
   };
 
   /**
    * bootstrapのjs情報
    */
   bootJS = {
-    src: 'https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/js/bootstrap.bundle.min.js',
-    integrity: 'sha384-ygbV9kiqUc6oa4msXn9868pTtWMgiQaeYH7/t7LECLbyPA2x65Kgf80OJFdroafW',
+    src: 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js',
+    integrity: 'sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI',
   };
 
   /**
@@ -594,33 +609,25 @@ export class DownloadHelper {
     input.className = 'form-control';
     input.placeholder = 'ここにJSONを貼り付け';
     inputDiv.appendChild(input);
-    const buttonDiv = document.createElement('div');
-    buttonDiv.className = 'input-group-append';
     const button = document.createElement('button');
     button.className = 'btn btn-outline-secondary btn-labeled';
     button.type = 'button';
     button.innerText = 'Download';
-    buttonDiv.appendChild(button);
-    inputDiv.appendChild(buttonDiv);
+    inputDiv.appendChild(button);
     bodyDiv.appendChild(inputDiv);
     const progressDiv = document.createElement('div');
     progressDiv.className = 'progress mb-3';
     progressDiv.style.width = '400px';
     const progress = document.createElement('div');
     progress.className = 'progress-bar';
-    // @ts-expect-error
-    progress['role'] = 'progressbar';
-    // @ts-expect-error
-    progress['aria-valuemin'] = '0';
-    // @ts-expect-error
-    progress['aria-valuemax'] = '100';
-    // @ts-expect-error
-    progress['aria-valuenow'] = '0';
     progress.style.width = '0%';
     progress.innerText = '0%';
+    progressDiv.setAttribute('role', 'progressbar');
+    progressDiv.setAttribute('aria-valuemin', '0');
+    progressDiv.setAttribute('aria-valuemax', '100');
+    progressDiv.setAttribute('aria-valuenow', '0');
     const setProgress = (n: number) => {
-      // @ts-expect-error
-      progress['aria-valuenow'] = `${n}`;
+      progressDiv.setAttribute('aria-valuenow', `${n}`);
       progress.style.width = `${n}%`;
       progress.innerText = `${n}%`;
     };
@@ -638,8 +645,7 @@ export class DownloadHelper {
     checkBoxDiv.appendChild(checkBox);
     const checkBoxLabel = document.createElement('label');
     checkBoxLabel.className = 'form-check-label';
-    // @ts-expect-error
-    checkBoxLabel['for'] = 'LogCheck';
+    checkBoxLabel.setAttribute('for', 'LogCheck');
     checkBoxLabel.innerText = 'ログを自動スクロール';
     checkBoxDiv.appendChild(checkBoxLabel);
     infoDiv.appendChild(checkBoxDiv);
@@ -712,6 +718,7 @@ export class DownloadHelper {
       async pull(ctrl) {
         const startTime = Math.floor(Date.now() / 1000);
         let count = 0;
+        let failedCount = 0;
         const enqueue = (fileBits: BlobPart[], path: string) =>
           ctrl.enqueue(new File(fileBits, `${encodedId}/${path}`));
         log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
@@ -741,11 +748,13 @@ export class DownloadHelper {
             if (blob) {
               enqueue([blob], `${post.encodedName}/${file.encodedName}`);
             } else {
+              failedCount++;
               console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
               log(`${file.encodedName}のダウンロードに失敗`);
             }
             count++;
             setTimeout(() => {
+              if (count <= 0) return;
               const remain = Math.floor(
                 (Math.abs(Math.floor(Date.now() / 1000) - startTime) * (downloadObj.fileCount - count)) / count,
               );
@@ -756,6 +765,11 @@ export class DownloadHelper {
             }, 0);
             await utils.sleep(100);
           }
+        }
+        if (failedCount > 0) {
+          log(`完了 (${failedCount}件のダウンロードに失敗)`);
+        } else {
+          log('完了');
         }
         ctrl.close();
       },
@@ -937,7 +951,7 @@ export class DownloadHelper {
       'img.pd-carousel{height: 210px; padding: 15px;}</style>\n' +
       `</head>\n<body>\n<div class="main" id="main">\n`;
     const body =
-      `<nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top"><div class="container-fluid">\n` +
+      `<nav class="navbar navbar-expand-lg bg-dark fixed-top" data-bs-theme="dark"><div class="container-fluid">\n` +
       `<a class="navbar-brand" href="${escapedUrl}">${escapedId}</a>\n` +
       `<button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#dd" aria-controls="dd" aria-expanded="false" aria-label="Toggle navigation">\n` +
       `<span class="navbar-toggler-icon"></span>\n` +
