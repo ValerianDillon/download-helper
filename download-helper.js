@@ -35,6 +35,9 @@ export class DownloadUtils {
   toQuoted(value) {
     return `'${value.replaceAll("'", "\\'")}'`;
   }
+  escapeHtml(value) {
+    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
   createInformationFile(informationText) {
     try {
       const json = JSON.stringify(JSON.parse(informationText), null, "\t");
@@ -60,10 +63,14 @@ export class DownloadUtils {
       return await this.fetchWithLimit({ url, name }, limit - 1);
     }
   }
-  async embedScript(url) {
+  async embedScript(url, integrity) {
     return new Promise((resolve, reject) => {
       const script = document.createElement("script");
       script.src = url;
+      if (integrity) {
+        script.integrity = integrity;
+        script.crossOrigin = "anonymous";
+      }
       script.onload = () => resolve(script);
       script.onerror = (e) => reject(e);
       document.head.appendChild(script);
@@ -174,16 +181,16 @@ export class PostObject {
   getAudioLinkTag(fileObject) {
     const filePath = this.getCurrentFilePath(fileObject);
     return `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}"><div class="post card">
-` + `<div class="card-header">${fileObject.getOriginalName()}</div>
+` + `<div class="card-header">${this.utils.escapeHtml(fileObject.getOriginalName())}</div>
 ` + `<audio class="card-img-top" src="${filePath}" controls/>
 </div></a>`;
   }
   getLinkTag(url, title) {
-    return `<a class="hl" href="${url}"><div class="post card text-center"><p class="pt-2">
+    return `<a class="hl" href="${this.utils.escapeHtml(url)}"><div class="post card text-center"><p class="pt-2">
 ` + `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-box-arrow-up-left" viewBox="0 0 16 16">
 ` + `<path fill-rule="evenodd" d="M7.364 3.5a.5.5 0 0 1 .5-.5H14.5A1.5 1.5 0 0 1 16 4.5v10a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 3 14.5V7.864a.5.5 0 1 1 1 0V14.5a.5.5 0 0 0 .5.5h10a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5H7.864a.5.5 0 0 1-.5-.5z"/>
 ` + `<path fill-rule="evenodd" d="M0 .5A.5.5 0 0 1 .5 0h5a.5.5 0 0 1 0 1H1.707l8.147 8.146a.5.5 0 0 1-.708.708L1 1.707V5.5a.5.5 0 0 1-1 0v-5z"/>
-` + `</svg> ${title}</p></div></a>`;
+` + `</svg> ${this.utils.escapeHtml(title)}</p></div></a>`;
   }
   getFileLinkTag(fileObject) {
     const filePath = this.getCurrentFilePath(fileObject);
@@ -191,12 +198,12 @@ export class PostObject {
 ` + `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-download" viewBox="0 0 16 16">
 ` + `<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>
 ` + `<path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/>
-` + `</svg> ${fileObject.getOriginalName() + fileObject.getOriginalExtension()}</p></div></a>`;
+` + `</svg> ${this.utils.escapeHtml(fileObject.getOriginalName() + fileObject.getOriginalExtension())}</p></div></a>`;
   }
   getImageLinkTag(fileObject) {
     const filePath = this.getCurrentFilePath(fileObject);
     return `<a class="hl" href="${filePath}" download="${fileObject.getEncodedName() + fileObject.getEncodedExtension()}"><div class="post card">
-` + `<img class="card-img-top" src="${filePath}" alt="${fileObject.getOriginalName()}"/>
+` + `<img class="card-img-top" src="${filePath}" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>
 </div></a>`;
   }
   getVideoLinkTag(fileObject) {
@@ -304,8 +311,17 @@ export class DownloadHelper {
     src: "https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/js/bootstrap.bundle.min.js",
     integrity: "sha384-ygbV9kiqUc6oa4msXn9868pTtWMgiQaeYH7/t7LECLbyPA2x65Kgf80OJFdroafW"
   };
-  vueJS = {
-    src: "https://unpkg.com/vue@3.2.28/dist/vue.global.js"
+  polyfillJS = {
+    src: "https://cdn.jsdelivr.net/npm/web-streams-polyfill@2.0.2/dist/ponyfill.min.js",
+    integrity: "sha384-ba6djMbY2Z/yqvSzlHRsh7WWPHEwE+TD2KdIhrpLv4q7+7izPZSlnWJe/t++aQOE"
+  };
+  streamSaverJS = {
+    src: "https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.js",
+    integrity: "sha384-Nqw6SzqA0IaGGLP/g9Y5h/bB8wBGXJ83TDjPs5OgxjX9mYZa5+oUc2Gym4xwZSSa"
+  };
+  zipStreamJS = {
+    src: "https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/examples/zip-stream.js",
+    integrity: "sha384-g9gkHBj/J34a/2KwwHmm6VymJgH8EivePV3Nhl9rGu/eKHhK0OthrHe5S7fW88Pn"
   };
   async createDownloadUI(title) {
     document.head.innerHTML = "";
@@ -423,9 +439,9 @@ export class DownloadHelper {
       throw new Error("ダウンロード対象オブジェクトの型が不正");
     const ui = this;
     const utils = this.utils;
-    await utils.embedScript("https://cdn.jsdelivr.net/npm/web-streams-polyfill@2.0.2/dist/ponyfill.min.js");
-    await utils.embedScript("https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.js");
-    await utils.embedScript("https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/examples/zip-stream.js");
+    await utils.embedScript(this.polyfillJS.src, this.polyfillJS.integrity);
+    await utils.embedScript(this.streamSaverJS.src, this.streamSaverJS.integrity);
+    await utils.embedScript(this.zipStreamJS.src, this.zipStreamJS.integrity);
     const encodedId = utils.encodeFileName(downloadObj.id);
     const fileStream = streamSaver.createWriteStream(`${encodedId}.zip`);
     const readableZipStream = new createWriter({
@@ -531,7 +547,6 @@ export class DownloadHelper {
             return true;
           }
           const fo = f;
-          const cover = p.cover;
           switch (true) {
             case typeof fo.url !== "string":
               console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にurlが文字列でないものが含まれる)", fo.url, p.files);
@@ -542,33 +557,46 @@ export class DownloadHelper {
             case typeof fo.encodedName !== "string":
               console.error("ダウンロード用オブジェクトの型が不正(postsのfilesの値にencodedNameが文字列でないものが含まれる)", fo.encodedName, p.files);
               return true;
-            case cover === undefined:
-              return false;
-            case typeof cover !== "object":
-              console.error("ダウンロード用オブジェクトの型が不正(postsの値にcoverがobjectでないものが含まれる)", cover, t.posts);
-              return true;
-            case typeof cover?.url !== "string":
-              console.error("ダウンロード用オブジェクトの型が不正(postsのcoverの値にurlが文字列でないものが含まれる)", cover?.url, cover);
-              return true;
-            case typeof cover?.name !== "string":
-              console.error("ダウンロード用オブジェクトの型が不正(postsのcoverの値にnameが文字列でないものが含まれる)", cover?.name, cover);
-              return true;
             default:
               return false;
           }
         }):
           return true;
-        default:
-          return false;
       }
+      const cover = p.cover;
+      if (cover !== undefined) {
+        if (typeof cover !== "object" || cover === null) {
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にcoverがobjectでないものが含まれる)", cover, t.posts);
+          return true;
+        }
+        if (typeof cover.url !== "string") {
+          console.error("ダウンロード用オブジェクトの型が不正(postsのcoverの値にurlが文字列でないものが含まれる)", cover.url, cover);
+          return true;
+        }
+        if (typeof cover.name !== "string") {
+          console.error("ダウンロード用オブジェクトの型が不正(postsのcoverの値にnameが文字列でないものが含まれる)", cover.name, cover);
+          return true;
+        }
+      }
+      return false;
     });
   }
   createRootHtmlFromPosts(downloadObj) {
+    const escapedId = this.utils.escapeHtml(downloadObj.id);
+    const escapedUrl = this.utils.escapeHtml(downloadObj.url);
+    const tagCheckboxes = downloadObj.tags.map((tag, i) => {
+      const escaped = this.utils.escapeHtml(tag);
+      return `<li><div class="form-check mx-1">
+` + `<input class="form-check-input tag-filter" type="checkbox" value="${escaped}" id="box${i + 1}">
+` + `<label class="form-check-label" for="box${i + 1}">${escaped}</label>
+` + `</div></li>
+`;
+    }).join("");
     const header = `<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
-<title>${downloadObj.id}</title>
+<title>${escapedId}</title>
 ` + `<link href="${this.bootCSS.href}" rel="stylesheet" integrity="${this.bootCSS.integrity}" crossOrigin="anonymous">
 ` + "<style>div.main{width: 600px; float: none; margin: 65px auto 0}div.root{width: 400px}div.post{width: 600px}" + "a.hl,a.hl:hover{color: inherit;text-decoration: none;}div.card{float: none; margin: 0 auto;}" + "img.gray-card{height: 210px;background-color: gray;}" + "div.gray-carousel{height: 210px; width: 400px;background-color: gray;}" + `img.pd-carousel{height: 210px; padding: 15px;}</style>
 ` + `</head>
@@ -576,7 +604,7 @@ export class DownloadHelper {
 <div class="main" id="main">
 `;
     const body = `<nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top"><div class="container-fluid">
-` + `<a class="navbar-brand" href="${downloadObj.url}">${downloadObj.id}</a>
+` + `<a class="navbar-brand" href="${escapedUrl}">${escapedId}</a>
 ` + `<button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#dd" aria-controls="dd" aria-expanded="false" aria-label="Toggle navigation">
 ` + `<span class="navbar-toggler-icon"></span>
 ` + `</button>
@@ -584,37 +612,38 @@ export class DownloadHelper {
 ` + `<li class="nav-item dropdown">
 ` + `<a class="nav-link dropdown-toggle" href="#" id="navbarDarkDropdownMenuLink" role="button" data-bs-toggle="dropdown" aria-expanded="false">Tags</a>
 ` + `<ul class="dropdown-menu dropdown-menu-dark" aria-labelledby="dd">
-` + `<li v-for="(tag,i) in [${downloadObj.tags.map((tag) => this.utils.toQuoted(tag)).join(",")}]">
-` + ` <div class="form-check mx-1">
-` + `<input class="form-check-input" type="checkbox" v-model="selected" :value="tag" :id="'box'+(i+1)">
-` + `<label class="form-check-label" :for="'box'+(i+1)">{{tag}}</label>
-` + `</div>
-</li>
-` + `</ul>
+` + tagCheckboxes + `</ul>
 </li>
 </ul></div>
 </div></nav>
 
-` + downloadObj.posts.map((post) => `<div v-show="isVisible([${post.tags.map((tag) => this.utils.toQuoted(tag)).join(", ")}], selected)">
+` + downloadObj.posts.map((post) => `<div class="post-item" data-tags="${this.utils.escapeHtml(JSON.stringify(post.tags))}">
 ` + `<a class="hl" href="./${this.utils.encodeURI(post.encodedName)}/index.html"><div class="root card">
-` + this.createCoverHtmlFromPost(post) + `<div class="card-body"><h5 class="card-title">${post.originalName}</h5></div>
+` + this.createCoverHtmlFromPost(post) + `<div class="card-body"><h5 class="card-title">${this.utils.escapeHtml(post.originalName)}</h5></div>
 </div></a><br>
 </div>
 `).join(`
 `);
     const footer = `
 </div>
-` + `<script src="${this.vueJS.src}"></script>
 ` + `<script>
-Vue.createApp({
-data() {return { selected: [] }},` + `methods: {
- isVisible(tags, selected) {
-  if (!selected.length) return true
-  return selected.every(it => tags.includes(it))
- }
-}
-` + `}).mount('#main')
-</script>
+` + `document.addEventListener('DOMContentLoaded', function() {
+` + `  var checkboxes = document.querySelectorAll('.tag-filter');
+` + `  var posts = document.querySelectorAll('.post-item');
+` + `  function updateVisibility() {
+` + `    var selected = Array.from(checkboxes)
+` + `      .filter(function(cb) { return cb.checked; })
+` + `      .map(function(cb) { return cb.value; });
+` + `    posts.forEach(function(post) {
+` + `      var tags = JSON.parse(post.getAttribute('data-tags'));
+` + `      post.style.display = (!selected.length ||
+` + `        selected.every(function(s) { return tags.indexOf(s) !== -1; }))
+` + `        ? '' : 'none';
+` + `    });
+` + `  }
+` + `  checkboxes.forEach(function(cb) { cb.addEventListener('change', updateVisibility); });
+` + `});
+` + `</script>
 ` + `<script src="${this.bootJS.src}" integrity="${this.bootJS.integrity}" crossOrigin="anonymous"></script>
 ` + "</body></html>";
     return header + body + footer;
@@ -642,7 +671,7 @@ data() {return { selected: [] }},` + `methods: {
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
-<title>${title}</title>
+<title>${this.utils.escapeHtml(title)}</title>
 ` + `<link href="${this.bootCSS.href}" rel="stylesheet" integrity="${this.bootCSS.integrity}" crossOrigin="anonymous">
 ` + "<style>div.main{width: 600px; float: none; margin: 0 auto}div.root{width: 400px}div.post{width: 600px}" + "a.hl,a.hl:hover{color: inherit;text-decoration: none;}div.card{float: none; margin: 0 auto;}" + "img.gray-card{height: 210px;background-color: gray;}" + "div.gray-carousel{height: 210px; width: 400px;background-color: gray;}" + `img.pd-carousel{height: 210px; padding: 15px;}</style>
 ` + `</head>
