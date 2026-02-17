@@ -7,9 +7,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/furubarug/download-helper.git"
+    "url": "git+https://github.com/ValerianDillon/download-helper.git"
   },
-  "author": "furubarug",
+  "author": "ValerianDillon",
   "license": "MIT",
   "main": "download-helper.js",
   "types": "download-helper.ts",
@@ -18,9 +18,9 @@
     "download-helper.ts"
   ],
   "bugs": {
-    "url": "https://github.com/furubarug/download/issues"
+    "url": "https://github.com/ValerianDillon/download-helper/issues"
   },
-  "homepage": "https://github.com/furubarug/download#readme",
+  "homepage": "https://github.com/ValerianDillon/download-helper#readme",
   "devDependencies": {
     "typescript": "^4.3.5"
   }
