@@ -5,14 +5,16 @@
 
 ## コマンド
 
-- `npm run build` — `tsc` で `download-helper.ts` → `download-helper.js` にコンパイル
-- テスト・リントの設定はなし
+- `bun run build` — `bun build --no-bundle` で `download-helper.ts` → `download-helper.js` にトランスパイル
+- `bun run lint` — Biome による静的解析・フォーマット修正
 
 ## プロジェクト構成
 
 ```
 download-helper.ts    # ソースコード（単一ファイル）
-download-helper.js    # コンパイル済み出力（コミット対象）
+download-helper.js    # トランスパイル済み出力（コミット対象）
+biome.json            # Biome 設定
+.mise.toml            # mise ツールバージョン管理
 package.json
 tsconfig.json
 ```
@@ -23,7 +25,9 @@ tsconfig.json
 
 ## 技術スタック
 
-- TypeScript 4.x（strict モード）→ ES2017 ターゲット、ES2015 モジュール出力
+- Bun でトランスパイル（TypeScript → ES module）
+- Biome で静的解析・フォーマット
+- tsconfig.json はエディタの型チェック用に維持
 - runtime 依存パッケージなし
 - CDN 経由で動的読み込み: Vue.js 3.2, Bootstrap 5.0, StreamSaver.js 2.0, web-streams-polyfill
 
@@ -43,9 +47,12 @@ tsconfig.json
 
 ## コーディング規約
 
+- Biome (recommended ルールセット) で強制。設定は `biome.json` に記載
+- インデント: スペース2つ
+- シングルクォート、セミコロンあり、末尾カンマあり
+- `lineWidth: 120`
 - JSDoc 形式のドキュメントコメント（日本語）
 - クラス: PascalCase、メソッド/変数: camelCase
-- strict モード有効
 
 ## Git運用
 
@@ -54,6 +61,6 @@ tsconfig.json
 ## リリース手順
 
 1. `package.json` の `version` を更新
-2. `npm run build`
+2. `bun run build`
 3. コミット・push
 4. `git tag vX.X.X && git push origin vX.X.X`

@@ -5,16 +5,10 @@
     "outDir": "./",
     "removeComments": true,
     "strict": true,
-    "lib": [
-      "dom",
-      "es2021"
-    ],
+    "lib": ["dom", "es2021"],
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "exclude": [
-    "**/*.test.ts",
-    "dist/**/*"
-  ]
+  "exclude": ["**/*.test.ts", "dist/**/*"]
 }
