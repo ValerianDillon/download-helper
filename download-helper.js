@@ -310,6 +310,103 @@ export class FileObject {
     return candidate.name === this.fileObj.name && candidate.url === this.fileObj.url;
   }
 }
+export const crc32Table = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0;i < 256; i++) {
+    let c = i;
+    for (let j = 0;j < 8; j++) {
+      c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+    }
+    table[i] = c;
+  }
+  return table;
+})();
+export function crc32(data) {
+  let crc = 4294967295;
+  for (let i = 0;i < data.length; i++) {
+    crc = crc32Table[(crc ^ data[i]) & 255] ^ crc >>> 8;
+  }
+  return (crc ^ 4294967295) >>> 0;
+}
+async function toUint8Array(parts) {
+  const blob = new Blob(parts);
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+export class ZipWriter {
+  writable;
+  offset = 0;
+  entries = [];
+  encoder = new TextEncoder;
+  constructor(writable) {
+    this.writable = writable;
+  }
+  async addFile(name, data) {
+    const nameBytes = this.encoder.encode(name);
+    const fileCrc = crc32(data);
+    const localHeaderOffset = this.offset;
+    const header = new ArrayBuffer(30);
+    const view = new DataView(header);
+    view.setUint32(0, 67324752, true);
+    view.setUint16(4, 20, true);
+    view.setUint16(6, 2048, true);
+    view.setUint16(8, 0, true);
+    view.setUint16(10, 0, true);
+    view.setUint16(12, 0, true);
+    view.setUint32(14, fileCrc, true);
+    view.setUint32(18, data.length, true);
+    view.setUint32(22, data.length, true);
+    view.setUint16(26, nameBytes.length, true);
+    view.setUint16(28, 0, true);
+    await this.write(new Uint8Array(header));
+    await this.write(nameBytes);
+    await this.write(data);
+    this.entries.push({ name: nameBytes, crc: fileCrc, size: data.length, offset: localHeaderOffset });
+  }
+  async close() {
+    const cdOffset = this.offset;
+    for (const entry of this.entries) {
+      const cdHeader = new ArrayBuffer(46);
+      const view = new DataView(cdHeader);
+      view.setUint32(0, 33639248, true);
+      view.setUint16(4, 20, true);
+      view.setUint16(6, 20, true);
+      view.setUint16(8, 2048, true);
+      view.setUint16(10, 0, true);
+      view.setUint16(12, 0, true);
+      view.setUint16(14, 0, true);
+      view.setUint32(16, entry.crc, true);
+      view.setUint32(20, entry.size, true);
+      view.setUint32(24, entry.size, true);
+      view.setUint16(28, entry.name.length, true);
+      view.setUint16(30, 0, true);
+      view.setUint16(32, 0, true);
+      view.setUint16(34, 0, true);
+      view.setUint16(36, 0, true);
+      view.setUint32(38, 0, true);
+      view.setUint32(42, entry.offset, true);
+      await this.write(new Uint8Array(cdHeader));
+      await this.write(entry.name);
+    }
+    const cdSize = this.offset - cdOffset;
+    const eocd = new ArrayBuffer(22);
+    const eocdView = new DataView(eocd);
+    eocdView.setUint32(0, 101010256, true);
+    eocdView.setUint16(4, 0, true);
+    eocdView.setUint16(6, 0, true);
+    eocdView.setUint16(8, this.entries.length, true);
+    eocdView.setUint16(10, this.entries.length, true);
+    eocdView.setUint32(12, cdSize, true);
+    eocdView.setUint32(16, cdOffset, true);
+    eocdView.setUint16(20, 0, true);
+    await this.write(new Uint8Array(eocd));
+    await this.writable.close();
+  }
+  async write(data) {
+    await this.writable.write(data);
+    this.offset += data.length;
+  }
+}
 
 export class DownloadHelper {
   utils;
@@ -323,18 +420,6 @@ export class DownloadHelper {
   bootJS = {
     src: "https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js",
     integrity: "sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI"
-  };
-  polyfillJS = {
-    src: "https://cdn.jsdelivr.net/npm/web-streams-polyfill@2.0.2/dist/ponyfill.min.js",
-    integrity: "sha384-ba6djMbY2Z/yqvSzlHRsh7WWPHEwE+TD2KdIhrpLv4q7+7izPZSlnWJe/t++aQOE"
-  };
-  streamSaverJS = {
-    src: "https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.js",
-    integrity: "sha384-Nqw6SzqA0IaGGLP/g9Y5h/bB8wBGXJ83TDjPs5OgxjX9mYZa5+oUc2Gym4xwZSSa"
-  };
-  zipStreamJS = {
-    src: "https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/examples/zip-stream.js",
-    integrity: "sha384-g9gkHBj/J34a/2KwwHmm6VymJgH8EivePV3Nhl9rGu/eKHhK0OthrHe5S7fW88Pn"
   };
   async createDownloadUI(title) {
     document.head.innerHTML = "";
@@ -447,73 +532,58 @@ export class DownloadHelper {
   async downloadZip(downloadObj, progress, log, remainTime) {
     if (!this.isDownloadJsonObj(downloadObj))
       throw new Error("ダウンロード対象オブジェクトの型が不正");
-    const ui = this;
     const utils = this.utils;
-    await utils.embedScript(this.polyfillJS.src, this.polyfillJS.integrity);
-    await utils.embedScript(this.streamSaverJS.src, this.streamSaverJS.integrity);
-    await utils.embedScript(this.zipStreamJS.src, this.zipStreamJS.integrity);
     const encodedId = utils.encodeFileName(downloadObj.id);
-    const fileStream = streamSaver.createWriteStream(`${encodedId}.zip`);
-    const readableZipStream = new createWriter({
-      async pull(ctrl) {
-        const startTime = Math.floor(Date.now() / 1000);
-        let count = 0;
-        let failedCount = 0;
-        const enqueue = (fileBits, path) => ctrl.enqueue(new File(fileBits, `${encodedId}/${path}`));
-        log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
-        enqueue([ui.createRootHtmlFromPosts(downloadObj)], "index.html");
-        let postCount = 0;
-        for (const post of downloadObj.posts) {
-          log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
-          const informationFile = utils.createInformationFile(post.informationText);
-          enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`);
-          enqueue([ui.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`);
-          if (post.cover) {
-            log(`download ${post.cover.name}`);
-            const blob = await utils.fetchWithLimit(post.cover, 1);
-            if (blob) {
-              enqueue([blob], `${post.encodedName}/${post.cover.name}`);
-            }
-          }
-          let fileCount = 0;
-          for (const file of post.files) {
-            log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-            const blob = await utils.fetchWithLimit({ url: file.url, name: file.encodedName }, 1);
-            if (blob) {
-              enqueue([blob], `${post.encodedName}/${file.encodedName}`);
-            } else {
-              failedCount++;
-              console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
-              log(`${file.encodedName}のダウンロードに失敗`);
-            }
-            count++;
-            setTimeout(() => {
-              if (count <= 0)
-                return;
-              const remain = Math.floor(Math.abs(Math.floor(Date.now() / 1000) - startTime) * (downloadObj.fileCount - count) / count);
-              const h = remain / (60 * 60) | 0;
-              const m = Math.ceil((remain - 60 * 60 * h) / 60);
-              remainTime(`${h}:${("00" + m).slice(-2)}`);
-              progress(count * 100 / downloadObj.fileCount | 0);
-            }, 0);
-            await utils.sleep(100);
-          }
+    const handle = await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
+    const writable = await handle.createWritable();
+    const zip = new ZipWriter(writable);
+    const enqueue = async (fileBits, path) => {
+      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits));
+    };
+    const startTime = Math.floor(Date.now() / 1000);
+    let count = 0;
+    let failedCount = 0;
+    log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
+    await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html");
+    let postCount = 0;
+    for (const post of downloadObj.posts) {
+      log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
+      const informationFile = utils.createInformationFile(post.informationText);
+      await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`);
+      await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`);
+      if (post.cover) {
+        log(`download ${post.cover.name}`);
+        const blob = await utils.fetchWithLimit(post.cover, 1);
+        if (blob) {
+          await enqueue([blob], `${post.encodedName}/${post.cover.name}`);
         }
-        if (failedCount > 0) {
-          log(`完了 (${failedCount}件のダウンロードに失敗)`);
-        } else {
-          log("完了");
-        }
-        ctrl.close();
       }
-    });
-    if (window.WritableStream && readableZipStream.pipeTo) {
-      return readableZipStream.pipeTo(fileStream).then(() => console.log("done writing"));
+      let fileCount = 0;
+      for (const file of post.files) {
+        log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
+        const blob = await utils.fetchWithLimit({ url: file.url, name: file.encodedName }, 1);
+        if (blob) {
+          await enqueue([blob], `${post.encodedName}/${file.encodedName}`);
+        } else {
+          failedCount++;
+          console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
+          log(`${file.encodedName}のダウンロードに失敗`);
+        }
+        count++;
+        const remain = Math.floor(Math.abs(Math.floor(Date.now() / 1000) - startTime) * (downloadObj.fileCount - count) / count);
+        const h = remain / (60 * 60) | 0;
+        const m = Math.ceil((remain - 60 * 60 * h) / 60);
+        remainTime(`${h}:${("00" + m).slice(-2)}`);
+        progress(count * 100 / downloadObj.fileCount | 0);
+        await utils.sleep(100);
+      }
     }
-    const writer = fileStream.getWriter();
-    const reader = readableZipStream.getReader();
-    const pump = () => reader.read().then((res) => res.done ? writer.close() : writer.write(res.value).then(pump));
-    await pump();
+    if (failedCount > 0) {
+      log(`完了 (${failedCount}件のダウンロードに失敗)`);
+    } else {
+      log("完了");
+    }
+    await zip.close();
   }
   isDownloadJsonObj(target) {
     if (typeof target !== "object" || target === null) {
