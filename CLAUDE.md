@@ -58,6 +58,7 @@ tsconfig.json
 ## Git運用
 
 - コミットの author/committer は ValerianDillon であること
+- **`gh pr create` は fork 元 (furubarug/download-helper) をデフォルトのベースリポジトリにする。** 必ず `--repo ValerianDillon/download-helper --base main` を指定すること
 
 ## リリース手順
 
