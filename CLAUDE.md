@@ -29,7 +29,8 @@ tsconfig.json
 - Biome で静的解析・フォーマット
 - tsconfig.json はエディタの型チェック用に維持
 - runtime 依存パッケージなし
-- CDN 経由で動的読み込み: Vue.js 3.2, Bootstrap 5.0, StreamSaver.js 2.0, web-streams-polyfill
+- CDN 経由で動的読み込み: Bootstrap 5.3
+- ZIP 書き込みは File System Access API による自前実装 (Chrome/Edge のみ対応)
 
 ## アーキテクチャ
 
@@ -40,8 +41,8 @@ tsconfig.json
 3. **DownloadHelper** — 最上位クラス。UI 生成、ZIP ダウンロード、HTML 生成を統合
 
 主な機能:
-- ZIP ダウンロード（StreamSaver.js 経由）
-- Vue.js ベースのタグフィルタリング UI
+- ZIP ダウンロード（File System Access API + 自前 ZipWriter）
+- Bootstrap ベースのタグフィルタリング UI
 - リトライ機能付き fetch（レート制限対策）
 - ファイル名の Windows 互換エンコーディング（全角記号への置換）
 

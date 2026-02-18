@@ -1,6 +1,6 @@
 {
   "name": "download-helper",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "description": "ブックマークレットとかで使うUI",
   "scripts": {
     "build": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle",

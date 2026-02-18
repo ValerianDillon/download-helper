@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
-import { DownloadHelper, type DownloadJsonObj, DownloadUtils, type FileObj, FileObject } from './download-helper';
+import {
+  crc32,
+  DownloadHelper,
+  type DownloadJsonObj,
+  DownloadUtils,
+  type FileObj,
+  FileObject,
+  ZipWriter,
+} from './download-helper';
 
 // ============================================================
 // 1. DownloadUtils tests
@@ -423,5 +431,172 @@ describe('isDownloadJsonObj', () => {
 
   test('空オブジェクト → false', () => {
     expect(helper.isDownloadJsonObj({})).toBe(false);
+  });
+});
+
+// ============================================================
+// 4. crc32 tests
+// ============================================================
+describe('crc32', () => {
+  const encoder = new TextEncoder();
+
+  test('空入力 → 0x00000000', () => {
+    expect(crc32(new Uint8Array(0))).toBe(0x00000000);
+  });
+
+  test('"123456789" → 0xCBF43926 (RFC 3720 テストベクタ)', () => {
+    expect(crc32(encoder.encode('123456789'))).toBe(0xcbf43926);
+  });
+
+  test('単一バイト入力', () => {
+    expect(crc32(new Uint8Array([0x00]))).toBe(0xd202ef8d);
+  });
+
+  test('日本語文字列の CRC-32', () => {
+    const data = encoder.encode('テスト');
+    const result = crc32(data);
+    expect(typeof result).toBe('number');
+    expect(result).toBeGreaterThan(0);
+  });
+});
+
+// ============================================================
+// 5. ZipWriter tests
+// ============================================================
+describe('ZipWriter', () => {
+  const encoder = new TextEncoder();
+
+  /**
+   * FileSystemWritableFileStream のモック
+   */
+  class MockWritableStream {
+    chunks: Uint8Array[] = [];
+    closed = false;
+
+    async write(data: Uint8Array): Promise<void> {
+      this.chunks.push(new Uint8Array(data));
+    }
+
+    async close(): Promise<void> {
+      this.closed = true;
+    }
+
+    toBuffer(): Uint8Array {
+      const totalLength = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of this.chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return result;
+    }
+  }
+
+  /**
+   * バッファから指定オフセットの 4 バイトを little-endian uint32 として読む
+   */
+  function readUint32(buf: Uint8Array, offset: number): number {
+    return new DataView(buf.buffer, buf.byteOffset).getUint32(offset, true);
+  }
+
+  /**
+   * バッファから指定オフセットの 2 バイトを little-endian uint16 として読む
+   */
+  function readUint16(buf: Uint8Array, offset: number): number {
+    return new DataView(buf.buffer, buf.byteOffset).getUint16(offset, true);
+  }
+
+  test('1 ファイルの ZIP を正しく生成', async () => {
+    const mock = new MockWritableStream();
+    const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+
+    const data = encoder.encode('hello');
+    await zip.addFile('test.txt', data);
+    await zip.close();
+
+    const buf = mock.toBuffer();
+
+    // Local File Header signature
+    expect(readUint32(buf, 0)).toBe(0x04034b50);
+    // version needed
+    expect(readUint16(buf, 4)).toBe(20);
+    // general purpose bit flag (UTF-8)
+    expect(readUint16(buf, 6)).toBe(0x0800);
+    // compression method (stored)
+    expect(readUint16(buf, 8)).toBe(0);
+    // file name length
+    const nameLen = readUint16(buf, 26);
+    expect(nameLen).toBe(encoder.encode('test.txt').length);
+    // uncompressed size
+    expect(readUint32(buf, 22)).toBe(data.length);
+
+    // ファイルデータがヘッダ直後に存在
+    const fileDataOffset = 30 + nameLen;
+    const fileData = buf.slice(fileDataOffset, fileDataOffset + data.length);
+    expect(fileData).toEqual(data);
+
+    // Central Directory signature を探す
+    const cdOffset = fileDataOffset + data.length;
+    expect(readUint32(buf, cdOffset)).toBe(0x02014b50);
+
+    // EOCD signature を探す (末尾 22 バイト)
+    const eocdOffset = buf.length - 22;
+    expect(readUint32(buf, eocdOffset)).toBe(0x06054b50);
+    // EOCD エントリ数
+    expect(readUint16(buf, eocdOffset + 8)).toBe(1);
+    expect(readUint16(buf, eocdOffset + 10)).toBe(1);
+
+    expect(mock.closed).toBe(true);
+  });
+
+  test('複数ファイルの ZIP: エントリ数が正しい', async () => {
+    const mock = new MockWritableStream();
+    const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+
+    await zip.addFile('a.txt', encoder.encode('aaa'));
+    await zip.addFile('b.txt', encoder.encode('bbb'));
+    await zip.addFile('c.txt', encoder.encode('ccc'));
+    await zip.close();
+
+    const buf = mock.toBuffer();
+    const eocdOffset = buf.length - 22;
+
+    expect(readUint32(buf, eocdOffset)).toBe(0x06054b50);
+    expect(readUint16(buf, eocdOffset + 8)).toBe(3);
+    expect(readUint16(buf, eocdOffset + 10)).toBe(3);
+  });
+
+  test('日本語ファイル名が UTF-8 で正しくエンコード', async () => {
+    const mock = new MockWritableStream();
+    const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+
+    const fileName = 'テスト/画像.png';
+    const data = new Uint8Array([0x89, 0x50, 0x4e, 0x47]); // PNG header bytes
+    await zip.addFile(fileName, data);
+    await zip.close();
+
+    const buf = mock.toBuffer();
+    const nameLen = readUint16(buf, 26);
+    const expectedNameBytes = encoder.encode(fileName);
+    expect(nameLen).toBe(expectedNameBytes.length);
+
+    // ファイル名バイト列を比較
+    const nameBytes = buf.slice(30, 30 + nameLen);
+    expect(nameBytes).toEqual(expectedNameBytes);
+  });
+
+  test('CRC-32 が Local File Header に正しく記録', async () => {
+    const mock = new MockWritableStream();
+    const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+
+    const data = encoder.encode('test data for crc');
+    const expectedCrc = crc32(data);
+    await zip.addFile('file.bin', data);
+    await zip.close();
+
+    const buf = mock.toBuffer();
+    // CRC-32 は Local File Header の offset 14
+    expect(readUint32(buf, 14)).toBe(expectedCrc);
   });
 });
