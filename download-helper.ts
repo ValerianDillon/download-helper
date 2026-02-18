@@ -41,6 +41,16 @@ export type DownloadJsonObj = {
 };
 
 /**
+ * ダウンロードUI生成オプション
+ */
+export type DownloadUIOptions = {
+  targetDocument?: Document;
+  targetWindow?: Window;
+  prefillData?: DownloadJsonObj;
+  onClose?: () => void;
+};
+
+/**
  * ダウンロード用のUtilityクラス
  */
 export class DownloadUtils {
@@ -253,8 +263,8 @@ export class DownloadObject {
     this.utils = utils;
   }
 
-  stringify(): string {
-    const downloadJson: DownloadJsonObj = {
+  toJsonObj(): DownloadJsonObj {
+    return {
       posts: this.orderedPosts.map((it) => it.toJsonObjBy(this.downloadObj.posts)),
       id: this.downloadObj.id,
       url: this.url,
@@ -262,7 +272,10 @@ export class DownloadObject {
       postCount: this.countPost(),
       fileCount: this.countFile(),
     };
-    return JSON.stringify(downloadJson);
+  }
+
+  stringify(): string {
+    return JSON.stringify(this.toJsonObj());
   }
 
   setUrl(url: string) {
@@ -694,46 +707,61 @@ export class DownloadHelper {
   /**
    * ダウンロード用のUIを作成する
    * @param title ダウンローダーの名前
+   * @param options UI生成オプション
    */
-  async createDownloadUI(title: string) {
-    document.head.innerHTML = '';
-    document.body.innerHTML = '';
-    document.getElementsByTagName('html')[0].style.height = '100%';
-    document.body.style.height = '100%';
-    document.body.style.margin = '0';
-    document.title = title;
+  async createDownloadUI(title: string, options?: DownloadUIOptions) {
+    const doc = options?.targetDocument ?? document;
+    const win = options?.targetWindow ?? window;
 
-    const bootLink = document.createElement('link');
+    doc.head.innerHTML = '';
+    doc.body.innerHTML = '';
+    doc.getElementsByTagName('html')[0].style.height = '100%';
+    doc.body.style.height = '100%';
+    doc.body.style.margin = '0';
+    doc.title = title;
+
+    const bootLink = doc.createElement('link');
     bootLink.href = this.bootCSS.href;
     bootLink.rel = 'stylesheet';
     bootLink.integrity = this.bootCSS.integrity;
     bootLink.crossOrigin = 'anonymous';
-    document.head.appendChild(bootLink);
+    doc.head.appendChild(bootLink);
 
-    const bodyDiv = document.createElement('div');
+    const bodyDiv = doc.createElement('div');
     bodyDiv.style.display = 'flex';
     bodyDiv.style.alignItems = 'center';
     bodyDiv.style.justifyContent = 'center';
     bodyDiv.style.flexDirection = 'column';
     bodyDiv.style.height = '100%';
-    const inputDiv = document.createElement('div');
+    const inputDiv = doc.createElement('div');
     inputDiv.className = 'input-group mb-2';
     inputDiv.style.width = '400px';
-    const input = document.createElement('input');
+    const input = doc.createElement('input');
     input.type = 'text';
     input.className = 'form-control';
     input.placeholder = 'ここにJSONを貼り付け';
+    if (options?.prefillData) {
+      input.value = JSON.stringify(options.prefillData);
+    }
     inputDiv.appendChild(input);
-    const button = document.createElement('button');
+    const button = doc.createElement('button');
     button.className = 'btn btn-outline-secondary btn-labeled';
     button.type = 'button';
     button.innerText = 'Download';
     inputDiv.appendChild(button);
+    if (options?.onClose) {
+      const closeButton = doc.createElement('button');
+      closeButton.className = 'btn btn-outline-danger btn-labeled';
+      closeButton.type = 'button';
+      closeButton.innerText = 'Close';
+      closeButton.onclick = options.onClose;
+      inputDiv.appendChild(closeButton);
+    }
     bodyDiv.appendChild(inputDiv);
-    const progressDiv = document.createElement('div');
+    const progressDiv = doc.createElement('div');
     progressDiv.className = 'progress mb-3';
     progressDiv.style.width = '400px';
-    const progress = document.createElement('div');
+    const progress = doc.createElement('div');
     progress.className = 'progress-bar';
     progress.style.width = '0%';
     progress.innerText = '0%';
@@ -748,29 +776,29 @@ export class DownloadHelper {
     };
     progressDiv.appendChild(progress);
     bodyDiv.appendChild(progressDiv);
-    const infoDiv = document.createElement('div');
+    const infoDiv = doc.createElement('div');
     infoDiv.style.width = '350px';
-    const checkBoxDiv = document.createElement('div');
+    const checkBoxDiv = doc.createElement('div');
     checkBoxDiv.className = 'form-check float-start';
-    const checkBox = document.createElement('input');
+    const checkBox = doc.createElement('input');
     checkBox.className = 'form-check-input';
     checkBox.type = 'checkbox';
     checkBox.id = 'LogCheck';
     checkBox.checked = true;
     checkBoxDiv.appendChild(checkBox);
-    const checkBoxLabel = document.createElement('label');
+    const checkBoxLabel = doc.createElement('label');
     checkBoxLabel.className = 'form-check-label';
     checkBoxLabel.setAttribute('for', 'LogCheck');
     checkBoxLabel.innerText = 'ログを自動スクロール';
     checkBoxDiv.appendChild(checkBoxLabel);
     infoDiv.appendChild(checkBoxDiv);
-    const remainTimeDiv = document.createElement('div');
+    const remainTimeDiv = doc.createElement('div');
     remainTimeDiv.className = 'float-end';
     remainTimeDiv.innerText = '残りおよそ -:--';
     const setRemainTime = (r: string) => (remainTimeDiv.innerText = `残りおよそ ${r}`);
     infoDiv.appendChild(remainTimeDiv);
     bodyDiv.appendChild(infoDiv);
-    const textarea = document.createElement('textarea');
+    const textarea = doc.createElement('textarea');
     textarea.className = 'form-control';
     textarea.readOnly = true;
     textarea.style.resize = 'both';
@@ -783,28 +811,75 @@ export class DownloadHelper {
       }
     };
     bodyDiv.appendChild(textarea);
-    document.body.appendChild(bodyDiv);
+    doc.body.appendChild(bodyDiv);
 
-    const bootScript = document.createElement('script');
+    const bootScript = doc.createElement('script');
     bootScript.src = this.bootJS.src;
     bootScript.integrity = this.bootJS.integrity;
     bootScript.crossOrigin = 'anonymous';
-    document.body.appendChild(bootScript);
+    doc.body.appendChild(bootScript);
     const downloadFun = this.downloadZip.bind(this);
 
     button.onclick = async () => {
       button.disabled = true;
-      const loadingFun = (event: BeforeUnloadEvent) => (event.returnValue = `downloading`);
-      window.addEventListener('beforeunload', loadingFun);
+      const loadingFun = (event: BeforeUnloadEvent) => (event.returnValue = 'downloading');
+      win.addEventListener('beforeunload', loadingFun);
       try {
         await downloadFun(JSON.parse(input.value), setProgress, textLog, setRemainTime);
       } catch (e) {
         textLog('エラー出た');
         console.error(e);
       } finally {
-        window.removeEventListener('beforeunload', loadingFun);
+        win.removeEventListener('beforeunload', loadingFun);
       }
     };
+  }
+
+  /**
+   * iframe オーバーレイでダウンロードUIを表示する
+   * @param title ダウンローダーの名前
+   * @param parentDocument オーバーレイを配置する親ドキュメント
+   * @param data 事前投入するデータ
+   * @returns オーバーレイを閉じる関数
+   */
+  async createDownloadOverlay(title: string, parentDocument: Document, data?: DownloadJsonObj): Promise<() => void> {
+    const overlay = parentDocument.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.width = '100%';
+    overlay.style.height = '100%';
+    overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+    overlay.style.zIndex = '2147483647';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+
+    const iframe = parentDocument.createElement('iframe');
+    iframe.style.width = '100%';
+    iframe.style.height = '100%';
+    iframe.style.border = 'none';
+    overlay.appendChild(iframe);
+    parentDocument.body.appendChild(overlay);
+
+    const closeOverlay = () => {
+      overlay.remove();
+    };
+
+    const iframeDoc = iframe.contentDocument;
+    const iframeWin = iframe.contentWindow;
+    if (!iframeDoc || !iframeWin) {
+      throw new Error('iframe の contentDocument/contentWindow を取得できません');
+    }
+
+    await this.createDownloadUI(title, {
+      targetDocument: iframeDoc,
+      targetWindow: iframeWin,
+      prefillData: data,
+      onClose: closeOverlay,
+    });
+
+    return closeOverlay;
   }
 
   /**
