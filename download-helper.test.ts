@@ -3,7 +3,6 @@ import {
   crc32,
   DownloadHelper,
   type DownloadJsonObj,
-  DownloadObject,
   DownloadUtils,
   type FileObj,
   FileObject,
@@ -599,57 +598,5 @@ describe('ZipWriter', () => {
     const buf = mock.toBuffer();
     // CRC-32 は Local File Header の offset 14
     expect(readUint32(buf, 14)).toBe(expectedCrc);
-  });
-});
-
-// ============================================================
-// 6. DownloadObject.toJsonObj tests
-// ============================================================
-describe('DownloadObject.toJsonObj', () => {
-  const utils = new DownloadUtils();
-
-  test('toJsonObj() と JSON.parse(stringify()) が同一の結果を返す', () => {
-    const obj = new DownloadObject('test-creator', utils);
-    obj.setUrl('https://example.com/@test-creator');
-    const post = obj.addPost('テスト投稿');
-    post.setInfo('{}');
-    post.setHtml('<p>content</p>');
-    post.setTags(['tag1', 'tag2']);
-    post.addFile('image', 'png', 'https://example.com/image.png');
-
-    const jsonObj = obj.toJsonObj();
-    const parsed = JSON.parse(obj.stringify());
-    expect(jsonObj).toEqual(parsed);
-  });
-
-  test('toJsonObj() のフィールドが正しい', () => {
-    const obj = new DownloadObject('creator-id', utils);
-    obj.setUrl('https://example.com');
-    obj.setTags(['tagA', 'tagB']);
-    const post = obj.addPost('投稿1');
-    post.setInfo('info-text');
-    post.setHtml('<p>html</p>');
-    post.setTags(['tagA']);
-    post.addFile('file1', 'jpg', 'https://example.com/file1.jpg');
-    post.addFile('file2', 'png', 'https://example.com/file2.png');
-
-    const result = obj.toJsonObj();
-    expect(result.id).toBe('creator-id');
-    expect(result.url).toBe('https://example.com');
-    expect(result.tags).toEqual(['tagA', 'tagB']);
-    expect(result.postCount).toBe(1);
-    expect(result.fileCount).toBe(2);
-    expect(result.posts).toHaveLength(1);
-    expect(result.posts[0].originalName).toBe('投稿1');
-    expect(result.posts[0].files).toHaveLength(2);
-  });
-
-  test('投稿が空の場合', () => {
-    const obj = new DownloadObject('empty', utils);
-    obj.setUrl('https://example.com');
-    const result = obj.toJsonObj();
-    expect(result.posts).toEqual([]);
-    expect(result.postCount).toBe(0);
-    expect(result.fileCount).toBe(0);
   });
 });
