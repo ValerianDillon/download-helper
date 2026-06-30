@@ -9,5 +9,5 @@ Chrome / Edge (File System Access API を使用)
 ## 使い方
 
 ```bash
-npm install --save github:ValerianDillon/download-helper#v3.5.0
+npm install --save github:ValerianDillon/download-helper#v3.6.0
 ```

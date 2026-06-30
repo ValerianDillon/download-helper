@@ -13,6 +13,7 @@ export type PostObj = {
   html: string;
   tags: string[];
   cover?: FileObj;
+  publishedDatetime?: string;
 };
 
 /**
@@ -32,6 +33,7 @@ export type DownloadJsonObj = {
     files: { url: string; originalName: string; encodedName: string }[];
     tags: string[];
     cover?: { url: string; name: string };
+    publishedDatetime?: string;
   }[];
   id: string;
   url: string;
@@ -338,6 +340,10 @@ export class PostObject {
     this.postObj.tags = tags;
   }
 
+  setPublishedDatetime(iso: string) {
+    this.postObj.publishedDatetime = iso;
+  }
+
   setCover(name: string, extension: string, url: string): FileObject {
     const fileObj: FileObj = { name, extension: extension ? `.${extension}` : '', url };
     this.postObj.cover = fileObj;
@@ -463,6 +469,7 @@ export class PostObject {
       files: this.collectFiles(),
       tags: this.postObj.tags,
       cover,
+      publishedDatetime: this.postObj.publishedDatetime,
     };
   }
 
@@ -564,6 +571,122 @@ async function toUint8Array(parts: BlobPart[]): Promise<Uint8Array> {
 }
 
 /**
+ * Date を ZIP の DOS time/date 表現可能範囲 (1980-01-01 00:00:00 〜 2107-12-31 23:59:58) にクランプする
+ * - DOS time/date はローカル時刻で計算される慣例なので min/max もローカル時刻で構築する
+ * - Issue #7 の Acceptance Criteria に従い、NTFS / Extended Timestamp にも clamp 後の同一 Date を使う
+ *   (NTFS は 1601-9999、UT は 1901-2038 を扱えるが、3 種で値を整合させるため意図的に DOS 範囲で揃える)
+ * @internal
+ */
+export function clampToZipRange(date: Date): Date {
+  const min = new Date(1980, 0, 1, 0, 0, 0, 0);
+  const max = new Date(2107, 11, 31, 23, 59, 58, 0);
+  if (date.getTime() < min.getTime()) return min;
+  if (date.getTime() > max.getTime()) return max;
+  return date;
+}
+
+/**
+ * Date を DOS time / DOS date (各 16 bit) に変換する
+ * - DOS time: (h << 11) | (m << 5) | (s >> 1)
+ * - DOS date: ((y - 1980) << 9) | ((mo + 1) << 5) | d
+ * 入力はクランプ済みであることを前提とする
+ * @internal
+ */
+export function toDosTimeDate(date: Date): { time: number; dosDate: number } {
+  const h = date.getHours();
+  const m = date.getMinutes();
+  const s = date.getSeconds();
+  const y = date.getFullYear();
+  const mo = date.getMonth();
+  const d = date.getDate();
+  const time = (h << 11) | (m << 5) | (s >> 1);
+  const dosDate = ((y - 1980) << 9) | ((mo + 1) << 5) | d;
+  return { time, dosDate };
+}
+
+/**
+ * NTFS Extra Field (0x000A) を構築する (36 バイト固定)
+ * mtime / atime / ctime はすべて同一の date を FILETIME として書き込む
+ * @internal
+ */
+export function buildNtfsExtra(date: Date): Uint8Array {
+  const buf = new ArrayBuffer(36);
+  const view = new DataView(buf);
+  view.setUint16(0, 0x000a, true); // Header ID: NTFS
+  view.setUint16(2, 32, true); // Data Size
+  view.setUint32(4, 0, true); // Reserved
+  view.setUint16(8, 0x0001, true); // Attr Tag (Tag1)
+  view.setUint16(10, 24, true); // Attr Size (Size1)
+  // FILETIME = (unix_ms + epoch_diff_ms) * 10000 (100ns 単位、1601-01-01 起点 UTC)
+  // 11644473600000 = (1970-01-01 - 1601-01-01) のミリ秒
+  const filetime = (BigInt(date.getTime()) + 11644473600000n) * 10000n;
+  view.setBigUint64(12, filetime, true); // Mtime
+  view.setBigUint64(20, filetime, true); // Atime
+  view.setBigUint64(28, filetime, true); // Ctime
+  return new Uint8Array(buf);
+}
+
+/**
+ * Extended Timestamp Extra Field (0x5455) を LFH 用に構築する (17 バイト)
+ * Flags = 0x07 (mtime + atime + ctime)
+ * 入力 unix time が signed int32 範囲に収まることを呼び出し側が保証する
+ * @internal
+ */
+export function buildExtTimestampLfh(date: Date): Uint8Array {
+  const buf = new ArrayBuffer(17);
+  const view = new DataView(buf);
+  view.setUint16(0, 0x5455, true); // Header ID: extended timestamp
+  view.setUint16(2, 13, true); // Data Size
+  view.setUint8(4, 0x07); // Flags: mtime + atime + ctime
+  const unix = Math.floor(date.getTime() / 1000);
+  view.setInt32(5, unix, true); // Mtime
+  view.setInt32(9, unix, true); // Atime
+  view.setInt32(13, unix, true); // Ctime
+  return new Uint8Array(buf);
+}
+
+/**
+ * Extended Timestamp Extra Field (0x5455) を CD 用に構築する (9 バイト, mtime のみ)
+ * - CD では mtime のみ格納するが、Flags は LFH と同一の 0x07 にする Info-ZIP 慣例
+ *   (proginfo/extrafld.txt: "This bitmap is the same as that in the local-header field.")
+ * - Flags は「LFH 側にどの timestamp が存在するか」を示すビットマップであり、CD payload の構成を表すものではない
+ * @internal
+ */
+export function buildExtTimestampCd(date: Date): Uint8Array {
+  const buf = new ArrayBuffer(9);
+  const view = new DataView(buf);
+  view.setUint16(0, 0x5455, true); // Header ID: extended timestamp
+  view.setUint16(2, 5, true); // Data Size (Flags 1 + Mtime 4)
+  view.setUint8(4, 0x07); // Flags (LFH と同一値、Info-ZIP 慣例)
+  const unix = Math.floor(date.getTime() / 1000);
+  view.setInt32(5, unix, true); // Mtime
+  return new Uint8Array(buf);
+}
+
+/**
+ * 値が signed int32 範囲に収まるか
+ * @internal
+ */
+function isInt32(n: number): boolean {
+  return n >= -2147483648 && n <= 2147483647;
+}
+
+/**
+ * 複数の Uint8Array を連結する
+ * @internal
+ */
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
+
+/**
  * ZIP ファイル書き込みクラス (stored / 非圧縮)
  * File System Access API の FileSystemWritableFileStream に直接書き込む
  * @internal
@@ -571,7 +694,15 @@ async function toUint8Array(parts: BlobPart[]): Promise<Uint8Array> {
 export class ZipWriter {
   private writable: FileSystemWritableFileStream;
   private offset = 0;
-  private entries: { name: Uint8Array; crc: number; size: number; offset: number }[] = [];
+  private entries: {
+    name: Uint8Array;
+    crc: number;
+    size: number;
+    offset: number;
+    dosTime: number;
+    dosDate: number;
+    extraCd: Uint8Array;
+  }[] = [];
   private encoder = new TextEncoder();
 
   constructor(writable: FileSystemWritableFileStream) {
@@ -582,32 +713,66 @@ export class ZipWriter {
    * ファイルを ZIP に追加する
    * @param name ZIP 内のファイルパス (UTF-8)
    * @param data ファイルデータ
+   * @param date 任意。指定時は DOS time/date に加え NTFS / Extended Timestamp Extra Field を書き込む。
+   *   省略または Invalid Date の場合は従来挙動 (DOS 0、extra field なし) でバイト列を維持する。
+   *   1980-01-01 〜 2107-12-31 23:59:58 にクランプ。Extended Timestamp は clamp 後の Unix time が
+   *   signed int32 範囲に収まる場合のみ書く。
    */
-  async addFile(name: string, data: Uint8Array): Promise<void> {
+  async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
     const nameBytes = this.encoder.encode(name);
     const fileCrc = crc32(data);
     const localHeaderOffset = this.offset;
 
-    // Local File Header (30 bytes + name length)
+    let dosTime = 0;
+    let dosDate = 0;
+    let extraLfh = new Uint8Array(0);
+    let extraCd = new Uint8Array(0);
+
+    if (date !== undefined && Number.isFinite(date.getTime())) {
+      const d = clampToZipRange(date);
+      const dos = toDosTimeDate(d);
+      dosTime = dos.time;
+      dosDate = dos.dosDate;
+      const ntfs = buildNtfsExtra(d);
+      const unix = Math.floor(d.getTime() / 1000);
+      if (isInt32(unix)) {
+        extraLfh = concatBytes([ntfs, buildExtTimestampLfh(d)]);
+        extraCd = concatBytes([ntfs, buildExtTimestampCd(d)]);
+      } else {
+        extraLfh = ntfs;
+        extraCd = ntfs;
+      }
+    }
+
+    // Local File Header (30 bytes + name length + extra field length)
     const header = new ArrayBuffer(30);
     const view = new DataView(header);
     view.setUint32(0, 0x04034b50, true); // signature
     view.setUint16(4, 20, true); // version needed (2.0)
     view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
     view.setUint16(8, 0, true); // compression method (stored)
-    view.setUint16(10, 0, true); // mod time
-    view.setUint16(12, 0, true); // mod date
+    view.setUint16(10, dosTime, true); // mod time
+    view.setUint16(12, dosDate, true); // mod date
     view.setUint32(14, fileCrc, true); // crc-32
     view.setUint32(18, data.length, true); // compressed size
     view.setUint32(22, data.length, true); // uncompressed size
     view.setUint16(26, nameBytes.length, true); // file name length
-    view.setUint16(28, 0, true); // extra field length
+    view.setUint16(28, extraLfh.length, true); // extra field length
 
     await this.write(new Uint8Array(header));
     await this.write(nameBytes);
+    if (extraLfh.length > 0) await this.write(extraLfh);
     await this.write(data);
 
-    this.entries.push({ name: nameBytes, crc: fileCrc, size: data.length, offset: localHeaderOffset });
+    this.entries.push({
+      name: nameBytes,
+      crc: fileCrc,
+      size: data.length,
+      offset: localHeaderOffset,
+      dosTime,
+      dosDate,
+      extraCd,
+    });
   }
 
   /**
@@ -624,13 +789,13 @@ export class ZipWriter {
       view.setUint16(6, 20, true); // version needed
       view.setUint16(8, 0x0800, true); // general purpose bit flag (UTF-8)
       view.setUint16(10, 0, true); // compression method
-      view.setUint16(12, 0, true); // mod time
-      view.setUint16(14, 0, true); // mod date
+      view.setUint16(12, entry.dosTime, true); // mod time
+      view.setUint16(14, entry.dosDate, true); // mod date
       view.setUint32(16, entry.crc, true); // crc-32
       view.setUint32(20, entry.size, true); // compressed size
       view.setUint32(24, entry.size, true); // uncompressed size
       view.setUint16(28, entry.name.length, true); // file name length
-      view.setUint16(30, 0, true); // extra field length
+      view.setUint16(30, entry.extraCd.length, true); // extra field length
       view.setUint16(32, 0, true); // file comment length
       view.setUint16(34, 0, true); // disk number start
       view.setUint16(36, 0, true); // internal file attributes
@@ -639,6 +804,7 @@ export class ZipWriter {
 
       await this.write(new Uint8Array(cdHeader));
       await this.write(entry.name);
+      if (entry.extraCd.length > 0) await this.write(entry.extraCd);
     }
 
     const cdSize = this.offset - cdOffset;
@@ -828,8 +994,14 @@ export class DownloadHelper {
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
 
-    const enqueue = async (fileBits: BlobPart[], path: string) => {
-      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits));
+    const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
+      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
+    };
+
+    const parsePublishedDate = (iso?: string): Date | undefined => {
+      if (!iso) return undefined;
+      const d = new Date(iso);
+      return Number.isFinite(d.getTime()) ? d : undefined;
     };
 
     const startTime = Math.floor(Date.now() / 1000);
@@ -837,22 +1009,31 @@ export class DownloadHelper {
     let failedCount = 0;
 
     log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
-    // ルートhtml
+    // ルートhtml (post に紐づかないので date は付与しない)
     await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html');
     // 投稿処理
     let postCount = 0;
     for (const post of downloadObj.posts) {
       log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
+      const postDate = parsePublishedDate(post.publishedDatetime);
       // 投稿情報+html
       const informationFile = utils.createInformationFile(post.informationText);
-      await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`);
-      await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`);
+      await enqueue(
+        informationFile.content,
+        `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`,
+        postDate,
+      );
+      await enqueue(
+        [this.createHtmlFromBody(post.originalName, post.htmlText)],
+        `${post.encodedName}/index.html`,
+        postDate,
+      );
       // カバー画像
       if (post.cover) {
         log(`download ${post.cover.name}`);
         const blob = await utils.fetchWithLimit(post.cover, 1);
         if (blob) {
-          await enqueue([blob], `${post.encodedName}/${post.cover.name}`);
+          await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
         }
       }
       // ファイル処理
@@ -861,7 +1042,7 @@ export class DownloadHelper {
         log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
         const blob = await utils.fetchWithLimit({ url: file.url, name: file.encodedName }, 1);
         if (blob) {
-          await enqueue([blob], `${post.encodedName}/${file.encodedName}`);
+          await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
         } else {
           failedCount++;
           console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
@@ -988,6 +1169,15 @@ export class DownloadHelper {
           }
         }):
           return true;
+      }
+      // publishedDatetime検証 (optional、文字列か undefined のみ許容)
+      if (p.publishedDatetime !== undefined && typeof p.publishedDatetime !== 'string') {
+        console.error(
+          'ダウンロード用オブジェクトの型が不正(postsの値にpublishedDatetimeが文字列でないものが含まれる)',
+          p.publishedDatetime,
+          t.posts,
+        );
+        return true;
       }
       // cover検証 (filesとは独立して検証)
       const cover = p.cover as Record<string, unknown> | null | undefined;

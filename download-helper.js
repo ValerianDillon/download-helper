@@ -160,6 +160,9 @@ export class PostObject {
   setTags(tags) {
     this.postObj.tags = tags;
   }
+  setPublishedDatetime(iso) {
+    this.postObj.publishedDatetime = iso;
+  }
   setCover(name, extension, url) {
     const fileObj = { name, extension: extension ? `.${extension}` : "", url };
     this.postObj.cover = fileObj;
@@ -259,7 +262,8 @@ export class PostObject {
       htmlText: this.postObj.html,
       files: this.collectFiles(),
       tags: this.postObj.tags,
-      cover
+      cover,
+      publishedDatetime: this.postObj.publishedDatetime
     };
   }
   collectFiles() {
@@ -332,6 +336,75 @@ async function toUint8Array(parts) {
   const blob = new Blob(parts);
   return new Uint8Array(await blob.arrayBuffer());
 }
+export function clampToZipRange(date) {
+  const min = new Date(1980, 0, 1, 0, 0, 0, 0);
+  const max = new Date(2107, 11, 31, 23, 59, 58, 0);
+  if (date.getTime() < min.getTime())
+    return min;
+  if (date.getTime() > max.getTime())
+    return max;
+  return date;
+}
+export function toDosTimeDate(date) {
+  const h = date.getHours();
+  const m = date.getMinutes();
+  const s = date.getSeconds();
+  const y = date.getFullYear();
+  const mo = date.getMonth();
+  const d = date.getDate();
+  const time = h << 11 | m << 5 | s >> 1;
+  const dosDate = y - 1980 << 9 | mo + 1 << 5 | d;
+  return { time, dosDate };
+}
+export function buildNtfsExtra(date) {
+  const buf = new ArrayBuffer(36);
+  const view = new DataView(buf);
+  view.setUint16(0, 10, true);
+  view.setUint16(2, 32, true);
+  view.setUint32(4, 0, true);
+  view.setUint16(8, 1, true);
+  view.setUint16(10, 24, true);
+  const filetime = (BigInt(date.getTime()) + 11644473600000n) * 10000n;
+  view.setBigUint64(12, filetime, true);
+  view.setBigUint64(20, filetime, true);
+  view.setBigUint64(28, filetime, true);
+  return new Uint8Array(buf);
+}
+export function buildExtTimestampLfh(date) {
+  const buf = new ArrayBuffer(17);
+  const view = new DataView(buf);
+  view.setUint16(0, 21589, true);
+  view.setUint16(2, 13, true);
+  view.setUint8(4, 7);
+  const unix = Math.floor(date.getTime() / 1000);
+  view.setInt32(5, unix, true);
+  view.setInt32(9, unix, true);
+  view.setInt32(13, unix, true);
+  return new Uint8Array(buf);
+}
+export function buildExtTimestampCd(date) {
+  const buf = new ArrayBuffer(9);
+  const view = new DataView(buf);
+  view.setUint16(0, 21589, true);
+  view.setUint16(2, 5, true);
+  view.setUint8(4, 7);
+  const unix = Math.floor(date.getTime() / 1000);
+  view.setInt32(5, unix, true);
+  return new Uint8Array(buf);
+}
+function isInt32(n) {
+  return n >= -2147483648 && n <= 2147483647;
+}
+function concatBytes(parts) {
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
 
 export class ZipWriter {
   writable;
@@ -341,27 +414,56 @@ export class ZipWriter {
   constructor(writable) {
     this.writable = writable;
   }
-  async addFile(name, data) {
+  async addFile(name, data, date) {
     const nameBytes = this.encoder.encode(name);
     const fileCrc = crc32(data);
     const localHeaderOffset = this.offset;
+    let dosTime = 0;
+    let dosDate = 0;
+    let extraLfh = new Uint8Array(0);
+    let extraCd = new Uint8Array(0);
+    if (date !== undefined && Number.isFinite(date.getTime())) {
+      const d = clampToZipRange(date);
+      const dos = toDosTimeDate(d);
+      dosTime = dos.time;
+      dosDate = dos.dosDate;
+      const ntfs = buildNtfsExtra(d);
+      const unix = Math.floor(d.getTime() / 1000);
+      if (isInt32(unix)) {
+        extraLfh = concatBytes([ntfs, buildExtTimestampLfh(d)]);
+        extraCd = concatBytes([ntfs, buildExtTimestampCd(d)]);
+      } else {
+        extraLfh = ntfs;
+        extraCd = ntfs;
+      }
+    }
     const header = new ArrayBuffer(30);
     const view = new DataView(header);
     view.setUint32(0, 67324752, true);
     view.setUint16(4, 20, true);
     view.setUint16(6, 2048, true);
     view.setUint16(8, 0, true);
-    view.setUint16(10, 0, true);
-    view.setUint16(12, 0, true);
+    view.setUint16(10, dosTime, true);
+    view.setUint16(12, dosDate, true);
     view.setUint32(14, fileCrc, true);
     view.setUint32(18, data.length, true);
     view.setUint32(22, data.length, true);
     view.setUint16(26, nameBytes.length, true);
-    view.setUint16(28, 0, true);
+    view.setUint16(28, extraLfh.length, true);
     await this.write(new Uint8Array(header));
     await this.write(nameBytes);
+    if (extraLfh.length > 0)
+      await this.write(extraLfh);
     await this.write(data);
-    this.entries.push({ name: nameBytes, crc: fileCrc, size: data.length, offset: localHeaderOffset });
+    this.entries.push({
+      name: nameBytes,
+      crc: fileCrc,
+      size: data.length,
+      offset: localHeaderOffset,
+      dosTime,
+      dosDate,
+      extraCd
+    });
   }
   async close() {
     const cdOffset = this.offset;
@@ -373,13 +475,13 @@ export class ZipWriter {
       view.setUint16(6, 20, true);
       view.setUint16(8, 2048, true);
       view.setUint16(10, 0, true);
-      view.setUint16(12, 0, true);
-      view.setUint16(14, 0, true);
+      view.setUint16(12, entry.dosTime, true);
+      view.setUint16(14, entry.dosDate, true);
       view.setUint32(16, entry.crc, true);
       view.setUint32(20, entry.size, true);
       view.setUint32(24, entry.size, true);
       view.setUint16(28, entry.name.length, true);
-      view.setUint16(30, 0, true);
+      view.setUint16(30, entry.extraCd.length, true);
       view.setUint16(32, 0, true);
       view.setUint16(34, 0, true);
       view.setUint16(36, 0, true);
@@ -387,6 +489,8 @@ export class ZipWriter {
       view.setUint32(42, entry.offset, true);
       await this.write(new Uint8Array(cdHeader));
       await this.write(entry.name);
+      if (entry.extraCd.length > 0)
+        await this.write(entry.extraCd);
     }
     const cdSize = this.offset - cdOffset;
     const eocd = new ArrayBuffer(22);
@@ -537,8 +641,14 @@ export class DownloadHelper {
     const handle = await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
-    const enqueue = async (fileBits, path) => {
-      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits));
+    const enqueue = async (fileBits, path, date) => {
+      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
+    };
+    const parsePublishedDate = (iso) => {
+      if (!iso)
+        return;
+      const d = new Date(iso);
+      return Number.isFinite(d.getTime()) ? d : undefined;
     };
     const startTime = Math.floor(Date.now() / 1000);
     let count = 0;
@@ -548,14 +658,15 @@ export class DownloadHelper {
     let postCount = 0;
     for (const post of downloadObj.posts) {
       log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
+      const postDate = parsePublishedDate(post.publishedDatetime);
       const informationFile = utils.createInformationFile(post.informationText);
-      await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`);
-      await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`);
+      await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`, postDate);
+      await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`, postDate);
       if (post.cover) {
         log(`download ${post.cover.name}`);
         const blob = await utils.fetchWithLimit(post.cover, 1);
         if (blob) {
-          await enqueue([blob], `${post.encodedName}/${post.cover.name}`);
+          await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
         }
       }
       let fileCount = 0;
@@ -563,7 +674,7 @@ export class DownloadHelper {
         log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
         const blob = await utils.fetchWithLimit({ url: file.url, name: file.encodedName }, 1);
         if (blob) {
-          await enqueue([blob], `${post.encodedName}/${file.encodedName}`);
+          await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
         } else {
           failedCount++;
           console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
@@ -651,6 +762,10 @@ export class DownloadHelper {
           }
         }):
           return true;
+      }
+      if (p.publishedDatetime !== undefined && typeof p.publishedDatetime !== "string") {
+        console.error("ダウンロード用オブジェクトの型が不正(postsの値にpublishedDatetimeが文字列でないものが含まれる)", p.publishedDatetime, t.posts);
+        return true;
       }
       const cover = p.cover;
       if (cover !== undefined) {

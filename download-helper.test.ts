@@ -1,3 +1,6 @@
+// DOS time/date は getHours() 等のローカル時刻で計算するため、テストの再現性確保のため UTC 固定
+process.env.TZ = 'UTC';
+
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import {
   crc32,
@@ -419,6 +422,24 @@ describe('isDownloadJsonObj', () => {
     expect(helper.isDownloadJsonObj(obj)).toBe(true);
   });
 
+  test('publishedDatetime に文字列 → true', () => {
+    const obj = createValidObj();
+    obj.posts[0].publishedDatetime = '2024-01-01T00:00:00Z';
+    expect(helper.isDownloadJsonObj(obj)).toBe(true);
+  });
+
+  test('publishedDatetime が undefined → true (省略可)', () => {
+    const obj = createValidObj();
+    obj.posts[0].publishedDatetime = undefined;
+    expect(helper.isDownloadJsonObj(obj)).toBe(true);
+  });
+
+  test('publishedDatetime が文字列でない → false', () => {
+    const obj = createValidObj();
+    (obj.posts[0] as Record<string, unknown>).publishedDatetime = 12345;
+    expect(helper.isDownloadJsonObj(obj)).toBe(false);
+  });
+
   test('cover が不正な型 (文字列) → false', () => {
     const obj = createValidObj();
     (obj.posts[0] as Record<string, unknown>).cover = 'not-object';
@@ -598,5 +619,165 @@ describe('ZipWriter', () => {
     const buf = mock.toBuffer();
     // CRC-32 は Local File Header の offset 14
     expect(readUint32(buf, 14)).toBe(expectedCrc);
+  });
+
+  // ----------------------------------------------------------
+  // addFile に date 引数を渡した場合 (Issue #7)
+  // ----------------------------------------------------------
+  describe('addFile (date 引数)', () => {
+    /**
+     * extra field 全体から指定 Header ID のブロックを線形検索する
+     */
+    function findExtraField(extra: Uint8Array, headerId: number): { offset: number; size: number } | null {
+      let offset = 0;
+      while (offset + 4 <= extra.length) {
+        const id = extra[offset] | (extra[offset + 1] << 8);
+        const size = extra[offset + 2] | (extra[offset + 3] << 8);
+        if (id === headerId) return { offset, size };
+        offset += 4 + size;
+      }
+      return null;
+    }
+
+    function readBigUint64LE(buf: Uint8Array, offset: number): bigint {
+      return new DataView(buf.buffer, buf.byteOffset).getBigUint64(offset, true);
+    }
+
+    function readInt32LE(buf: Uint8Array, offset: number): number {
+      return new DataView(buf.buffer, buf.byteOffset).getInt32(offset, true);
+    }
+
+    /**
+     * 単一 ZIP を生成して buffer を返すヘルパ
+     */
+    async function buildZip(name: string, data: Uint8Array, date?: Date): Promise<Uint8Array> {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.addFile(name, data, date);
+      await zip.close();
+      return mock.toBuffer();
+    }
+
+    test('引数2形式: DOS time/date=0、extra field length=0 (後方互換)', async () => {
+      const buf = await buildZip('test.txt', encoder.encode('hello'));
+      expect(readUint16(buf, 10)).toBe(0);
+      expect(readUint16(buf, 12)).toBe(0);
+      expect(readUint16(buf, 28)).toBe(0);
+
+      const nameLen = readUint16(buf, 26);
+      const cdOffset = 30 + nameLen + 5; // 'hello' = 5 バイト、extra なし
+      expect(readUint32(buf, cdOffset)).toBe(0x02014b50);
+      expect(readUint16(buf, cdOffset + 12)).toBe(0);
+      expect(readUint16(buf, cdOffset + 14)).toBe(0);
+      expect(readUint16(buf, cdOffset + 30)).toBe(0);
+    });
+
+    test('引数2形式と Invalid Date は完全一致のバイト列', async () => {
+      const a = await buildZip('a.txt', encoder.encode('a'));
+      const b = await buildZip('a.txt', encoder.encode('a'), new Date('not-a-date'));
+      expect(b).toEqual(a);
+    });
+
+    test('一般ケース (2024-05-01T12:34:56Z): DOS / NTFS / UT が LFH/CD に整合して書かれる', async () => {
+      const date = new Date('2024-05-01T12:34:56Z');
+      const data = encoder.encode('hello');
+      const buf = await buildZip('test.txt', data, date);
+
+      // 期待 DOS time = (12<<11)|(34<<5)|(56>>1) = 25692
+      // 期待 DOS date = ((2024-1980)<<9)|(5<<5)|1 = 22689
+      const expectedDosTime = 25692;
+      const expectedDosDate = 22689;
+      const expectedFiletime = (BigInt(date.getTime()) + 11644473600000n) * 10000n;
+      const expectedUnix = Math.floor(date.getTime() / 1000);
+
+      // --- LFH ---
+      expect(readUint16(buf, 10)).toBe(expectedDosTime);
+      expect(readUint16(buf, 12)).toBe(expectedDosDate);
+      const nameLen = readUint16(buf, 26);
+      const extraLen = readUint16(buf, 28);
+      expect(nameLen).toBe(8);
+      expect(extraLen).toBe(53); // NTFS 36 + UT 17
+
+      const lfhExtra = buf.slice(30 + nameLen, 30 + nameLen + extraLen);
+      const ntfs = findExtraField(lfhExtra, 0x000a);
+      const ut = findExtraField(lfhExtra, 0x5455);
+      expect(ntfs).not.toBeNull();
+      expect(ut).not.toBeNull();
+      const ntfsBlk = lfhExtra.slice(ntfs?.offset ?? 0, (ntfs?.offset ?? 0) + 4 + (ntfs?.size ?? 0));
+      expect(readUint16(ntfsBlk, 2)).toBe(32); // Data Size
+      expect(readUint16(ntfsBlk, 8)).toBe(0x0001); // Attr Tag
+      expect(readUint16(ntfsBlk, 10)).toBe(24); // Attr Size
+      expect(readBigUint64LE(ntfsBlk, 12)).toBe(expectedFiletime); // Mtime
+      expect(readBigUint64LE(ntfsBlk, 20)).toBe(expectedFiletime); // Atime
+      expect(readBigUint64LE(ntfsBlk, 28)).toBe(expectedFiletime); // Ctime
+      const utBlk = lfhExtra.slice(ut?.offset ?? 0, (ut?.offset ?? 0) + 4 + (ut?.size ?? 0));
+      expect(readUint16(utBlk, 2)).toBe(13); // Data Size
+      expect(utBlk[4]).toBe(0x07); // Flags
+      expect(readInt32LE(utBlk, 5)).toBe(expectedUnix); // Mtime
+      expect(readInt32LE(utBlk, 9)).toBe(expectedUnix); // Atime
+      expect(readInt32LE(utBlk, 13)).toBe(expectedUnix); // Ctime
+
+      // --- file data ---
+      const fileDataOffset = 30 + nameLen + extraLen;
+      expect(buf.slice(fileDataOffset, fileDataOffset + data.length)).toEqual(data);
+
+      // --- CD ---
+      const cdOffset = fileDataOffset + data.length;
+      expect(readUint32(buf, cdOffset)).toBe(0x02014b50);
+      expect(readUint16(buf, cdOffset + 12)).toBe(expectedDosTime);
+      expect(readUint16(buf, cdOffset + 14)).toBe(expectedDosDate);
+      const cdNameLen = readUint16(buf, cdOffset + 28);
+      const cdExtraLen = readUint16(buf, cdOffset + 30);
+      expect(cdExtraLen).toBe(45); // NTFS 36 + UT 9
+      const cdExtra = buf.slice(cdOffset + 46 + cdNameLen, cdOffset + 46 + cdNameLen + cdExtraLen);
+      const cdNtfs = findExtraField(cdExtra, 0x000a);
+      const cdUt = findExtraField(cdExtra, 0x5455);
+      expect(cdNtfs).not.toBeNull();
+      expect(cdUt).not.toBeNull();
+      const cdNtfsBlk = cdExtra.slice(cdNtfs?.offset ?? 0, (cdNtfs?.offset ?? 0) + 4 + (cdNtfs?.size ?? 0));
+      expect(readBigUint64LE(cdNtfsBlk, 12)).toBe(expectedFiletime);
+      const cdUtBlk = cdExtra.slice(cdUt?.offset ?? 0, (cdUt?.offset ?? 0) + 4 + (cdUt?.size ?? 0));
+      expect(readUint16(cdUtBlk, 2)).toBe(5); // mtime のみ
+      expect(cdUtBlk[4]).toBe(0x07);
+      expect(readInt32LE(cdUtBlk, 5)).toBe(expectedUnix);
+
+      // --- EOCD cdOffset / cdSize 整合 ---
+      const eocdOffset = buf.length - 22;
+      expect(readUint32(buf, eocdOffset + 16)).toBe(cdOffset);
+      expect(readUint32(buf, eocdOffset + 12)).toBe(eocdOffset - cdOffset);
+    });
+
+    test('1980-01-01T00:00:00Z: DOS time=0、DOS date=0x0021、UT 書かれる', async () => {
+      const buf = await buildZip('a.txt', encoder.encode('a'), new Date('1980-01-01T00:00:00Z'));
+      expect(readUint16(buf, 10)).toBe(0);
+      expect(readUint16(buf, 12)).toBe(0x0021);
+      expect(readUint16(buf, 28)).toBe(53);
+    });
+
+    test('1980 未満の Date は clamp されて 1980-01-01 と同等のバイト列', async () => {
+      const a = await buildZip('a.txt', encoder.encode('a'), new Date('1979-06-15T00:00:00Z'));
+      const b = await buildZip('a.txt', encoder.encode('a'), new Date('1980-01-01T00:00:00Z'));
+      expect(a).toEqual(b);
+    });
+
+    test('2107-12-31T23:59:58Z: DOS 最大値、UT は省略 (extra=36)', async () => {
+      const buf = await buildZip('a.txt', encoder.encode('a'), new Date('2107-12-31T23:59:58Z'));
+      // (23<<11)|(59<<5)|(58>>1) = 49021 = 0xBF7D
+      expect(readUint16(buf, 10)).toBe(0xbf7d);
+      // ((2107-1980)<<9)|(12<<5)|31 = 65439 = 0xFF9F
+      expect(readUint16(buf, 12)).toBe(0xff9f);
+      expect(readUint16(buf, 28)).toBe(36); // NTFS のみ
+
+      const nameLen = readUint16(buf, 26);
+      const cdOffset = 30 + nameLen + 36 + 1; // extra 36 + data 1 byte
+      expect(readUint32(buf, cdOffset)).toBe(0x02014b50);
+      expect(readUint16(buf, cdOffset + 30)).toBe(36);
+    });
+
+    test('2107 超過の Date は clamp されて 2107-12-31 23:59:58 と同等のバイト列', async () => {
+      const a = await buildZip('a.txt', encoder.encode('a'), new Date('2200-01-01T00:00:00Z'));
+      const b = await buildZip('a.txt', encoder.encode('a'), new Date('2107-12-31T23:59:58Z'));
+      expect(a).toEqual(b);
+    });
   });
 });
