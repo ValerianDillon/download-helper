@@ -511,6 +511,19 @@ export class ZipWriter {
     this.offset += data.length;
   }
 }
+function pad2(n) {
+  return `00${n}`.slice(-2);
+}
+function formatRemain(seconds) {
+  if (seconds < 0 || !Number.isFinite(seconds))
+    return "-:--";
+  const h = seconds / 3600 | 0;
+  const m = (seconds - h * 3600) / 60 | 0;
+  const s = seconds - h * 3600 - m * 60;
+  if (h > 0)
+    return `${h}:${pad2(m)}:${pad2(s)}`;
+  return `${pad2(m)}:${pad2(s)}`;
+}
 
 export class DownloadHelper {
   utils;
@@ -633,14 +646,15 @@ export class DownloadHelper {
       }
     };
   }
-  async downloadZip(downloadObj, progress, log, remainTime) {
+  async downloadZip(downloadObj, progress, log, remainTime, options) {
     if (!this.isDownloadJsonObj(downloadObj))
       throw new Error("ダウンロード対象オブジェクトの型が不正");
     const utils = this.utils;
     const encodedId = utils.encodeFileName(downloadObj.id);
-    const handle = await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
+    const handle = options?.handle ?? await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
+    const fetchFile = options?.fetchFile ?? ((url, name) => utils.fetchWithLimit({ url, name }, 1));
     const enqueue = async (fileBits, path, date) => {
       await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
     };
@@ -657,6 +671,10 @@ export class DownloadHelper {
     await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html");
     let postCount = 0;
     for (const post of downloadObj.posts) {
+      if (options?.signal?.aborted) {
+        await zip.close();
+        return;
+      }
       log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
       const postDate = parsePublishedDate(post.publishedDatetime);
       const informationFile = utils.createInformationFile(post.informationText);
@@ -664,15 +682,19 @@ export class DownloadHelper {
       await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`, postDate);
       if (post.cover) {
         log(`download ${post.cover.name}`);
-        const blob = await utils.fetchWithLimit(post.cover, 1);
+        const blob = await fetchFile(post.cover.url, post.cover.name);
         if (blob) {
           await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
         }
       }
       let fileCount = 0;
       for (const file of post.files) {
+        if (options?.signal?.aborted) {
+          await zip.close();
+          return;
+        }
         log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-        const blob = await utils.fetchWithLimit({ url: file.url, name: file.encodedName }, 1);
+        const blob = await fetchFile(file.url, file.encodedName);
         if (blob) {
           await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
         } else {
@@ -681,10 +703,9 @@ export class DownloadHelper {
           log(`${file.encodedName}のダウンロードに失敗`);
         }
         count++;
-        const remain = Math.floor(Math.abs(Math.floor(Date.now() / 1000) - startTime) * (downloadObj.fileCount - count) / count);
-        const h = remain / (60 * 60) | 0;
-        const m = Math.ceil((remain - 60 * 60 * h) / 60);
-        remainTime(`${h}:${("00" + m).slice(-2)}`);
+        const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
+        const remain = Math.floor(elapsedSec * (downloadObj.fileCount - count) / count);
+        remainTime(formatRemain(remain));
         progress(count * 100 / downloadObj.fileCount | 0);
         await utils.sleep(100);
       }

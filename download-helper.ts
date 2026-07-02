@@ -832,6 +832,39 @@ export class ZipWriter {
 }
 
 /**
+ * downloadZip の挙動を差し替えるためのオプション
+ */
+export type DownloadZipOptions = {
+  /** 指定時は showSaveFilePicker を呼ばずこのハンドルに書き込む */
+  handle?: FileSystemFileHandle;
+  /** 中断用。投稿ループ / ファイルループの先頭で aborted を確認する */
+  signal?: AbortSignal;
+  /** ファイル取得処理の差し替え (未指定時は DownloadUtils.fetchWithLimit を使う) */
+  fetchFile?: (url: string, name: string) => Promise<Blob | null>;
+};
+
+/**
+ * 2桁ゼロ埋め
+ * @internal
+ */
+function pad2(n: number): string {
+  return `00${n}`.slice(-2);
+}
+
+/**
+ * 残り秒数を "h:mm:ss" または "mm:ss" 形式にフォーマットする
+ * @internal
+ */
+function formatRemain(seconds: number): string {
+  if (seconds < 0 || !Number.isFinite(seconds)) return '-:--';
+  const h = (seconds / 3600) | 0;
+  const m = ((seconds - h * 3600) / 60) | 0;
+  const s = seconds - h * 3600 - m * 60;
+  if (h > 0) return `${h}:${pad2(m)}:${pad2(s)}`;
+  return `${pad2(m)}:${pad2(s)}`;
+}
+
+/**
  * ダウンロード用のヘルパー
  */
 export class DownloadHelper {
@@ -979,20 +1012,23 @@ export class DownloadHelper {
    * @param progress 進捗率出力関数
    * @param log ログ出力関数
    * @param remainTime 終了予測出力関数
+   * @param options handle/signal/fetchFile を差し替えるためのオプション (省略時は従来どおりの挙動)
    */
   async downloadZip(
     downloadObj: unknown,
     progress: (n: number) => void,
     log: (s: string) => void,
     remainTime: (r: string) => void,
+    options?: DownloadZipOptions,
   ) {
     if (!this.isDownloadJsonObj(downloadObj)) throw new Error('ダウンロード対象オブジェクトの型が不正');
     const utils = this.utils;
     const encodedId = utils.encodeFileName(downloadObj.id);
 
-    const handle = await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
+    const handle = options?.handle ?? (await showSaveFilePicker({ suggestedName: `${encodedId}.zip` }));
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
+    const fetchFile = options?.fetchFile ?? ((url: string, name: string) => utils.fetchWithLimit({ url, name }, 1));
 
     const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
       await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
@@ -1014,6 +1050,10 @@ export class DownloadHelper {
     // 投稿処理
     let postCount = 0;
     for (const post of downloadObj.posts) {
+      if (options?.signal?.aborted) {
+        await zip.close();
+        return;
+      }
       log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
       const postDate = parsePublishedDate(post.publishedDatetime);
       // 投稿情報+html
@@ -1031,7 +1071,7 @@ export class DownloadHelper {
       // カバー画像
       if (post.cover) {
         log(`download ${post.cover.name}`);
-        const blob = await utils.fetchWithLimit(post.cover, 1);
+        const blob = await fetchFile(post.cover.url, post.cover.name);
         if (blob) {
           await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
         }
@@ -1039,8 +1079,12 @@ export class DownloadHelper {
       // ファイル処理
       let fileCount = 0;
       for (const file of post.files) {
+        if (options?.signal?.aborted) {
+          await zip.close();
+          return;
+        }
         log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-        const blob = await utils.fetchWithLimit({ url: file.url, name: file.encodedName }, 1);
+        const blob = await fetchFile(file.url, file.encodedName);
         if (blob) {
           await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
         } else {
@@ -1049,12 +1093,9 @@ export class DownloadHelper {
           log(`${file.encodedName}のダウンロードに失敗`);
         }
         count++;
-        const remain = Math.floor(
-          (Math.abs(Math.floor(Date.now() / 1000) - startTime) * (downloadObj.fileCount - count)) / count,
-        );
-        const h = (remain / (60 * 60)) | 0;
-        const m = Math.ceil((remain - 60 * 60 * h) / 60);
-        remainTime(`${h}:${('00' + m).slice(-2)}`);
+        const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
+        const remain = Math.floor((elapsedSec * (downloadObj.fileCount - count)) / count);
+        remainTime(formatRemain(remain));
         progress(((count * 100) / downloadObj.fileCount) | 0);
         await utils.sleep(100);
       }
@@ -1339,7 +1380,7 @@ declare function showSaveFilePicker(options?: {
   types?: { description?: string; accept: Record<string, string[]> }[];
 }): Promise<FileSystemFileHandle>;
 
-interface FileSystemFileHandle {
+export interface FileSystemFileHandle {
   createWritable(): Promise<FileSystemWritableFileStream>;
 }
 
