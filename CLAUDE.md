@@ -5,22 +5,24 @@
 
 ## コマンド
 
-- `bun run build` — `bun build --no-bundle` で `download-helper.ts` → `download-helper.js` にトランスパイル
+- `bun run build` — `bun build --no-bundle` で `download-helper.ts` → `download-helper.js`、`fanbox-collector.ts` → `fanbox-collector.js` にそれぞれトランスパイル
 - `bun run lint` — Biome による静的解析・フォーマット修正
 
 ## プロジェクト構成
 
 ```
-download-helper.ts    # ソースコード（単一ファイル）
-download-helper.js    # トランスパイル済み出力（コミット対象）
-biome.json            # Biome 設定
-.mise.toml            # mise ツールバージョン管理
+download-helper.ts     # 汎用ダウンロード UI / ZIP 生成のソースコード
+download-helper.js     # トランスパイル済み出力（コミット対象）
+fanbox-collector.ts    # FANBOX 固有の収集ロジック (fanbox-downloader / fanbox-downloader-extension 共用)
+fanbox-collector.js    # トランスパイル済み出力（コミット対象）
+biome.json             # Biome 設定
+.mise.toml             # mise ツールバージョン管理
 package.json
 tsconfig.json
 ```
 
-- `package.json` の `files` で `download-helper.js` と `download-helper.ts` を配布対象に指定
-- `download-helper.js` はgit管理対象。ビルド後に差分があればコミットすること
+- `package.json` の `files` で `download-helper.js` / `download-helper.ts` / `fanbox-collector.js` / `fanbox-collector.ts` を配布対象に指定
+- `download-helper.js` / `fanbox-collector.js` はgit管理対象。ビルド後に差分があればコミットすること
 - npm パッケージとしてではなく `github:ValerianDillon/download-helper#vX.X.X` (git tag) で参照される
 
 ## 技術スタック
@@ -34,7 +36,7 @@ tsconfig.json
 
 ## アーキテクチャ
 
-単一ファイルにレイヤード構成:
+`download-helper.ts` はレイヤード構成:
 
 1. **DownloadUtils** — ユーティリティ（メディア判定、ファイル名エンコード、fetch ラッパー、sleep）
 2. **DownloadObject / PostObject / FileObject** — ダウンロードデータのラッパークラス群
@@ -45,6 +47,16 @@ tsconfig.json
 - Bootstrap ベースのタグフィルタリング UI
 - リトライ機能付き fetch（レート制限対策）
 - ファイル名の Windows 互換エンコーディング（全角記号への置換）
+
+`DownloadHelper.downloadZip` は第 5 引数 `options?: DownloadZipOptions` で以下を差し替え可能（省略時は従来どおりの挙動）:
+- `handle` — 指定時は `showSaveFilePicker` を呼ばずこのハンドルに書き込む
+- `signal` — 指定時、投稿ループ / ファイルループの先頭で `aborted` を確認して中断する
+- `fetchFile` — ファイル取得処理の差し替え（拡張は service worker 経由の CORS 回避プロキシを注入する）
+
+`fanbox-collector.ts` は FANBOX API の型定義、`DownloadManage`（収集時の状態管理）、`addByPostInfo` /
+`convertImageMap` / `convertFileMap` / `convertEmbedMap` / `convertUrlEmbedMap`（postInfo → DownloadObject 変換）
+をまとめたもの。fanbox-downloader（ブックマークレット）と fanbox-downloader-extension の両方から参照される。
+投稿一覧の取得・ページネーション・レート制限などの API 呼び出し自体は含めず、各利用側に委ねる。
 
 ## コーディング規約
 

@@ -1,9 +1,9 @@
 {
   "name": "download-helper",
-  "version": "3.6.0",
+  "version": "3.7.0",
   "description": "ブックマークレットとかで使うUI",
   "scripts": {
-    "build": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle",
+    "build": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle && bun build ./fanbox-collector.ts --outfile ./fanbox-collector.js --format esm --target browser --no-bundle",
     "lint": "biome check --write .",
     "test": "bun test"
   },
@@ -17,7 +17,9 @@
   "types": "download-helper.ts",
   "files": [
     "download-helper.js",
-    "download-helper.ts"
+    "download-helper.ts",
+    "fanbox-collector.js",
+    "fanbox-collector.ts"
   ],
   "bugs": {
     "url": "https://github.com/ValerianDillon/download-helper/issues"
