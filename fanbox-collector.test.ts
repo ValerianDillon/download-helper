@@ -209,6 +209,79 @@ describe('addByPostInfo - publishedDatetime', () => {
   });
 });
 
+describe('addByPostInfo - 取り込み結果', () => {
+  const createManage = () => new DownloadManage('testUser', new Map<number, string>());
+
+  const basePost = (override: Partial<PostInfo> = {}): PostInfo =>
+    ({
+      title: 'タイトル',
+      feeRequired: 0,
+      id: 'post-1',
+      creatorId: 'creator',
+      coverImageUrl: null,
+      excerpt: '',
+      isRestricted: false,
+      tags: [],
+      publishedDatetime: '2024-05-01T12:34:56Z',
+      updatedDatetime: '2024-05-02T00:00:00Z',
+      likeCount: 0,
+      commentCount: 0,
+      type: 'text',
+      body: { text: 'hello' },
+      ...override,
+    }) as PostInfo;
+
+  const postCount = (m: DownloadManage) => JSON.parse(m.downloadObject.stringify()).posts.length;
+
+  test('取り込めたら added を返す', () => {
+    const m = createManage();
+    expect(addByPostInfo(m, basePost())).toBe('added');
+    expect(postCount(m)).toBe(1);
+  });
+
+  test('isIgnoreFree による無料投稿の除外は ignored を返す', () => {
+    const m = createManage();
+    m.isIgnoreFree = true;
+    expect(addByPostInfo(m, basePost({ feeRequired: 0 }))).toBe('ignored');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('本文が無ければ unavailable を返す', () => {
+    const m = createManage();
+    expect(addByPostInfo(m, basePost({ body: undefined } as Partial<PostInfo>))).toBe('unavailable');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('閲覧できない投稿は unavailable を返す', () => {
+    const m = createManage();
+    expect(addByPostInfo(m, basePost({ isRestricted: true }))).toBe('unavailable');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('本文の形式が想定と違えば invalid を返し、壊れた投稿を残さない', () => {
+    const m = createManage();
+    // image タイプなのに images が無い: 従来は登録後に TypeError となり空の投稿が残っていた
+    const broken = basePost({ type: 'image', body: { text: 'hello' } } as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toBe('invalid');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('本文が壊れていても取得件数上限を消費しない', () => {
+    const m = createManage();
+    m.setLimitAvailable(true);
+    m.setLimit(1);
+    addByPostInfo(m, basePost({ type: 'file', body: { text: 'hello' } } as Partial<PostInfo>));
+    expect(m.isLimitValid()).toBe(true);
+  });
+
+  test('未知タイプは本文を触らないので取り込む', () => {
+    const m = createManage();
+    const unknown = basePost({ type: 'image-v2', body: { whatever: true } } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, unknown)).toBe('added');
+    expect(postCount(m)).toBe(1);
+  });
+});
+
 describe('DownloadManage', () => {
   const createManage = () => new DownloadManage('testUser', new Map([[100, '100円プラン']]));
 

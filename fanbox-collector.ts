@@ -245,17 +245,73 @@ export class DownloadManage {
 }
 
 /**
+ * addByPostInfo の処理結果
+ * 呼び出し側が「意図した除外」と「取れなかった投稿」を区別できるようにするための戻り値。
+ * 一括して読み飛ばすと、本文の在り処が変わったときに全投稿が無言で消えても気付けない。
+ */
+export type AddPostResult =
+  /** 取り込んだ */
+  | 'added'
+  /** isIgnoreFree の設定により意図的に除外した */
+  | 'ignored'
+  /** 本文が無い (支援額が足りない、または本文の在り処が変わった) */
+  | 'unavailable'
+  /** 本文の形式が想定と違う */
+  | 'invalid';
+
+function isRecord(value: unknown): boolean {
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * 投稿タイプごとに、本文の取り込みで実際に触るフィールドが揃っているかを検査する。
+ *
+ * addByPostInfo は投稿を downloadObject に登録してから本文を触るため、途中で例外になると
+ * 空の投稿が出力に残り、取得件数上限の減算も飛ばされる。登録前にここで弾いて
+ * その状態を作らせない。未知タイプは本文を触らないので検査しない。
+ */
+function hasSupportedBody(postInfo: PostInfo): boolean {
+  const body = postInfo.body as Record<string, unknown>;
+  switch (postInfo.type) {
+    case 'image':
+      return Array.isArray(body.images) && typeof body.text === 'string';
+    case 'file':
+      return Array.isArray(body.files) && typeof body.text === 'string';
+    case 'article':
+      return (
+        Array.isArray(body.blocks) &&
+        isRecord(body.imageMap) &&
+        isRecord(body.fileMap) &&
+        isRecord(body.embedMap) &&
+        isRecord(body.urlEmbedMap)
+      );
+    case 'text':
+      return typeof body.text === 'string';
+    default:
+      return true;
+  }
+}
+
+/**
  * postInfoオブジェクトからURLリストに追加する
  * @param downloadManage ダウンロード設定
  * @param postInfo 投稿情報オブジェクト
+ * @returns 取り込んだか、取り込まなかった場合はその理由
  */
-export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | undefined) {
-  if (!postInfo || (downloadManage.isIgnoreFree && postInfo.feeRequired === 0)) {
-    return;
+export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | undefined): AddPostResult {
+  if (!postInfo) {
+    return 'unavailable';
+  }
+  if (downloadManage.isIgnoreFree && postInfo.feeRequired === 0) {
+    return 'ignored';
   }
   if (!postInfo.body || postInfo.isRestricted) {
     console.log(`取得できませんでした(支援がたりない？)\nfeeRequired: ${postInfo.feeRequired}@${postInfo.id}`);
-    return;
+    return 'unavailable';
+  }
+  if (!hasSupportedBody(postInfo)) {
+    console.error(`本文の形式が想定と違うため取り込みませんでした\n${postInfo.type}@${postInfo.id}`);
+    return 'invalid';
   }
   const postName = postInfo.title;
   const postObject = downloadManage.downloadObject.addPost(postName);
@@ -400,6 +456,7 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
     postObject.setInfo(`${exportInfoText}\nparsedText:\n${parsedText}`);
   }
   downloadManage.decrementLimit();
+  return 'added';
 }
 
 export function convertImageMap(imageMap: Record<string, ImageInfo>, blocks: Block[]): ImageInfo[] {
