@@ -11,12 +11,16 @@ import { DownloadObject, DownloadUtils } from './download-helper';
  */
 export type Plans = {
   body?: {
-    id: string;
-    title: string;
-    fee: number;
-    description: string;
-    coverImageUrl: string;
-  }[];
+    plans: PlanInfo[];
+  };
+};
+
+export type PlanInfo = {
+  id: string;
+  title: string;
+  fee: number;
+  description: string;
+  coverImageUrl: string | null;
 };
 
 /**
@@ -25,15 +29,81 @@ export type Plans = {
  */
 export type Tags = {
   body?: {
-    tag: string;
-    count: number;
-    coverImageUrl: string;
-  }[];
+    featuredTags: TagInfo[];
+  };
+};
+
+export type TagInfo = {
+  tag: string;
+  count: number;
+  coverImageUrl: string | null;
 };
 
 /**
- * 投稿情報の型
+ * 投稿一覧のページURL APIの型
+ * @see https://api.fanbox.cc/post.paginateCreator?creatorId=${creatorId}
+ */
+export type PaginatedPosts = {
+  body?: {
+    pageUrls: string[];
+  };
+};
+
+/**
+ * 投稿一覧APIの型
  * @see https://api.fanbox.cc/post.listCreator?creatorId=${creatorId}
+ */
+export type PostList = {
+  body?: {
+    posts: PostListItem[];
+  };
+};
+
+/**
+ * 投稿一覧の要素の型
+ * 詳細 (PostInfo) と違って type / body を持たず、カバー画像も cover.url に入る。
+ * 本文を得るには post.info を別途叩く必要がある。
+ */
+export type PostListItem = {
+  id: string;
+  title: string;
+  feeRequired: number;
+  creatorId: string;
+  user: UserInfo;
+  excerpt: string;
+  isRestricted: boolean;
+  isLiked: boolean;
+  isPinned: boolean;
+  isCommentingRestricted: boolean;
+  hasAdultContent: boolean;
+  tags: string[];
+  publishedDatetime: string;
+  updatedDatetime: string;
+  likeCount: number;
+  commentCount: number;
+  // 観測できた type は 'cover_image' のみだが、他の値がありうるので絞り込まない
+  cover: { type: string; url: string } | null;
+};
+
+export type UserInfo = {
+  userId: string;
+  name: string;
+  iconUrl: string | null;
+};
+
+/**
+ * 投稿詳細APIの型
+ * @see https://api.fanbox.cc/post.info?postId=${postId}
+ */
+export type PostInfoResponse = {
+  body?: {
+    post: PostInfo;
+  };
+};
+
+/**
+ * 投稿詳細の型
+ * 一覧 (post.listCreator) の要素はこの形状ではない。PostListItem を使うこと。
  * @see https://api.fanbox.cc/post.info?postId=${postId}
  */
 export type PostInfo = {
