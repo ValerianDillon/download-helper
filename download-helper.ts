@@ -672,6 +672,43 @@ function isInt32(n: number): boolean {
 }
 
 /**
+ * addFile / addDirectory 共通の日時フィールド構築
+ * date が未指定または Invalid Date の場合は DOS time/date = 0、extra field なし (従来挙動)
+ * それ以外は clampToZipRange 後の Date から DOS time/date + NTFS Extra を組み立て、
+ * clamp 後の Unix time が signed int32 範囲に収まる場合のみ Extended Timestamp も足す
+ * @internal
+ */
+function buildDateFields(date?: Date): {
+  dosTime: number;
+  dosDate: number;
+  extraLfh: Uint8Array<ArrayBuffer>;
+  extraCd: Uint8Array<ArrayBuffer>;
+} {
+  let dosTime = 0;
+  let dosDate = 0;
+  let extraLfh = new Uint8Array(0);
+  let extraCd = new Uint8Array(0);
+
+  if (date !== undefined && Number.isFinite(date.getTime())) {
+    const d = clampToZipRange(date);
+    const dos = toDosTimeDate(d);
+    dosTime = dos.time;
+    dosDate = dos.dosDate;
+    const ntfs = buildNtfsExtra(d);
+    const unix = Math.floor(d.getTime() / 1000);
+    if (isInt32(unix)) {
+      extraLfh = concatBytes([ntfs, buildExtTimestampLfh(d)]);
+      extraCd = concatBytes([ntfs, buildExtTimestampCd(d)]);
+    } else {
+      extraLfh = ntfs;
+      extraCd = ntfs;
+    }
+  }
+
+  return { dosTime, dosDate, extraLfh, extraCd };
+}
+
+/**
  * 複数の Uint8Array を連結する
  * @internal
  */
@@ -702,6 +739,8 @@ export class ZipWriter {
     dosTime: number;
     dosDate: number;
     extraCd: Uint8Array<ArrayBuffer>;
+    /** central directory の external file attributes。addFile は 0、addDirectory は 0x10 (FILE_ATTRIBUTE_DIRECTORY) */
+    externalAttr: number;
   }[] = [];
   private encoder = new TextEncoder();
 
@@ -729,26 +768,7 @@ export class ZipWriter {
     const fileCrc = crc32(bytes);
     const localHeaderOffset = this.offset;
 
-    let dosTime = 0;
-    let dosDate = 0;
-    let extraLfh = new Uint8Array(0);
-    let extraCd = new Uint8Array(0);
-
-    if (date !== undefined && Number.isFinite(date.getTime())) {
-      const d = clampToZipRange(date);
-      const dos = toDosTimeDate(d);
-      dosTime = dos.time;
-      dosDate = dos.dosDate;
-      const ntfs = buildNtfsExtra(d);
-      const unix = Math.floor(d.getTime() / 1000);
-      if (isInt32(unix)) {
-        extraLfh = concatBytes([ntfs, buildExtTimestampLfh(d)]);
-        extraCd = concatBytes([ntfs, buildExtTimestampCd(d)]);
-      } else {
-        extraLfh = ntfs;
-        extraCd = ntfs;
-      }
-    }
+    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
 
     // Local File Header (30 bytes + name length + extra field length)
     const header = new ArrayBuffer(30);
@@ -778,11 +798,70 @@ export class ZipWriter {
       dosTime,
       dosDate,
       extraCd,
+      externalAttr: 0,
+    });
+  }
+
+  /**
+   * ディレクトリエントリを ZIP に追加する
+   * @param name ZIP 内のディレクトリパス (UTF-8)。末尾が `/` でなければ自動的に付与する
+   * @param date 任意。addFile と同一の日時ロジック (DOS time/date + NTFS Extra + Extended Timestamp) を適用する。
+   *   省略または Invalid Date の場合は DOS time/date = 0、extra field なし
+   * @throws {Error} 正規化後の名前が `/` になる (name が空文字列)、または先頭が `/` の場合。
+   *   APPNOTE 4.4.17.1 が ZIP 内のパスを相対パスに限り、先頭 `/` を禁じるため。
+   *   drive letter (`C:/dir`) や `\` 区切りは検証しない (addFile と非対称にしないため。呼び出し側の事前条件とする)
+   */
+  async addDirectory(name: string, date?: Date): Promise<void> {
+    const dirName = name.endsWith('/') ? name : `${name}/`;
+    if (dirName.startsWith('/')) {
+      throw new Error(`addDirectory: name must not be empty or start with "/": ${JSON.stringify(name)}`);
+    }
+
+    const nameBytes = this.encoder.encode(dirName) as Uint8Array<ArrayBuffer>;
+    const localHeaderOffset = this.offset;
+
+    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+
+    // Local File Header (30 bytes + name length + extra field length)。CRC / size は常に 0、データ本体は書かない
+    const header = new ArrayBuffer(30);
+    const view = new DataView(header);
+    view.setUint32(0, 0x04034b50, true); // signature
+    view.setUint16(4, 20, true); // version needed (2.0)
+    view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
+    view.setUint16(8, 0, true); // compression method (stored)
+    view.setUint16(10, dosTime, true); // mod time
+    view.setUint16(12, dosDate, true); // mod date
+    view.setUint32(14, 0, true); // crc-32
+    view.setUint32(18, 0, true); // compressed size
+    view.setUint32(22, 0, true); // uncompressed size
+    view.setUint16(26, nameBytes.length, true); // file name length
+    view.setUint16(28, extraLfh.length, true); // extra field length
+
+    await this.write(new Uint8Array(header));
+    await this.write(nameBytes);
+    if (extraLfh.length > 0) await this.write(extraLfh);
+
+    this.entries.push({
+      name: nameBytes,
+      crc: 0,
+      size: 0,
+      offset: localHeaderOffset,
+      dosTime,
+      dosDate,
+      extraCd,
+      externalAttr: 0x10, // FILE_ATTRIBUTE_DIRECTORY
     });
   }
 
   /**
    * Central Directory と EOCD を書き込み、ストリームを閉じる
+   *
+   * 既知の制限 (ZIP64 未対応): EOCD のエントリ数 (下記 offset 8/10) と LFH/CD の compressed / uncompressed size
+   * (addFile 内、offset 18/22 および 20/24)、CD の local header offset (offset 42)、EOCD の cdSize / cdOffset
+   * (offset 12/16) はいずれも uint16 または uint32 に直接値を書いており、ZIP64 の拡張フィールドを持たない。
+   * `0xFFFF` / `0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値のため、
+   * エントリ数が 65,535 件以上、またはサイズ/オフセットが `0xFFFFFFFF` bytes 以上になると壊れた ZIP を出力する。
+   * ディレクトリエントリの追加でエントリ数が「投稿数 + 1」増える分、上限に到達しやすくなる点に留意する。
    */
   async close(): Promise<void> {
     const cdOffset = this.offset;
@@ -805,7 +884,7 @@ export class ZipWriter {
       view.setUint16(32, 0, true); // file comment length
       view.setUint16(34, 0, true); // disk number start
       view.setUint16(36, 0, true); // internal file attributes
-      view.setUint32(38, 0, true); // external file attributes
+      view.setUint32(38, entry.externalAttr, true); // external file attributes
       view.setUint32(42, entry.offset, true); // local header offset
 
       await this.write(new Uint8Array(cdHeader));
@@ -848,6 +927,26 @@ export type DownloadZipOptions = {
   /** ファイル取得処理の差し替え (未指定時は DownloadUtils.fetchWithLimit を使う) */
   fetchFile?: (url: string, name: string) => Promise<Blob | null>;
 };
+
+/**
+ * ZIP パスの 1 セグメントとして安全か検証する (encodedId / post.encodedName 用)
+ * 空文字列 / "." / ".." / "/" "\" ":" を含むものを拒否する。
+ * post.encodedName は isDownloadJsonObj で型 (string) すら検証されないため、value を unknown として受ける
+ * @internal
+ */
+function isValidPathSegment(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value !== '.' && value !== '..' && !/[/\\:]/.test(value);
+}
+
+/**
+ * ディレクトリエントリと同名衝突を避けるためのファイル名検証 (post.cover.name / file.encodedName 用)
+ * これらは isDownloadJsonObj で型 (string) までは検証済みのため、空文字列 / "." / ".." のみを拒否する
+ * (`/` `\` `:` の検証と addFile 自体への入力検証は本 Issue のスコープ外。別 Issue で扱う)
+ * @internal
+ */
+function isValidFileNameSegment(name: string): boolean {
+  return name.length > 0 && name !== '.' && name !== '..';
+}
 
 /**
  * 2桁ゼロ埋め
@@ -1031,6 +1130,30 @@ export class DownloadHelper {
     const utils = this.utils;
     const encodedId = utils.encodeFileName(downloadObj.id);
 
+    // handle (showSaveFilePicker) 取得より前に入力を検証する。
+    // ファイル選択 UI を表示してから失敗させることになるため、handle 取得前に置く。
+    if (!isValidPathSegment(encodedId)) {
+      throw new Error(`downloadZip: id が不正な値です (encode 後: ${JSON.stringify(encodedId)})`);
+    }
+    const seenEncodedNames = new Set<string>();
+    for (const post of downloadObj.posts) {
+      if (!isValidPathSegment(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName が不正な値です (${JSON.stringify(post.encodedName)})`);
+      }
+      if (seenEncodedNames.has(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
+      }
+      seenEncodedNames.add(post.encodedName);
+      if (post.cover !== undefined && !isValidFileNameSegment(post.cover.name)) {
+        throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
+      }
+      for (const file of post.files) {
+        if (!isValidFileNameSegment(file.encodedName)) {
+          throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
+        }
+      }
+    }
+
     const handle = options?.handle ?? (await showSaveFilePicker({ suggestedName: `${encodedId}.zip` }));
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
@@ -1051,6 +1174,13 @@ export class DownloadHelper {
     let failedCount = 0;
 
     log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
+    // ルートディレクトリ (日時は有効な publishedDatetime の最大値。有効な値が 1 件も無ければ date なし)
+    const rootDate = downloadObj.posts.reduce<Date | undefined>((max, post) => {
+      const d = parsePublishedDate(post.publishedDatetime);
+      if (d === undefined) return max;
+      return max === undefined || d.getTime() > max.getTime() ? d : max;
+    }, undefined);
+    await zip.addDirectory(`${encodedId}/`, rootDate);
     // ルートhtml (post に紐づかないので date は付与しない)
     await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html');
     // 投稿処理
@@ -1062,6 +1192,8 @@ export class DownloadHelper {
       }
       log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
       const postDate = parsePublishedDate(post.publishedDatetime);
+      // 投稿ディレクトリ (配下ファイルより前に書く)
+      await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
       // 投稿情報+html
       const informationFile = utils.createInformationFile(post.informationText);
       await enqueue(
