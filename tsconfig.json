@@ -1,14 +1,14 @@
 {
   "compilerOptions": {
-    "target": "es2017",
+    "target": "es2022",
     "module": "es2015",
-    "outDir": "./",
-    "removeComments": true,
+    "noEmit": true,
     "strict": true,
     "lib": ["dom", "es2021"],
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "types": ["bun"]
   },
-  "exclude": ["**/*.test.ts", "dist/**/*"]
+  "include": ["*.ts"]
 }

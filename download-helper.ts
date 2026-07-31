@@ -565,7 +565,7 @@ export function crc32(data: Uint8Array): number {
 /**
  * BlobPart 配列を Uint8Array に変換する
  */
-async function toUint8Array(parts: BlobPart[]): Promise<Uint8Array> {
+async function toUint8Array(parts: BlobPart[]): Promise<Uint8Array<ArrayBuffer>> {
   const blob = new Blob(parts);
   return new Uint8Array(await blob.arrayBuffer());
 }
@@ -609,7 +609,7 @@ export function toDosTimeDate(date: Date): { time: number; dosDate: number } {
  * mtime / atime / ctime はすべて同一の date を FILETIME として書き込む
  * @internal
  */
-export function buildNtfsExtra(date: Date): Uint8Array {
+export function buildNtfsExtra(date: Date): Uint8Array<ArrayBuffer> {
   const buf = new ArrayBuffer(36);
   const view = new DataView(buf);
   view.setUint16(0, 0x000a, true); // Header ID: NTFS
@@ -632,7 +632,7 @@ export function buildNtfsExtra(date: Date): Uint8Array {
  * 入力 unix time が signed int32 範囲に収まることを呼び出し側が保証する
  * @internal
  */
-export function buildExtTimestampLfh(date: Date): Uint8Array {
+export function buildExtTimestampLfh(date: Date): Uint8Array<ArrayBuffer> {
   const buf = new ArrayBuffer(17);
   const view = new DataView(buf);
   view.setUint16(0, 0x5455, true); // Header ID: extended timestamp
@@ -652,7 +652,7 @@ export function buildExtTimestampLfh(date: Date): Uint8Array {
  * - Flags は「LFH 側にどの timestamp が存在するか」を示すビットマップであり、CD payload の構成を表すものではない
  * @internal
  */
-export function buildExtTimestampCd(date: Date): Uint8Array {
+export function buildExtTimestampCd(date: Date): Uint8Array<ArrayBuffer> {
   const buf = new ArrayBuffer(9);
   const view = new DataView(buf);
   view.setUint16(0, 0x5455, true); // Header ID: extended timestamp
@@ -675,7 +675,7 @@ function isInt32(n: number): boolean {
  * 複数の Uint8Array を連結する
  * @internal
  */
-function concatBytes(parts: Uint8Array[]): Uint8Array {
+function concatBytes(parts: Uint8Array<ArrayBuffer>[]): Uint8Array<ArrayBuffer> {
   const total = parts.reduce((s, p) => s + p.length, 0);
   const out = new Uint8Array(total);
   let off = 0;
@@ -695,13 +695,13 @@ export class ZipWriter {
   private writable: FileSystemWritableFileStream;
   private offset = 0;
   private entries: {
-    name: Uint8Array;
+    name: Uint8Array<ArrayBuffer>;
     crc: number;
     size: number;
     offset: number;
     dosTime: number;
     dosDate: number;
-    extraCd: Uint8Array;
+    extraCd: Uint8Array<ArrayBuffer>;
   }[] = [];
   private encoder = new TextEncoder();
 
@@ -719,8 +719,14 @@ export class ZipWriter {
    *   signed int32 範囲に収まる場合のみ書く。
    */
   async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
-    const nameBytes = this.encoder.encode(name);
-    const fileCrc = crc32(data);
+    // 公開 API なので引数は Uint8Array のまま受ける。File System Access API の write は
+    // ArrayBuffer backed しか受け付けないので、SharedArrayBuffer backed ならコピーして揃える。
+    const bytes: Uint8Array<ArrayBuffer> =
+      data.buffer instanceof ArrayBuffer ? (data as Uint8Array<ArrayBuffer>) : new Uint8Array(data);
+    // TextEncoder.encode は常に新しい ArrayBuffer を確保する (TypeScript 5.7 未満では
+    // 戻り値が ArrayBufferLike 扱いになるためアサーションで補う)
+    const nameBytes = this.encoder.encode(name) as Uint8Array<ArrayBuffer>;
+    const fileCrc = crc32(bytes);
     const localHeaderOffset = this.offset;
 
     let dosTime = 0;
@@ -754,20 +760,20 @@ export class ZipWriter {
     view.setUint16(10, dosTime, true); // mod time
     view.setUint16(12, dosDate, true); // mod date
     view.setUint32(14, fileCrc, true); // crc-32
-    view.setUint32(18, data.length, true); // compressed size
-    view.setUint32(22, data.length, true); // uncompressed size
+    view.setUint32(18, bytes.length, true); // compressed size
+    view.setUint32(22, bytes.length, true); // uncompressed size
     view.setUint16(26, nameBytes.length, true); // file name length
     view.setUint16(28, extraLfh.length, true); // extra field length
 
     await this.write(new Uint8Array(header));
     await this.write(nameBytes);
     if (extraLfh.length > 0) await this.write(extraLfh);
-    await this.write(data);
+    await this.write(bytes);
 
     this.entries.push({
       name: nameBytes,
       crc: fileCrc,
-      size: data.length,
+      size: bytes.length,
       offset: localHeaderOffset,
       dosTime,
       dosDate,
@@ -825,7 +831,7 @@ export class ZipWriter {
     await this.writable.close();
   }
 
-  private async write(data: Uint8Array): Promise<void> {
+  private async write(data: Uint8Array<ArrayBuffer>): Promise<void> {
     await this.writable.write(data);
     this.offset += data.length;
   }

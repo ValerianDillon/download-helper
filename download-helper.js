@@ -415,8 +415,9 @@ export class ZipWriter {
     this.writable = writable;
   }
   async addFile(name, data, date) {
+    const bytes = data.buffer instanceof ArrayBuffer ? data : new Uint8Array(data);
     const nameBytes = this.encoder.encode(name);
-    const fileCrc = crc32(data);
+    const fileCrc = crc32(bytes);
     const localHeaderOffset = this.offset;
     let dosTime = 0;
     let dosDate = 0;
@@ -446,19 +447,19 @@ export class ZipWriter {
     view.setUint16(10, dosTime, true);
     view.setUint16(12, dosDate, true);
     view.setUint32(14, fileCrc, true);
-    view.setUint32(18, data.length, true);
-    view.setUint32(22, data.length, true);
+    view.setUint32(18, bytes.length, true);
+    view.setUint32(22, bytes.length, true);
     view.setUint16(26, nameBytes.length, true);
     view.setUint16(28, extraLfh.length, true);
     await this.write(new Uint8Array(header));
     await this.write(nameBytes);
     if (extraLfh.length > 0)
       await this.write(extraLfh);
-    await this.write(data);
+    await this.write(bytes);
     this.entries.push({
       name: nameBytes,
       crc: fileCrc,
-      size: data.length,
+      size: bytes.length,
       offset: localHeaderOffset,
       dosTime,
       dosDate,

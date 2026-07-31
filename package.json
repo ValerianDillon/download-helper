@@ -1,10 +1,11 @@
 {
   "name": "download-helper",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "description": "ブックマークレットとかで使うUI",
   "scripts": {
     "build": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle && bun build ./fanbox-collector.ts --outfile ./fanbox-collector.js --format esm --target browser --no-bundle",
     "lint": "biome check --write .",
+    "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
   "repository": {
@@ -26,6 +27,8 @@
   },
   "homepage": "https://github.com/ValerianDillon/download-helper#readme",
   "devDependencies": {
-    "@biomejs/biome": "^2.0.0"
+    "@biomejs/biome": "^2.0.0",
+    "@types/bun": "^1.3.14",
+    "typescript": "^7.0.2"
   }
 }
