@@ -941,7 +941,7 @@ function isValidPathSegment(value: unknown): value is string {
 /**
  * ディレクトリエントリと同名衝突を避けるためのファイル名検証 (post.cover.name / file.encodedName 用)
  * これらは isDownloadJsonObj で型 (string) までは検証済みのため、空文字列 / "." / ".." のみを拒否する
- * (`/` `\` `:` の検証と addFile 自体への入力検証は本 Issue のスコープ外。別 Issue で扱う)
+ * (`/` `\` `:` の検証と addFile 自体への入力検証は本 Issue のスコープ外。#17 で扱う)
  * @internal
  */
 function isValidFileNameSegment(name: string): boolean {
