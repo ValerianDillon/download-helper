@@ -1109,24 +1109,33 @@ describe('DownloadHelper.downloadZip', () => {
     return new DataView(buf.buffer, buf.byteOffset).getUint16(offset, true);
   }
 
-  type CdEntry = { externalAttr: number; dosTime: number; dosDate: number; localHeaderOffset: number };
+  type CdEntry = { name: string; externalAttr: number; dosTime: number; dosDate: number; localHeaderOffset: number };
 
   /**
-   * central directory を先頭から走査し、名前 → 主要フィールドを返す
-   * Map の挿入順は central directory の格納順 (= addFile/addDirectory の呼び出し順) と一致する
+   * central directory の走査結果。
+   * entries は central directory に格納された順 (= addFile/addDirectory の呼び出し順) の実エントリ列で、
+   * 同名エントリが複数あってもそのまま残る。byName はそこから作った名前引きの Map で、
+   * 同名エントリがあれば後勝ちで 1 件に潰れる (存在確認・フィールド参照用の利便のため用意しているだけで、
+   * 「エントリ数」や「重複がないこと」の検証には entries を使うこと)。
    */
-  function parseCentralDirectory(buf: Uint8Array): Map<string, CdEntry> {
+  type ParsedCentralDirectory = { entries: CdEntry[]; byName: Map<string, CdEntry> };
+
+  /**
+   * central directory を先頭から走査し、エントリ列 (格納順) と名前引き Map を返す
+   */
+  function parseCentralDirectory(buf: Uint8Array): ParsedCentralDirectory {
     const eocdOffset = buf.length - 22;
     const cdOffset = readUint32(buf, eocdOffset + 16);
     const totalEntries = readUint16(buf, eocdOffset + 10);
-    const result = new Map<string, CdEntry>();
+    const entries: CdEntry[] = [];
     let pos = cdOffset;
     for (let i = 0; i < totalEntries; i++) {
       const nameLen = readUint16(buf, pos + 28);
       const extraLen = readUint16(buf, pos + 30);
       const commentLen = readUint16(buf, pos + 32);
       const name = new TextDecoder().decode(buf.slice(pos + 46, pos + 46 + nameLen));
-      result.set(name, {
+      entries.push({
+        name,
         externalAttr: readUint32(buf, pos + 38),
         dosTime: readUint16(buf, pos + 12),
         dosDate: readUint16(buf, pos + 14),
@@ -1134,7 +1143,11 @@ describe('DownloadHelper.downloadZip', () => {
       });
       pos += 46 + nameLen + extraLen + commentLen;
     }
-    return result;
+    const byName = new Map<string, CdEntry>();
+    for (const entry of entries) {
+      byName.set(entry.name, entry);
+    }
+    return { entries, byName };
   }
 
   /**
@@ -1350,22 +1363,26 @@ describe('DownloadHelper.downloadZip', () => {
 
   describe('構造 (ディレクトリエントリの配置と日時)', () => {
     test('投稿ごとにディレクトリエントリがちょうど 1 件書かれ、配下ファイルより前に配置される', async () => {
-      const buf = await runDownloadZip(createValidObj());
+      const obj = createValidObj();
+      const buf = await runDownloadZip(obj);
       const cd = parseCentralDirectory(buf);
-      const names = Array.from(cd.keys());
+      const names = cd.entries.map((e) => e.name);
 
-      const post1DirIdx = names.indexOf('creator-id/post1/');
-      expect(post1DirIdx).toBeGreaterThanOrEqual(0);
-      expect(names.filter((n) => n === 'creator-id/post1/').length).toBe(1);
+      for (const post of obj.posts) {
+        const dirName = `creator-id/${post.encodedName}/`;
+        const dirIdx = names.indexOf(dirName);
+        expect(dirIdx).toBeGreaterThanOrEqual(0);
+        expect(names.filter((n) => n === dirName).length).toBe(1);
 
-      const post1ChildIdx = names.findIndex((n) => n !== 'creator-id/post1/' && n.startsWith('creator-id/post1/'));
-      expect(post1ChildIdx).toBeGreaterThan(post1DirIdx);
+        const childIdx = names.findIndex((n) => n !== dirName && n.startsWith(dirName));
+        expect(childIdx).toBeGreaterThan(dirIdx);
+      }
     });
 
     test('ルートディレクトリのエントリがルート index.html より前に配置される', async () => {
       const buf = await runDownloadZip(createValidObj());
       const cd = parseCentralDirectory(buf);
-      const names = Array.from(cd.keys());
+      const names = cd.entries.map((e) => e.name);
       const rootDirIdx = names.indexOf('creator-id/');
       const rootHtmlIdx = names.indexOf('creator-id/index.html');
       expect(rootDirIdx).toBe(0);
@@ -1375,7 +1392,7 @@ describe('DownloadHelper.downloadZip', () => {
     test('ルートディレクトリが書かれ、その日時が有効な publishedDatetime の最大値 (clamp 後) と一致する', async () => {
       const buf = await runDownloadZip(createValidObj());
       const cd = parseCentralDirectory(buf);
-      const rootEntry = cd.get('creator-id/');
+      const rootEntry = cd.byName.get('creator-id/');
       expect(rootEntry).toBeDefined();
       // posts の publishedDatetime は 2024-01-01 と 2024-06-15 → 最大値は 2024-06-15
       const expected = toDosTimeDate(clampToZipRange(new Date('2024-06-15T00:00:00Z')));
@@ -1391,19 +1408,19 @@ describe('DownloadHelper.downloadZip', () => {
       const cd = parseCentralDirectory(buf);
 
       const expected = toDosTimeDate(clampToZipRange(new Date('2024-03-01T00:00:00Z')));
-      expect(cd.get('creator-id/post1/')?.dosTime).toBe(expected.time);
-      expect(cd.get('creator-id/post1/')?.dosDate).toBe(expected.dosDate);
+      expect(cd.byName.get('creator-id/post1/')?.dosTime).toBe(expected.time);
+      expect(cd.byName.get('creator-id/post1/')?.dosDate).toBe(expected.dosDate);
       // 未指定 → date なし (DOS 0)
-      expect(cd.get('creator-id/post2/')?.dosTime).toBe(0);
-      expect(cd.get('creator-id/post2/')?.dosDate).toBe(0);
+      expect(cd.byName.get('creator-id/post2/')?.dosTime).toBe(0);
+      expect(cd.byName.get('creator-id/post2/')?.dosDate).toBe(0);
 
       const objInvalid = createValidObj();
       objInvalid.posts[0].publishedDatetime = 'not-a-date';
       const buf2 = await runDownloadZip(objInvalid);
       const cd2 = parseCentralDirectory(buf2);
       // 不正値 → date なし (DOS 0)
-      expect(cd2.get('creator-id/post1/')?.dosTime).toBe(0);
-      expect(cd2.get('creator-id/post1/')?.dosDate).toBe(0);
+      expect(cd2.byName.get('creator-id/post1/')?.dosTime).toBe(0);
+      expect(cd2.byName.get('creator-id/post1/')?.dosDate).toBe(0);
     });
 
     test('全投稿の publishedDatetime が無効な場合、ルートディレクトリが date なしになる', async () => {
@@ -1412,8 +1429,8 @@ describe('DownloadHelper.downloadZip', () => {
       obj.posts[1].publishedDatetime = 'not-a-date';
       const buf = await runDownloadZip(obj);
       const cd = parseCentralDirectory(buf);
-      expect(cd.get('creator-id/')?.dosTime).toBe(0);
-      expect(cd.get('creator-id/')?.dosDate).toBe(0);
+      expect(cd.byName.get('creator-id/')?.dosTime).toBe(0);
+      expect(cd.byName.get('creator-id/')?.dosDate).toBe(0);
     });
 
     test('EOCD のエントリ数が「実際に書かれた非ディレクトリエントリ数 + posts.length + 1」と一致する', async () => {
@@ -1422,8 +1439,8 @@ describe('DownloadHelper.downloadZip', () => {
       const eocdOffset = buf.length - 22;
       const totalEntries = readUint16(buf, eocdOffset + 10);
       const cd = parseCentralDirectory(buf);
-      const dirEntryCount = Array.from(cd.values()).filter((v) => (v.externalAttr & 0x10) !== 0).length;
-      const nonDirEntryCount = cd.size - dirEntryCount;
+      const dirEntryCount = cd.entries.filter((v) => (v.externalAttr & 0x10) !== 0).length;
+      const nonDirEntryCount = cd.entries.length - dirEntryCount;
       expect(totalEntries).toBe(nonDirEntryCount + obj.posts.length + 1);
     });
 
@@ -1455,12 +1472,12 @@ describe('DownloadHelper.downloadZip', () => {
       const eocdOffset = buf.length - 22;
       const totalEntries = readUint16(buf, eocdOffset + 10);
       const cd = parseCentralDirectory(buf);
-      const dirEntryCount = Array.from(cd.values()).filter((v) => (v.externalAttr & 0x10) !== 0).length;
-      const nonDirEntryCount = cd.size - dirEntryCount;
+      const dirEntryCount = cd.entries.filter((v) => (v.externalAttr & 0x10) !== 0).length;
+      const nonDirEntryCount = cd.entries.length - dirEntryCount;
       expect(totalEntries).toBe(nonDirEntryCount + obj.posts.length + 1);
       // 失敗した post1 のファイルはエントリが作られない一方、post2 のファイルは作られる
-      expect(cd.has('creator-id/post1/a.png')).toBe(false);
-      expect(cd.has('creator-id/post2/b.png')).toBe(true);
+      expect(cd.byName.has('creator-id/post1/a.png')).toBe(false);
+      expect(cd.byName.has('creator-id/post2/b.png')).toBe(true);
     });
   });
 });
