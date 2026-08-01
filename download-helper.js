@@ -395,6 +395,28 @@ export function buildExtTimestampCd(date) {
 function isInt32(n) {
   return n >= -2147483648 && n <= 2147483647;
 }
+function buildDateFields(date) {
+  let dosTime = 0;
+  let dosDate = 0;
+  let extraLfh = new Uint8Array(0);
+  let extraCd = new Uint8Array(0);
+  if (date !== undefined && Number.isFinite(date.getTime())) {
+    const d = clampToZipRange(date);
+    const dos = toDosTimeDate(d);
+    dosTime = dos.time;
+    dosDate = dos.dosDate;
+    const ntfs = buildNtfsExtra(d);
+    const unix = Math.floor(d.getTime() / 1000);
+    if (isInt32(unix)) {
+      extraLfh = concatBytes([ntfs, buildExtTimestampLfh(d)]);
+      extraCd = concatBytes([ntfs, buildExtTimestampCd(d)]);
+    } else {
+      extraLfh = ntfs;
+      extraCd = ntfs;
+    }
+  }
+  return { dosTime, dosDate, extraLfh, extraCd };
+}
 function concatBytes(parts) {
   const total = parts.reduce((s, p) => s + p.length, 0);
   const out = new Uint8Array(total);
@@ -419,25 +441,7 @@ export class ZipWriter {
     const nameBytes = this.encoder.encode(name);
     const fileCrc = crc32(bytes);
     const localHeaderOffset = this.offset;
-    let dosTime = 0;
-    let dosDate = 0;
-    let extraLfh = new Uint8Array(0);
-    let extraCd = new Uint8Array(0);
-    if (date !== undefined && Number.isFinite(date.getTime())) {
-      const d = clampToZipRange(date);
-      const dos = toDosTimeDate(d);
-      dosTime = dos.time;
-      dosDate = dos.dosDate;
-      const ntfs = buildNtfsExtra(d);
-      const unix = Math.floor(d.getTime() / 1000);
-      if (isInt32(unix)) {
-        extraLfh = concatBytes([ntfs, buildExtTimestampLfh(d)]);
-        extraCd = concatBytes([ntfs, buildExtTimestampCd(d)]);
-      } else {
-        extraLfh = ntfs;
-        extraCd = ntfs;
-      }
-    }
+    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
     const header = new ArrayBuffer(30);
     const view = new DataView(header);
     view.setUint32(0, 67324752, true);
@@ -463,7 +467,44 @@ export class ZipWriter {
       offset: localHeaderOffset,
       dosTime,
       dosDate,
-      extraCd
+      extraCd,
+      externalAttr: 0
+    });
+  }
+  async addDirectory(name, date) {
+    const dirName = name.endsWith("/") ? name : `${name}/`;
+    if (dirName.startsWith("/")) {
+      throw new Error(`addDirectory: name must not be empty or start with "/": ${JSON.stringify(name)}`);
+    }
+    const nameBytes = this.encoder.encode(dirName);
+    const localHeaderOffset = this.offset;
+    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+    const header = new ArrayBuffer(30);
+    const view = new DataView(header);
+    view.setUint32(0, 67324752, true);
+    view.setUint16(4, 20, true);
+    view.setUint16(6, 2048, true);
+    view.setUint16(8, 0, true);
+    view.setUint16(10, dosTime, true);
+    view.setUint16(12, dosDate, true);
+    view.setUint32(14, 0, true);
+    view.setUint32(18, 0, true);
+    view.setUint32(22, 0, true);
+    view.setUint16(26, nameBytes.length, true);
+    view.setUint16(28, extraLfh.length, true);
+    await this.write(new Uint8Array(header));
+    await this.write(nameBytes);
+    if (extraLfh.length > 0)
+      await this.write(extraLfh);
+    this.entries.push({
+      name: nameBytes,
+      crc: 0,
+      size: 0,
+      offset: localHeaderOffset,
+      dosTime,
+      dosDate,
+      extraCd,
+      externalAttr: 16
     });
   }
   async close() {
@@ -486,7 +527,7 @@ export class ZipWriter {
       view.setUint16(32, 0, true);
       view.setUint16(34, 0, true);
       view.setUint16(36, 0, true);
-      view.setUint32(38, 0, true);
+      view.setUint32(38, entry.externalAttr, true);
       view.setUint32(42, entry.offset, true);
       await this.write(new Uint8Array(cdHeader));
       await this.write(entry.name);
@@ -511,6 +552,12 @@ export class ZipWriter {
     await this.writable.write(data);
     this.offset += data.length;
   }
+}
+function isValidPathSegment(value) {
+  return typeof value === "string" && value.length > 0 && value !== "." && value !== ".." && !/[/\\:]/.test(value);
+}
+function isValidFileNameSegment(name) {
+  return name.length > 0 && name !== "." && name !== "..";
 }
 function pad2(n) {
   return `00${n}`.slice(-2);
@@ -652,6 +699,27 @@ export class DownloadHelper {
       throw new Error("ダウンロード対象オブジェクトの型が不正");
     const utils = this.utils;
     const encodedId = utils.encodeFileName(downloadObj.id);
+    if (!isValidPathSegment(encodedId)) {
+      throw new Error(`downloadZip: id が不正な値です (encode 後: ${JSON.stringify(encodedId)})`);
+    }
+    const seenEncodedNames = new Set;
+    for (const post of downloadObj.posts) {
+      if (!isValidPathSegment(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName が不正な値です (${JSON.stringify(post.encodedName)})`);
+      }
+      if (seenEncodedNames.has(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
+      }
+      seenEncodedNames.add(post.encodedName);
+      if (post.cover !== undefined && !isValidFileNameSegment(post.cover.name)) {
+        throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
+      }
+      for (const file of post.files) {
+        if (!isValidFileNameSegment(file.encodedName)) {
+          throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
+        }
+      }
+    }
     const handle = options?.handle ?? await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
@@ -669,6 +737,13 @@ export class DownloadHelper {
     let count = 0;
     let failedCount = 0;
     log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
+    const rootDate = downloadObj.posts.reduce((max, post) => {
+      const d = parsePublishedDate(post.publishedDatetime);
+      if (d === undefined)
+        return max;
+      return max === undefined || d.getTime() > max.getTime() ? d : max;
+    }, undefined);
+    await zip.addDirectory(`${encodedId}/`, rootDate);
     await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html");
     let postCount = 0;
     for (const post of downloadObj.posts) {
@@ -678,6 +753,7 @@ export class DownloadHelper {
       }
       log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
       const postDate = parsePublishedDate(post.publishedDatetime);
+      await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
       const informationFile = utils.createInformationFile(post.informationText);
       await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`, postDate);
       await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`, postDate);

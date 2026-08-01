@@ -1,6 +1,6 @@
 {
   "name": "download-helper",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "description": "ブックマークレットとかで使うUI",
   "scripts": {
     "build": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle && bun build ./fanbox-collector.ts --outfile ./fanbox-collector.js --format esm --target browser --no-bundle",
