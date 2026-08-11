@@ -983,8 +983,10 @@ export class ZipWriter {
    * catch することになる。その catch から呼ぶための入口がこのメソッドである。
    *
    * 既に 'open' でない (close 済み、または addFile/addDirectory/close 自身の失敗で既に abort 済み) 場合は
-   * no-op にする。ZipWriter 内部の失敗はメソッド自身の catch が既に abortOnFailure 済みなので、
-   * その例外が呼び出し元まで伝播してここに渡されても二重に abort しない。
+   * no-op にする。ここでの判定はあくまで早期リターンの最適化であり、実際に二重 abort を防いでいるのは
+   * abortOnFailure 側の同じチェックである (in-flight な addFile/addDirectory/close の I/O 待ち中に
+   * abort() が呼ばれるレースでは、ここでの判定時点ではまだ 'open' のままになりうるため。詳細は
+   * abortOnFailure のコメントを参照)。
    * @param reason 破棄理由 (writable.abort() に渡される)
    */
   async abort(reason?: unknown): Promise<void> {
@@ -1028,12 +1030,22 @@ export class ZipWriter {
    * そのため、addFile / addDirectory / close の途中で例外が発生した場合は、
    * 中途半端な (Central Directory / EOCD を欠いた壊れた) ZIP を実ファイルとしてコミットしてしまわないよう、
    * close() ではなく abort() でストリームを破棄する。abort() 自体の失敗は元の例外を握りつぶさないよう無視する。
+   *
+   * 冒頭の `state !== 'open'` チェックが二重 abort 防止の実体である (Issue #17 フォローアップ)。
+   * 公開 abort() は in-flight (addFile/addDirectory/close の I/O 待ち中) かどうかを考慮しないため、
+   * 進行中の操作の write() 待ちの最中に外部から abort() が呼ばれるレースが起こりうる。
+   * このとき abort() 経由の呼び出しが先に writable.abort() を発火させ、それによって進行中の write() が
+   * reject されると、進行中メソッド自身の catch も abortOnFailure を呼ぶため、対策が無いと
+   * writable.abort() が二重に実行されてしまう。
+   * ここでの「state を確認してから 'failed' に遷移させ、その後で writable.abort() を await する」という
+   * 順序が対策になっている。チェックと代入の間に await を挟まないため単一スレッドの JS 上では
+   * 不可分に実行され、2 つの呼び出しが競合しても後着側は必ず `state !== 'open'` を見て no-op になる。
    * state は abort() の成否に関わらず 'failed' のまま維持し、以後のすべての呼び出しを
-   * beginOperation で拒否することで、二重 abort と「失敗後もまだ生きているストリームへの書き込みが
-   * 通ってしまう」問題の両方を防ぐ (addFile/addDirectory/close 自身からの呼び出しは beginOperation が
-   * 入口で弾くため複数回呼ばれない。public な abort() 経由の呼び出しも state !== 'open' なら no-op にしている)。
+   * beginOperation で拒否することで、「失敗後もまだ生きているストリームへの書き込みが通ってしまう」
+   * 問題も防ぐ。
    */
   private async abortOnFailure(reason: unknown): Promise<void> {
+    if (this.state !== 'open') return;
     this.state = 'failed';
     try {
       await this.writable.abort(reason);

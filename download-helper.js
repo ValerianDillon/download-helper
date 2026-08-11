@@ -598,6 +598,8 @@ export class ZipWriter {
     this.inFlight = true;
   }
   async abortOnFailure(reason) {
+    if (this.state !== "open")
+      return;
     this.state = "failed";
     try {
       await this.writable.abort(reason);

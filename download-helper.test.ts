@@ -1412,6 +1412,73 @@ describe('ZipWriter', () => {
   });
 
   // ----------------------------------------------------------
+  // 公開 abort() と in-flight 操作の競合 (Issue #17 フォローアップ)
+  // 公開 abort() は inFlight を考慮しないため、addFile / addDirectory / close の I/O 待ち中にも呼べる。
+  // abort() 経由の writable.abort() が、進行中メソッドが待っている write() を reject させると、
+  // 進行中メソッド自身の catch も abortOnFailure を呼ぶ。abortOnFailure が state を見ずに
+  // writable.abort() を呼んでいると、この 2 系統から writable.abort() が二重に呼ばれてしまう。
+  // ----------------------------------------------------------
+  describe('公開 abort() と in-flight 操作の競合 (Issue #17 フォローアップ)', () => {
+    test('addFile の write() 待ち中に abort() を呼んでも writable.abort() は 1 回しか呼ばれず、進行中の addFile は reject される', async () => {
+      const mock = new MockWritableStream();
+      let abortCalls = 0;
+      let rejectPendingWrite: ((reason: unknown) => void) | undefined;
+      const originalAbort = mock.abort.bind(mock);
+
+      // 最初の write() を、mock.abort が呼ばれるまで pending にする。
+      // 実ブラウザの FileSystemWritableFileStream は abort されると保留中の write() を reject するため、
+      // それを模している。
+      mock.write = () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectPendingWrite = reject;
+        });
+      mock.abort = async (reason?: unknown) => {
+        abortCalls++;
+        await originalAbort(reason);
+        rejectPendingWrite?.(reason ?? new Error('aborted'));
+      };
+
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const addFilePromise = zip.addFile('a.txt', encoder.encode('x')); // await しない (write() で pending になる)
+
+      const abortReason = new Error('外部からの abort');
+      await zip.abort(abortReason);
+
+      await expect(addFilePromise).rejects.toThrow();
+      expect(abortCalls).toBe(1);
+      expect(mock.aborted).toBe(true);
+
+      // 以後の操作は拒否される
+      await expect(zip.addFile('b.txt', encoder.encode('y'))).rejects.toThrow();
+    });
+
+    test('addDirectory の write() 待ち中に abort() を呼んでも writable.abort() は 1 回しか呼ばれない', async () => {
+      const mock = new MockWritableStream();
+      let abortCalls = 0;
+      let rejectPendingWrite: ((reason: unknown) => void) | undefined;
+      const originalAbort = mock.abort.bind(mock);
+
+      mock.write = () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectPendingWrite = reject;
+        });
+      mock.abort = async (reason?: unknown) => {
+        abortCalls++;
+        await originalAbort(reason);
+        rejectPendingWrite?.(reason ?? new Error('aborted'));
+      };
+
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const addDirectoryPromise = zip.addDirectory('dir');
+
+      await zip.abort(new Error('外部からの abort'));
+
+      await expect(addDirectoryPromise).rejects.toThrow();
+      expect(abortCalls).toBe(1);
+    });
+  });
+
+  // ----------------------------------------------------------
   // 並行呼び出しの検出 (Issue #17 フォローアップ)
   // このクラスは直列に await して使うことを契約とする。前の呼び出しの完了を待たずに次を呼ぶのは誤用であり、
   // 暗黙に直列化してキューイングするのではなく、即座に例外にして誤用を顕在化させる。
