@@ -9,6 +9,7 @@ import {
   type DownloadJsonObj,
   DownloadUtils,
   type DownloadZipOptions,
+  type DownloadZipResult,
   type FileObj,
   FileObject,
   toDosTimeDate,
@@ -2251,6 +2252,181 @@ describe('DownloadHelper.downloadZip', () => {
       // 失敗した post1 のファイルはエントリが作られない一方、post2 のファイルは作られる
       expect(cd.byName.has('creator-id/post1/a.png')).toBe(false);
       expect(cd.byName.has('creator-id/post2/b.png')).toBe(true);
+    });
+  });
+
+  // ----------------------------------------------------------
+  // 処理結果 (Issue #13)
+  // 各件数の定義は DownloadZipResult の JSDoc を参照。ここでは加算タイミングをケースごとに確認する。
+  // ----------------------------------------------------------
+  describe('処理結果 (Issue #13)', () => {
+    /**
+     * 投稿 2 件、各投稿にカバー 1 件 + 添付 1 件を持つ DownloadJsonObj。
+     * カバー / 添付それぞれの成功・失敗・中断を個別に制御しやすいよう、投稿 1 件あたりの
+     * カバー・添付を 1 件ずつに絞っている (件数の数え間違いをテスト側で見落としにくくするため)。
+     */
+    function createObjWithCovers(): DownloadJsonObj {
+      return {
+        posts: [
+          {
+            originalName: 'post1',
+            encodedName: 'post1',
+            informationText: '{}',
+            htmlText: '<p>1</p>',
+            files: [{ url: 'https://example.com/p1-file.png', originalName: 'file.png', encodedName: 'file.png' }],
+            tags: [],
+            cover: { url: 'https://example.com/p1-cover.png', name: 'cover.png' },
+          },
+          {
+            originalName: 'post2',
+            encodedName: 'post2',
+            informationText: '{}',
+            htmlText: '<p>2</p>',
+            files: [{ url: 'https://example.com/p2-file.png', originalName: 'file.png', encodedName: 'file.png' }],
+            tags: [],
+            cover: { url: 'https://example.com/p2-cover.png', name: 'cover.png' },
+          },
+        ],
+        id: 'creator-id',
+        url: 'https://example.com',
+        tags: [],
+        fileCount: 2,
+        postCount: 2,
+      };
+    }
+
+    /**
+     * handle を注入して downloadZip を実行し、結果を返す (ZIP バイト列は使わないケース向け)
+     */
+    async function runForResult(
+      obj: DownloadJsonObj,
+      fetchFile: NonNullable<DownloadZipOptions['fetchFile']>,
+      signal?: AbortSignal,
+    ): Promise<DownloadZipResult> {
+      const mock = new MockWritableStream();
+      const handle = {
+        async createWritable() {
+          return mock as unknown as FileSystemWritableFileStream;
+        },
+      };
+      return helper.downloadZip(
+        obj,
+        () => {},
+        () => {},
+        () => {},
+        { handle: handle as unknown as FileSystemFileHandle, fetchFile, signal },
+      );
+    }
+
+    test('全成功時: completedPostCount/totalPostCount が投稿数、writtenFileCount がカバー+添付の成功数、failedFileCount 0、aborted false', async () => {
+      const obj = createObjWithCovers();
+      const fetchFile = async () => new Blob([new Uint8Array([1])]);
+      const result = await runForResult(obj, fetchFile);
+      expect(result).toEqual({
+        completedPostCount: 2,
+        totalPostCount: 2,
+        writtenFileCount: 4, // cover x2 + file x2
+        failedFileCount: 0,
+        aborted: false,
+      });
+    });
+
+    test('添付ファイル失敗あり: 失敗した添付は writtenFileCount に含めず failedFileCount に数える。投稿自体は完了扱いになる', async () => {
+      const obj = createObjWithCovers();
+      const fetchFile = async (_url: string, _name: string, context: { kind: 'cover' | 'file' }) =>
+        context.kind === 'file' && _url === 'https://example.com/p1-file.png' ? null : new Blob([new Uint8Array([1])]);
+      const result = await runForResult(obj, fetchFile);
+      expect(result.completedPostCount).toBe(2);
+      expect(result.totalPostCount).toBe(2);
+      expect(result.writtenFileCount).toBe(3); // cover x2 + file x1 (post2 のみ成功)
+      expect(result.failedFileCount).toBe(1);
+      expect(result.aborted).toBe(false);
+    });
+
+    test('カバー失敗あり: 失敗したカバーは writtenFileCount に含めず failedFileCount に数える。投稿自体は完了扱いになる (カバー画像の最終的な失敗を計上する、fanbox-downloader-extension#18 対応)', async () => {
+      const obj = createObjWithCovers();
+      const fetchFile = async (url: string) =>
+        url === 'https://example.com/p1-cover.png' ? null : new Blob([new Uint8Array([1])]);
+      const result = await runForResult(obj, fetchFile);
+      expect(result.completedPostCount).toBe(2);
+      expect(result.writtenFileCount).toBe(3); // cover x1 (post2) + file x2
+      expect(result.failedFileCount).toBe(1);
+      expect(result.aborted).toBe(false);
+    });
+
+    test('中断時: 打ち切られた投稿は completedPostCount に含めず、aborted は true になる', async () => {
+      const obj = createObjWithCovers();
+      const controller = new AbortController();
+      const fetchFile = async (url: string) => {
+        if (url === 'https://example.com/p1-file.png') {
+          // post1 のファイル取得完了直後 (post1 完了直後、post2 開始前) に中断する
+          controller.abort();
+        }
+        return new Blob([new Uint8Array([1])]);
+      };
+      const result = await runForResult(obj, fetchFile, controller.signal);
+      expect(result.completedPostCount).toBe(1); // post1 のみ完了、post2 は未着手
+      expect(result.totalPostCount).toBe(2);
+      expect(result.writtenFileCount).toBe(2); // post1 の cover + file
+      expect(result.failedFileCount).toBe(0);
+      expect(result.aborted).toBe(true);
+    });
+
+    test('中断による fetchFile の null 応答は failedFileCount に数えない', async () => {
+      const obj = createObjWithCovers();
+      const controller = new AbortController();
+      const fetchFile = async (url: string) => {
+        if (url === 'https://example.com/p1-file.png') {
+          // このファイル自体の取得中に中断される (top-of-loop の signal チェックをすり抜けた後に発生する中断)
+          controller.abort();
+          return null;
+        }
+        return new Blob([new Uint8Array([1])]);
+      };
+      const result = await runForResult(obj, fetchFile, controller.signal);
+      expect(result.aborted).toBe(true);
+      expect(result.failedFileCount).toBe(0); // 中断由来の null は失敗として数えない
+      expect(result.completedPostCount).toBe(0); // post1 はカバーのみ完了、添付未完了のため未完了扱い
+      expect(result.writtenFileCount).toBe(1); // post1 の cover のみ
+    });
+
+    test('全データを書き終えたあと (最終 zip.close() 実行中) に signal.aborted になった場合、aborted は false のまま', async () => {
+      const obj = createObjWithCovers();
+      const controller = new AbortController();
+      // カバー x2 + 添付 x2 = 4 回の fetchFile 呼び出しのうち、最後 (post2 の添付) の直前で abort する。
+      // それより前に abort すると、以後の投稿/ファイルループの先頭チェックで中断分岐に入ってしまい、
+      // 検証したい「全部書き終わった後に signal が立った」状況を作れないため、最後の呼び出しに限定する
+      let callCount = 0;
+      const totalCalls = 4;
+      const fetchFile = async () => {
+        callCount++;
+        if (callCount === totalCalls) {
+          controller.abort();
+        }
+        return new Blob([new Uint8Array([1])]);
+      };
+      const result = await runForResult(obj, fetchFile, controller.signal);
+      expect(result.aborted).toBe(false);
+      expect(result.completedPostCount).toBe(2);
+      expect(result.totalPostCount).toBe(2);
+      expect(result.writtenFileCount).toBe(4);
+      expect(result.failedFileCount).toBe(0);
+    });
+
+    test('fetchFile の第 3 引数 context.kind がカバー/添付それぞれ正しく渡る', async () => {
+      const obj = createObjWithCovers();
+      const calls: { url: string; kind: 'cover' | 'file' }[] = [];
+      const fetchFile = async (url: string, _name: string, context: { kind: 'cover' | 'file' }) => {
+        calls.push({ url, kind: context.kind });
+        return new Blob([new Uint8Array([1])]);
+      };
+      await runForResult(obj, fetchFile);
+      expect(calls).toEqual([
+        { url: 'https://example.com/p1-cover.png', kind: 'cover' },
+        { url: 'https://example.com/p1-file.png', kind: 'file' },
+        { url: 'https://example.com/p2-cover.png', kind: 'cover' },
+        { url: 'https://example.com/p2-file.png', kind: 'file' },
+      ]);
     });
   });
 
