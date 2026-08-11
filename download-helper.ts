@@ -833,6 +833,11 @@ export class ZipWriter {
       if (extraLfh.length > 0) await this.write(extraLfh);
       await this.write(bytes);
 
+      // 最後の write() が resolve してからこの行に来るまでの間 (await this.write(bytes) の継続が挟む
+      // マイクロタスク境界) にも、公開 abort() が割り込む窓が残るため、entries.push() 直前で再確認する
+      // (Issue #17 フォローアップ)
+      this.assertStillOpen('addFile');
+
       this.entries.push({
         name: nameBytes,
         crc: fileCrc,
@@ -895,6 +900,9 @@ export class ZipWriter {
       await this.write(new Uint8Array(header));
       await this.write(nameBytes);
       if (extraLfh.length > 0) await this.write(extraLfh);
+
+      // addFile と同様、最後の write() の resolve から entries.push() までの窓を塞ぐ (Issue #17 フォローアップ)
+      this.assertStillOpen('addDirectory');
 
       this.entries.push({
         name: nameBytes,
@@ -1016,9 +1024,39 @@ export class ZipWriter {
     await this.abortOnFailure(reason);
   }
 
+  /**
+   * writable への実書き込み。addFile / addDirectory / close の各書き込み点から呼ばれる。
+   *
+   * Streams 仕様は abort() が保留中の write() を必ず reject することを保証しない。そのため、
+   * addFile / addDirectory の I/O 待ち中に公開 abort() が呼ばれても、この write() 自体は正常に
+   * resolve してしまいうる。それを検出しないと、addFile / addDirectory が abort 後も「書けた」まま
+   * 成功として resolve してしまう (契約の嘘になる。ZIP の実コミットは close() 側で state を見て
+   * 弾かれるため実際には起きないが、呼び出し元への戻り値としての嘘は起きる)。
+   * そこで実書き込みが resolve した直後に state を再確認し、'open' でなくなっていれば例外を投げる。
+   * close() は in-flight 中は公開 abort() 自体が拒否される (別項参照) ため、close 自身の CD / EOCD
+   * 書き込みではこのチェックは通常発火しない。
+   * @throws {Error} 書き込みが resolve した時点で state が 'open' でなくなっていた場合 (Issue #17 フォローアップ)
+   */
   private async write(data: Uint8Array<ArrayBuffer>): Promise<void> {
     await this.writable.write(data);
+    if (this.state !== 'open') {
+      throw new Error('ZipWriter: 書き込み中に abort されました');
+    }
     this.offset += data.length;
+  }
+
+  /**
+   * state が 'open' のままであることを再確認する (Issue #17 フォローアップ)。
+   * write() 内のチェックは、その write() 自身が resolve した時点の state しか見られない。
+   * addFile / addDirectory では、最後の write() が resolve してから entries.push() に到達するまでの間にも
+   * (呼び出し元での `await this.write(...)` の継続がマイクロタスク境界を挟むため) 公開 abort() が
+   * 割り込む窓が残る。entries.push() 直前でこの確認を挟むことでその窓を塞ぐ。
+   * @throws {Error} state が 'open' でない場合
+   */
+  private assertStillOpen(method: 'addFile' | 'addDirectory'): void {
+    if (this.state !== 'open') {
+      throw new Error(`ZipWriter.${method}: 書き込み中に abort されました`);
+    }
   }
 
   /**

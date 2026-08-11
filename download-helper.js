@@ -466,6 +466,7 @@ export class ZipWriter {
       if (extraLfh.length > 0)
         await this.write(extraLfh);
       await this.write(bytes);
+      this.assertStillOpen("addFile");
       this.entries.push({
         name: nameBytes,
         crc: fileCrc,
@@ -509,6 +510,7 @@ export class ZipWriter {
       await this.write(nameBytes);
       if (extraLfh.length > 0)
         await this.write(extraLfh);
+      this.assertStillOpen("addDirectory");
       this.entries.push({
         name: nameBytes,
         crc: 0,
@@ -586,7 +588,15 @@ export class ZipWriter {
   }
   async write(data) {
     await this.writable.write(data);
+    if (this.state !== "open") {
+      throw new Error("ZipWriter: 書き込み中に abort されました");
+    }
     this.offset += data.length;
+  }
+  assertStillOpen(method) {
+    if (this.state !== "open") {
+      throw new Error(`ZipWriter.${method}: 書き込み中に abort されました`);
+    }
   }
   beginOperation(method) {
     if (this.state === "failed") {

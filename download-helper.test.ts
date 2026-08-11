@@ -1515,6 +1515,81 @@ describe('ZipWriter', () => {
       // close 成功後は 'closed' として terminal 状態を維持する (state が 'failed' に化けていない)
       await expect(zip.addFile('b.txt', encoder.encode('y'))).rejects.toThrow();
     });
+
+    // Streams 仕様は abort() が保留中の write() を必ず reject することを保証しない。
+    // write() 自体が正常に resolve してしまうケースでも、addFile / addDirectory が abort 後に
+    // 「書けた」まま成功として resolve してはならない。
+    test('addFile: 最終 write() の実行中に abort() を呼び、write 自体は正常 resolve しても addFile は reject される', async () => {
+      const mock = new MockWritableStream();
+      let abortCalls = 0;
+      let writeCallCount = 0;
+      let resolveLastWrite: (() => void) | undefined;
+      const originalWrite = mock.write.bind(mock);
+      const originalAbort = mock.abort.bind(mock);
+
+      mock.write = async (data: Uint8Array) => {
+        writeCallCount++;
+        if (writeCallCount === 3) {
+          // 最後の write (ファイル本体データ。日時なしなので header → name → data の 3 回) だけ
+          // 明示的に解放するまで pending にする
+          await new Promise<void>((resolve) => {
+            resolveLastWrite = resolve;
+          });
+        }
+        await originalWrite(data);
+      };
+      mock.abort = async (reason?: unknown) => {
+        abortCalls++;
+        await originalAbort(reason);
+        // ここでは意図的に保留中の write() を reject させない (write が abort で必ず reject するとは
+        // 限らないケースの再現)
+      };
+
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const addFilePromise = zip.addFile('a.txt', encoder.encode('x')); // await しない (3 回目の write() で pending)
+
+      await zip.abort(new Error('外部からの abort'));
+
+      // write() 自体は (abort による reject ではなく) 正常に resolve させる
+      resolveLastWrite?.();
+
+      await expect(addFilePromise).rejects.toThrow();
+      expect(abortCalls).toBe(1); // addFile 自身の catch が二重に abort していない
+    });
+
+    test('addDirectory: 最終 write() の実行中に abort() を呼び、write 自体は正常 resolve しても addDirectory は reject される', async () => {
+      const mock = new MockWritableStream();
+      let abortCalls = 0;
+      let writeCallCount = 0;
+      let resolveLastWrite: (() => void) | undefined;
+      const originalWrite = mock.write.bind(mock);
+      const originalAbort = mock.abort.bind(mock);
+
+      mock.write = async (data: Uint8Array) => {
+        writeCallCount++;
+        if (writeCallCount === 2) {
+          // 最後の write (エントリ名。日時なしなので header → name の 2 回) だけ pending にする
+          await new Promise<void>((resolve) => {
+            resolveLastWrite = resolve;
+          });
+        }
+        await originalWrite(data);
+      };
+      mock.abort = async (reason?: unknown) => {
+        abortCalls++;
+        await originalAbort(reason);
+      };
+
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const addDirectoryPromise = zip.addDirectory('dir'); // await しない (2 回目の write() で pending)
+
+      await zip.abort(new Error('外部からの abort'));
+
+      resolveLastWrite?.();
+
+      await expect(addDirectoryPromise).rejects.toThrow();
+      expect(abortCalls).toBe(1);
+    });
   });
 
   // ----------------------------------------------------------
