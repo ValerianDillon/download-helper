@@ -85,6 +85,17 @@ function isValidUrlEmbedInfo(value) {
       return true;
   }
 }
+function checkCommonFields(postInfo) {
+  const missing = [];
+  if (typeof postInfo.title !== "string")
+    missing.push("title");
+  if (!Array.isArray(postInfo.tags))
+    missing.push("tags");
+  if (postInfo.coverImageUrl !== null && postInfo.coverImageUrl !== undefined && typeof postInfo.coverImageUrl !== "string") {
+    missing.push("coverImageUrl");
+  }
+  return missing;
+}
 function checkBody(postInfo) {
   const body = postInfo.body;
   const missing = [];
@@ -148,9 +159,9 @@ feeRequired: ${postInfo.feeRequired}@${postInfo.id}`);
 ${postInfo.type}@${postInfo.id}`);
       return { status: "unsupported", postId: postInfo.id, type: postInfo.type };
   }
-  const missing = checkBody(postInfo);
+  const missing = [...checkCommonFields(postInfo), ...checkBody(postInfo)];
   if (missing.length > 0) {
-    console.error(`本文の形式が想定と違うため取り込みませんでした
+    console.error(`投稿データの形式が想定と違うため取り込みませんでした
 ${postInfo.type}@${postInfo.id} missing: ${missing.join(", ")}`);
     return { status: "invalid", postId: postInfo.id, type: postInfo.type, missing };
   }

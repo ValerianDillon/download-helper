@@ -344,12 +344,37 @@ function isValidUrlEmbedInfo(value: unknown): boolean {
 }
 
 /**
+ * 投稿タイプによらず addByPostInfo が本文外 (postInfo 直下) で参照するフィールドを検査する。
+ *
+ * - title: addPost(postName) の内部で DownloadUtils.encodeFileName が String.prototype.replace を
+ *   直接呼ぶほか、header 生成でも escapeHtml(postName) に渡る。いずれも非文字列だと例外になる
+ * - tags: `[...postInfo.tags]` で 2 箇所 (setTags 呼び出し、addTags 呼び出し) スプレッドしており、
+ *   配列 (正確には iterable) でないとその場で例外になる。要素自体は Set への格納や
+ *   JSON.stringify にしか使われず文字列メソッドを直接呼ばれないため、要素の型までは検証しない
+ * - coverImageUrl: truthy なら header 生成で `.split('.')` を直接呼ぶため、文字列でない truthy 値
+ *   だと例外になる。null / undefined は falsy 分岐に流れるだけなので許容する
+ */
+function checkCommonFields(postInfo: PostInfo): string[] {
+  const missing: string[] = [];
+  if (typeof postInfo.title !== 'string') missing.push('title');
+  if (!Array.isArray(postInfo.tags)) missing.push('tags');
+  if (
+    postInfo.coverImageUrl !== null &&
+    postInfo.coverImageUrl !== undefined &&
+    typeof postInfo.coverImageUrl !== 'string'
+  ) {
+    missing.push('coverImageUrl');
+  }
+  return missing;
+}
+
+/**
  * 投稿タイプごとに、本文の取り込みで実際に触るフィールドを検査し、欠けているものを返す。
  *
  * addByPostInfo は投稿を downloadObject に登録してから本文を触るため、途中で例外になると
  * 空の投稿が出力に残り、取得件数上限の減算も飛ばされる。登録前にここで弾いて
  * その状態を作らせない。呼び出し側は addByPostInfo が既知タイプと確認した後にのみ呼ぶため、
- * 未知タイプはここに来ない。
+ * 未知タイプはここに来ない。本文外の共通フィールドは checkCommonFields が別途検査する。
  */
 function checkBody(postInfo: PostInfo & { type: KnownPostType }): string[] {
   const body = postInfo.body as Record<string, unknown>;
@@ -416,10 +441,10 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
       console.error(`未知の投稿タイプのため取り込みませんでした\n${postInfo.type}@${postInfo.id}`);
       return { status: 'unsupported', postId: postInfo.id, type: postInfo.type };
   }
-  const missing = checkBody(postInfo);
+  const missing = [...checkCommonFields(postInfo), ...checkBody(postInfo)];
   if (missing.length > 0) {
     console.error(
-      `本文の形式が想定と違うため取り込みませんでした\n${postInfo.type}@${postInfo.id} missing: ${missing.join(', ')}`,
+      `投稿データの形式が想定と違うため取り込みませんでした\n${postInfo.type}@${postInfo.id} missing: ${missing.join(', ')}`,
     );
     return { status: 'invalid', postId: postInfo.id, type: postInfo.type, missing };
   }

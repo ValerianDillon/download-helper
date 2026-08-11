@@ -317,6 +317,58 @@ describe('addByPostInfo - 取り込み結果', () => {
     });
   });
 
+  test('tags が配列でなければ invalid を返す (スプレッドで例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({ tags: undefined } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'text',
+      missing: ['tags'],
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('coverImageUrl が truthy な非文字列なら invalid を返す (.split で例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({ coverImageUrl: 12345 } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'text',
+      missing: ['coverImageUrl'],
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('coverImageUrl が null / undefined なら許容する (falsy 分岐で split を呼ばないため)', () => {
+    const m = createManage();
+    expect(addByPostInfo(m, basePost({ coverImageUrl: null }))).toEqual({ status: 'added' });
+    expect(addByPostInfo(m, basePost({ coverImageUrl: undefined } as Partial<PostInfo>))).toEqual({
+      status: 'added',
+    });
+  });
+
+  test('title が非文字列なら invalid を返す (encodeFileName / escapeHtml で例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({ title: 123 } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'text',
+      missing: ['title'],
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('本文外フィールドが壊れていても取得件数上限を消費しない', () => {
+    const m = createManage();
+    m.setLimitAvailable(true);
+    m.setLimit(1);
+    addByPostInfo(m, basePost({ tags: undefined } as unknown as Partial<PostInfo>));
+    expect(m.isLimitValid()).toBe(true);
+  });
+
   test('article タイプは blocks / imageMap / fileMap / embedMap / urlEmbedMap を個別に検査する', () => {
     const m = createManage();
     const broken = basePost({
