@@ -724,6 +724,80 @@ function concatBytes(parts: Uint8Array<ArrayBuffer>[]): Uint8Array<ArrayBuffer> 
 }
 
 /**
+ * ZIP エントリ数の上限 (Issue #15)。
+ * `0xFFFF` (65535) は ZIP64 の central directory エントリ数の sentinel 値 (APPNOTE 4.4.1.4) であり、
+ * 「真の値は ZIP64 EOCD レコードにある」ことを示す。ZipWriter は ZIP64 record を書かないため、
+ * エントリ数がちょうど 65535 件になると、sentinel を厳密に扱うリーダー (例: Perl Archive::Zip) が
+ * ZIP 全体を開けなくなる。65536 件以上では EOCD の uint16 フィールドが折り返り (65536 → 0)、
+ * 件数でループするリーダーが central directory の途中で不整合を起こす。
+ * どちらの壊れ方も避けるため、エントリ数は 65534 件までに制限する。
+ * @internal
+ */
+export const MAX_ZIP_ENTRY_COUNT = 0xfffe;
+
+/**
+ * LFH / CD の size フィールドと CD / EOCD の offset フィールド (いずれも uint32) が
+ * 取り得る値の上限 (Issue #15)。`0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値であり、
+ * ZipWriter は ZIP64 Extended Information Extra Field を書かないため、この値以上になると
+ * sentinel と誤認されるか、uint32 の折り返しでフィールドの値そのものが壊れる。
+ * @internal
+ */
+export const MAX_ZIP_UINT32_FIELD_VALUE = 0xffffffff;
+
+/**
+ * ZIP エントリ数が上限に達していないか検証する。addFile / addDirectory の書き込み開始前
+ * (ヘッダを書く前) に呼ぶことで、65535 件目 (sentinel 値) 以降のエントリを書き込む前に拒否する
+ * (Issue #15)。65534 回 addFile を呼ぶ実行時間のテストを避けるため、カウント検査ロジックを
+ * ZipWriter から独立させて直接ユニットテストできるようにしている。
+ * @param currentEntryCount 追加しようとしている時点での既存エントリ数 (呼び出し側の entries.length)
+ * @throws {Error} currentEntryCount が上限 (MAX_ZIP_ENTRY_COUNT) 以上の場合
+ * @internal
+ */
+export function assertZipEntryCountWithinLimit(currentEntryCount: number, method: 'addFile' | 'addDirectory'): void {
+  if (currentEntryCount >= MAX_ZIP_ENTRY_COUNT) {
+    throw new Error(
+      `ZipWriter.${method}: ZIP エントリ数が上限 (${MAX_ZIP_ENTRY_COUNT} 件) に達しています ` +
+        '(ZIP64 非対応のため、これ以上追加すると EOCD のエントリ数フィールドが ZIP64 の sentinel 値と衝突するか uint16 で折り返します)',
+    );
+  }
+}
+
+/**
+ * 単一エントリのデータサイズが上限を超えないか検証する。LFH / CD の compressed / uncompressed size は
+ * uint32 で、かつ ZipWriter は圧縮を行わない (常に stored, Issue #15) ため、データの生バイト数が
+ * そのままこのフィールドに書かれる。0xFFFFFFFF bytes のバッファ確保は現実的でないため、
+ * サイズ比較のロジックのみを独立させて境界値を直接ユニットテストできるようにしている。
+ * @param size エントリのデータバイト数
+ * @throws {Error} size が上限 (MAX_ZIP_UINT32_FIELD_VALUE) 以上の場合
+ * @internal
+ */
+export function assertZipEntrySizeWithinLimit(size: number, name: string, method: 'addFile'): void {
+  if (size >= MAX_ZIP_UINT32_FIELD_VALUE) {
+    throw new Error(
+      `ZipWriter.${method}: エントリサイズが上限 (${MAX_ZIP_UINT32_FIELD_VALUE} bytes) 以上です (ZIP64 非対応): ` +
+        `${JSON.stringify(name)} (${size} bytes)`,
+    );
+  }
+}
+
+/**
+ * CD の local header offset、EOCD の cdOffset / cdSize など、uint32 フィールドに書き込む値が
+ * 上限を超えないか検証する (Issue #15)。addFile / addDirectory では書き込み開始前の this.offset
+ * (この後 CD に書く local header offset になる値) を、close() では cdOffset と central directory
+ * 全体のサイズをそれぞれ書き込み前に検証する。呼び出しごとに書き込みの手前で呼ぶことで、
+ * 上限超過を「壊れたバイト列を書いてから気付く」のではなく「書く前に検知する」設計にしている。
+ * @param value 検証対象の値 (offset または size)
+ * @param context エラーメッセージに含める説明 (どのフィールドの検証かを示す)
+ * @throws {Error} value が上限 (MAX_ZIP_UINT32_FIELD_VALUE) 以上の場合
+ * @internal
+ */
+export function assertZipUint32FieldWithinLimit(value: number, context: string): void {
+  if (value >= MAX_ZIP_UINT32_FIELD_VALUE) {
+    throw new Error(`ZipWriter: ${context} が上限 (${MAX_ZIP_UINT32_FIELD_VALUE} bytes) 以上になります (ZIP64 非対応)`);
+  }
+}
+
+/**
  * ZIP ファイル書き込みクラス (stored / 非圧縮)
  * File System Access API の FileSystemWritableFileStream に直接書き込む
  *
@@ -793,7 +867,12 @@ export class ZipWriter {
    *   実行中) の場合。name をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を
    *   含む場合、または末尾が `/` の場合 (downloadZip 側でも同じ検証を行うが、addFile を直接呼ぶ利用者を
    *   無防備にしないための多層防御として ZipWriter 自身にも検証を持たせている、Issue #17)。
-   *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)
+   *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)。
+   *   このインスタンスの既存エントリ数が上限 (`MAX_ZIP_ENTRY_COUNT` = 65534 件) に達している場合、
+   *   data のバイト数が上限 (`MAX_ZIP_UINT32_FIELD_VALUE` = 0xFFFFFFFF bytes) 以上の場合、または
+   *   この書き込みで central directory の local header offset が同上限に達する場合
+   *   (ZipWriter は ZIP64 を実装しておらず、classic ZIP の uint16 / uint32 フィールドの範囲を
+   *   超えるとフィールド自体が壊れるため、書き込み前に検知して拒否する。Issue #15)
    */
   async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
     this.beginOperation('addFile');
@@ -808,8 +887,13 @@ export class ZipWriter {
       // 戻り値が ArrayBufferLike 扱いになるためアサーションで補う)
       const nameBytes = this.encoder.encode(name) as Uint8Array<ArrayBuffer>;
       assertValidZipEntryNameByteLength(nameBytes, name, 'addFile');
+      assertZipEntryCountWithinLimit(this.entries.length, 'addFile');
+      assertZipEntrySizeWithinLimit(bytes.length, name, 'addFile');
       const fileCrc = crc32(bytes);
       const localHeaderOffset = this.offset;
+      // この後 CD に local header offset として書く値 (offset 42) が uint32 に収まるかを、
+      // ヘッダを書く前に検証する (Issue #15)
+      assertZipUint32FieldWithinLimit(localHeaderOffset, `addFile ("${name}") の local header offset`);
 
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
 
@@ -868,7 +952,11 @@ export class ZipWriter {
    *   addFile と同じ検証をセグメント単位で適用するため、drive letter (`C:/dir`) や `\` 区切りも拒否する
    *   (Issue #14 時点では addFile と非対称にしないため未検証としていたが、Issue #17 で addFile 側にも
    *   検証を追加したため、この非対称は解消されている)。
-   *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)
+   *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)。
+   *   このインスタンスの既存エントリ数が上限 (`MAX_ZIP_ENTRY_COUNT` = 65534 件) に達している場合、
+   *   またはこの書き込みで central directory の local header offset が上限
+   *   (`MAX_ZIP_UINT32_FIELD_VALUE` = 0xFFFFFFFF bytes) に達する場合 (addFile と同じ ZIP64 非対応の
+   *   理由による書き込み前の検知。Issue #15)
    */
   async addDirectory(name: string, date?: Date): Promise<void> {
     this.beginOperation('addDirectory');
@@ -878,7 +966,11 @@ export class ZipWriter {
 
       const nameBytes = this.encoder.encode(dirName) as Uint8Array<ArrayBuffer>;
       assertValidZipEntryNameByteLength(nameBytes, dirName, 'addDirectory');
+      assertZipEntryCountWithinLimit(this.entries.length, 'addDirectory');
       const localHeaderOffset = this.offset;
+      // addFile と同様、CD に書く local header offset (offset 42) を書き込み前に検証する (Issue #15)。
+      // ディレクトリエントリはデータ本体を持たずサイズは常に 0 のため、サイズ上限の検査は不要
+      assertZipUint32FieldWithinLimit(localHeaderOffset, `addDirectory ("${dirName}") の local header offset`);
 
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
 
@@ -928,16 +1020,34 @@ export class ZipWriter {
    * 既知の制限 (ZIP64 未対応): EOCD のエントリ数 (下記 offset 8/10) と LFH/CD の compressed / uncompressed size
    * (addFile 内、offset 18/22 および 20/24)、CD の local header offset (offset 42)、EOCD の cdSize / cdOffset
    * (offset 12/16) はいずれも uint16 または uint32 に直接値を書いており、ZIP64 の拡張フィールドを持たない。
-   * `0xFFFF` / `0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値のため、
-   * エントリ数が 65,535 件以上、またはサイズ/オフセットが `0xFFFFFFFF` bytes 以上になると壊れた ZIP を出力する。
+   * `0xFFFF` / `0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値のため、これらのフィールドが
+   * それに達すると本来は壊れた ZIP になる。Issue #15 でこれを検知するようにしたため、実際には
+   * エントリ数が上限 (`MAX_ZIP_ENTRY_COUNT` = 65534 件) に達している場合、または cdOffset / cdSize が
+   * 上限 (`MAX_ZIP_UINT32_FIELD_VALUE` = 0xFFFFFFFF bytes) に達する場合は、CD / EOCD を書く前に例外を
+   * 投げて拒否する (根本解決である ZIP64 の実装ではなく、上限超過の検知と失敗に留めている。ZIP64 の
+   * 実装が必要になった場合は改めて判断する)。単一エントリのサイズ上限は addFile 側で検証済みのため、
+   * ここでは entries.length と cdOffset / cdSize のみを検証すればよい。
    * ディレクトリエントリの追加でエントリ数が「投稿数 + 1」増える分、上限に到達しやすくなる点に留意する。
    * @throws {Error} このインスタンスが使用不能な状態 (close 済み、以前の失敗、または他の呼び出しが
-   *   実行中) の場合 (Issue #17 フォローアップ)
+   *   実行中) の場合 (Issue #17 フォローアップ)。central directory の offset または size が上限
+   *   (`MAX_ZIP_UINT32_FIELD_VALUE` = 0xFFFFFFFF bytes) 以上になる場合 (Issue #15)
    */
   async close(): Promise<void> {
     this.beginOperation('close');
     try {
       const cdOffset = this.offset;
+      // EOCD の cdOffset フィールド (offset 16, uint32) が収まるかを CD を書く前に検証する (Issue #15)
+      assertZipUint32FieldWithinLimit(cdOffset, 'close の central directory offset (cdOffset)');
+
+      // central directory 全体のサイズを、実際に書き込む前に事前計算して検証する (Issue #15)。
+      // 各エントリの CD レコードは 46 bytes 固定 + 名前長 + extra field 長であり、この時点で
+      // entries は確定済みなので、実際の書き込みと同じ計算を先取りしてよい
+      let predictedCdSize = 0;
+      for (const entry of this.entries) {
+        predictedCdSize += 46 + entry.name.length + entry.extraCd.length;
+      }
+      // EOCD の cdSize フィールド (offset 12, uint32) が収まるかを CD を書く前に検証する (Issue #15)
+      assertZipUint32FieldWithinLimit(predictedCdSize, 'close の central directory size (cdSize)');
 
       for (const entry of this.entries) {
         const cdHeader = new ArrayBuffer(46);

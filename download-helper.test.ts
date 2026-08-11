@@ -3,6 +3,9 @@ process.env.TZ = 'UTC';
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import {
+  assertZipEntryCountWithinLimit,
+  assertZipEntrySizeWithinLimit,
+  assertZipUint32FieldWithinLimit,
   clampToZipRange,
   crc32,
   DownloadHelper,
@@ -12,6 +15,8 @@ import {
   type DownloadZipResult,
   type FileObj,
   FileObject,
+  MAX_ZIP_ENTRY_COUNT,
+  MAX_ZIP_UINT32_FIELD_VALUE,
   toDosTimeDate,
   ZipWriter,
 } from './download-helper';
@@ -1250,6 +1255,237 @@ describe('ZipWriter', () => {
       await expect(zip.addDirectory(name)).rejects.toThrow();
       expect(mock.aborted).toBe(true);
       expect(mock.closed).toBe(false);
+    });
+  });
+
+  // ----------------------------------------------------------
+  // ZIP64 非対応の上限検知 (Issue #15)
+  // ZipWriter は ZIP64 を実装しておらず、classic ZIP の固定長フィールド (uint16 のエントリ数、
+  // uint32 のサイズ/オフセット) に直接値を書く。上限に達すると `0xFFFF` / `0xFFFFFFFF` の
+  // ZIP64 sentinel 値と衝突するか、フィールド自体が折り返って壊れた ZIP になる
+  // (ZIP64 の実装ではなく上限超過の検知と失敗という対処方針。Issue #15 の対処案 1)。
+  //
+  // エントリ数境界 (65534 件) を実際に addFile を 65534 回呼んで検証すると実行時間がかさむため、
+  // 上限判定ロジック (assertZipEntryCountWithinLimit / assertZipEntrySizeWithinLimit /
+  // assertZipUint32FieldWithinLimit) を ZipWriter から独立させ、まずプレーンな数値で境界の両側を
+  // 直接ユニットテストする。加えて、ZipWriter の private フィールド (entries / offset) に
+  // 直接値を注入したうえで実際の addFile / addDirectory / close を呼ぶ統合テストで、拒否時に
+  // 既存の cleanup (abort、terminal 状態) が正しく働くこと、および書き込み前 (chunks が空のまま) に
+  // 検知できていることを確認する。単一エントリのサイズ上限 (0xFFFFFFFF bytes) は実バッファ確保が
+  // 非現実的なため、ユニットテストのみで境界を確認し、addFile 経由の統合テストは行わない。
+  // ----------------------------------------------------------
+  describe('ZIP64 非対応の上限検知 (Issue #15)', () => {
+    describe('境界判定ロジックの直接ユニットテスト', () => {
+      test('MAX_ZIP_ENTRY_COUNT は 65534', () => {
+        expect(MAX_ZIP_ENTRY_COUNT).toBe(65534);
+      });
+
+      test('MAX_ZIP_UINT32_FIELD_VALUE は 0xFFFFFFFF', () => {
+        expect(MAX_ZIP_UINT32_FIELD_VALUE).toBe(0xffffffff);
+      });
+
+      test('assertZipEntryCountWithinLimit: 上限未満 (65533 件) は通過する', () => {
+        expect(() => assertZipEntryCountWithinLimit(MAX_ZIP_ENTRY_COUNT - 1, 'addFile')).not.toThrow();
+      });
+
+      test('assertZipEntryCountWithinLimit: 上限ちょうど (65534 件) は拒否される', () => {
+        expect(() => assertZipEntryCountWithinLimit(MAX_ZIP_ENTRY_COUNT, 'addFile')).toThrow();
+      });
+
+      test('assertZipEntrySizeWithinLimit: 上限未満 (0xFFFFFFFE bytes) は通過する', () => {
+        expect(() => assertZipEntrySizeWithinLimit(MAX_ZIP_UINT32_FIELD_VALUE - 1, 'big.bin', 'addFile')).not.toThrow();
+      });
+
+      test('assertZipEntrySizeWithinLimit: 上限ちょうど (0xFFFFFFFF bytes) は拒否される', () => {
+        expect(() => assertZipEntrySizeWithinLimit(MAX_ZIP_UINT32_FIELD_VALUE, 'huge.bin', 'addFile')).toThrow();
+      });
+
+      test('assertZipUint32FieldWithinLimit: 上限未満 (0xFFFFFFFE) は通過する', () => {
+        expect(() => assertZipUint32FieldWithinLimit(MAX_ZIP_UINT32_FIELD_VALUE - 1, 'test')).not.toThrow();
+      });
+
+      test('assertZipUint32FieldWithinLimit: 上限ちょうど (0xFFFFFFFF) は拒否される', () => {
+        expect(() => assertZipUint32FieldWithinLimit(MAX_ZIP_UINT32_FIELD_VALUE, 'test')).toThrow();
+      });
+    });
+
+    /**
+     * ZipWriter の private フィールド (entries / offset) に直接値を注入するための最小限の型。
+     * 65534 件の addFile 呼び出しや 4 GiB 近いオフセットを実際の書き込みで再現するのは実行時間・
+     * メモリの両面で非現実的なため、境界直前の状態を直接作って「1 回の呼び出しで境界を跨ぐ」
+     * ケースだけを検証する。
+     */
+    type ZipWriterLimitInternals = {
+      entries: {
+        name: Uint8Array;
+        crc: number;
+        size: number;
+        offset: number;
+        dosTime: number;
+        dosDate: number;
+        extraCd: Uint8Array;
+        externalAttr: number;
+      }[];
+      offset: number;
+    };
+
+    describe('addFile / addDirectory: エントリ数の境界 (private entries への直接注入)', () => {
+      test('addFile: entries が 65533 件のとき、65534 件目 (上限ちょうど) の追加は成功する', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        for (let i = 0; i < MAX_ZIP_ENTRY_COUNT - 1; i++) {
+          internals.entries.push({
+            name: encoder.encode(`f${i}`),
+            crc: 0,
+            size: 0,
+            offset: 0,
+            dosTime: 0,
+            dosDate: 0,
+            extraCd: new Uint8Array(0),
+            externalAttr: 0,
+          });
+        }
+        expect(internals.entries.length).toBe(MAX_ZIP_ENTRY_COUNT - 1);
+
+        await zip.addFile('ok.txt', encoder.encode('x'));
+
+        expect(internals.entries.length).toBe(MAX_ZIP_ENTRY_COUNT);
+        expect(mock.aborted).toBe(false);
+      });
+
+      test('addFile: entries が 65534 件に達している状態で 65535 件目を追加すると拒否され、書き込み前にストリームが abort される', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        for (let i = 0; i < MAX_ZIP_ENTRY_COUNT; i++) {
+          internals.entries.push({
+            name: encoder.encode(`f${i}`),
+            crc: 0,
+            size: 0,
+            offset: 0,
+            dosTime: 0,
+            dosDate: 0,
+            extraCd: new Uint8Array(0),
+            externalAttr: 0,
+          });
+        }
+
+        await expect(zip.addFile('one-too-many.txt', encoder.encode('x'))).rejects.toThrow();
+        expect(mock.aborted).toBe(true);
+        expect(mock.closed).toBe(false);
+        expect(mock.chunks.length).toBe(0);
+      });
+
+      test('addDirectory: entries が 65534 件に達している状態で 65535 件目を追加すると拒否され、書き込み前にストリームが abort される', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        for (let i = 0; i < MAX_ZIP_ENTRY_COUNT; i++) {
+          internals.entries.push({
+            name: encoder.encode(`d${i}/`),
+            crc: 0,
+            size: 0,
+            offset: 0,
+            dosTime: 0,
+            dosDate: 0,
+            extraCd: new Uint8Array(0),
+            externalAttr: 0x10,
+          });
+        }
+
+        await expect(zip.addDirectory('one-too-many')).rejects.toThrow();
+        expect(mock.aborted).toBe(true);
+        expect(mock.closed).toBe(false);
+        expect(mock.chunks.length).toBe(0);
+      });
+    });
+
+    describe('addFile / addDirectory: local header offset の境界 (private offset への直接注入)', () => {
+      test('addFile: this.offset が上限未満 (0xFFFFFFFE) なら成功する', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        internals.offset = MAX_ZIP_UINT32_FIELD_VALUE - 1;
+
+        await zip.addFile('ok.txt', encoder.encode('x'));
+
+        expect(mock.aborted).toBe(false);
+      });
+
+      test('addFile: this.offset が上限ちょうど (0xFFFFFFFF) だと拒否され、書き込み前にストリームが abort される', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        internals.offset = MAX_ZIP_UINT32_FIELD_VALUE;
+
+        await expect(zip.addFile('too-far.txt', encoder.encode('x'))).rejects.toThrow();
+        expect(mock.aborted).toBe(true);
+        expect(mock.closed).toBe(false);
+        expect(mock.chunks.length).toBe(0);
+      });
+
+      test('addDirectory: this.offset が上限ちょうど (0xFFFFFFFF) だと拒否され、書き込み前にストリームが abort される', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        internals.offset = MAX_ZIP_UINT32_FIELD_VALUE;
+
+        await expect(zip.addDirectory('too-far')).rejects.toThrow();
+        expect(mock.aborted).toBe(true);
+        expect(mock.closed).toBe(false);
+        expect(mock.chunks.length).toBe(0);
+      });
+    });
+
+    describe('close: central directory の offset / size の境界 (private entries / offset への直接注入)', () => {
+      test('close: cdOffset (= this.offset) が上限未満 (0xFFFFFFFE) で、エントリなしなら正常に完了する', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        internals.offset = MAX_ZIP_UINT32_FIELD_VALUE - 1;
+
+        await zip.close();
+
+        expect(mock.closed).toBe(true);
+        expect(mock.aborted).toBe(false);
+      });
+
+      test('close: cdOffset (= this.offset) が上限ちょうど (0xFFFFFFFF) だと、CD を書く前に拒否されストリームが abort される', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        internals.offset = MAX_ZIP_UINT32_FIELD_VALUE;
+
+        await expect(zip.close()).rejects.toThrow();
+        expect(mock.aborted).toBe(true);
+        expect(mock.closed).toBe(false);
+        // CD/EOCD どころか 1 バイトも書かれていない (書き込み前に検知している証拠)
+        expect(mock.chunks.length).toBe(0);
+      });
+
+      test('close: cdSize (central directory 全体サイズ) が上限に達していると、CD を書く前に拒否される (実メモリは確保しない)', async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        const internals = zip as unknown as ZipWriterLimitInternals;
+        // .length だけを持つダミーオブジェクトで、実際に 4 GiB 近いバッファを確保せず巨大な cdSize を模す
+        internals.entries.push({
+          name: { length: MAX_ZIP_UINT32_FIELD_VALUE } as unknown as Uint8Array,
+          crc: 0,
+          size: 0,
+          offset: 0,
+          dosTime: 0,
+          dosDate: 0,
+          extraCd: { length: 0 } as unknown as Uint8Array,
+          externalAttr: 0,
+        });
+
+        await expect(zip.close()).rejects.toThrow();
+        expect(mock.aborted).toBe(true);
+        expect(mock.closed).toBe(false);
+        // CD の書き込みループに入る前に拒否されている (entry.name の書き込みに進んでいたら壊れた挙動になる)
+        expect(mock.chunks.length).toBe(0);
+      });
     });
   });
 

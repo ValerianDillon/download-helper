@@ -427,6 +427,23 @@ function concatBytes(parts) {
   }
   return out;
 }
+export const MAX_ZIP_ENTRY_COUNT = 65534;
+export const MAX_ZIP_UINT32_FIELD_VALUE = 4294967295;
+export function assertZipEntryCountWithinLimit(currentEntryCount, method) {
+  if (currentEntryCount >= MAX_ZIP_ENTRY_COUNT) {
+    throw new Error(`ZipWriter.${method}: ZIP エントリ数が上限 (${MAX_ZIP_ENTRY_COUNT} 件) に達しています ` + "(ZIP64 非対応のため、これ以上追加すると EOCD のエントリ数フィールドが ZIP64 の sentinel 値と衝突するか uint16 で折り返します)");
+  }
+}
+export function assertZipEntrySizeWithinLimit(size, name, method) {
+  if (size >= MAX_ZIP_UINT32_FIELD_VALUE) {
+    throw new Error(`ZipWriter.${method}: エントリサイズが上限 (${MAX_ZIP_UINT32_FIELD_VALUE} bytes) 以上です (ZIP64 非対応): ` + `${JSON.stringify(name)} (${size} bytes)`);
+  }
+}
+export function assertZipUint32FieldWithinLimit(value, context) {
+  if (value >= MAX_ZIP_UINT32_FIELD_VALUE) {
+    throw new Error(`ZipWriter: ${context} が上限 (${MAX_ZIP_UINT32_FIELD_VALUE} bytes) 以上になります (ZIP64 非対応)`);
+  }
+}
 
 export class ZipWriter {
   writable;
@@ -445,8 +462,11 @@ export class ZipWriter {
       const bytes = data.buffer instanceof ArrayBuffer ? data : new Uint8Array(data);
       const nameBytes = this.encoder.encode(name);
       assertValidZipEntryNameByteLength(nameBytes, name, "addFile");
+      assertZipEntryCountWithinLimit(this.entries.length, "addFile");
+      assertZipEntrySizeWithinLimit(bytes.length, name, "addFile");
       const fileCrc = crc32(bytes);
       const localHeaderOffset = this.offset;
+      assertZipUint32FieldWithinLimit(localHeaderOffset, `addFile ("${name}") の local header offset`);
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
       const header = new ArrayBuffer(30);
       const view = new DataView(header);
@@ -491,7 +511,9 @@ export class ZipWriter {
       assertValidZipEntryName(dirName, "addDirectory");
       const nameBytes = this.encoder.encode(dirName);
       assertValidZipEntryNameByteLength(nameBytes, dirName, "addDirectory");
+      assertZipEntryCountWithinLimit(this.entries.length, "addDirectory");
       const localHeaderOffset = this.offset;
+      assertZipUint32FieldWithinLimit(localHeaderOffset, `addDirectory ("${dirName}") の local header offset`);
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
       const header = new ArrayBuffer(30);
       const view = new DataView(header);
@@ -532,6 +554,12 @@ export class ZipWriter {
     this.beginOperation("close");
     try {
       const cdOffset = this.offset;
+      assertZipUint32FieldWithinLimit(cdOffset, "close の central directory offset (cdOffset)");
+      let predictedCdSize = 0;
+      for (const entry of this.entries) {
+        predictedCdSize += 46 + entry.name.length + entry.extraCd.length;
+      }
+      assertZipUint32FieldWithinLimit(predictedCdSize, "close の central directory size (cdSize)");
       for (const entry of this.entries) {
         const cdHeader = new ArrayBuffer(46);
         const view = new DataView(cdHeader);
