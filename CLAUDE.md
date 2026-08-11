@@ -5,24 +5,32 @@
 
 ## コマンド
 
-- `bun run build` — `bun build --no-bundle` で `download-helper.ts` → `download-helper.js`、`fanbox-collector.ts` → `fanbox-collector.js` にそれぞれトランスパイル
+- `bun run build` — `build:js` と `build:types` をまとめて実行
+- `bun run build:js` — `bun build --no-bundle` で `download-helper.ts` → `download-helper.js`、`fanbox-collector.ts` → `fanbox-collector.js` にそれぞれトランスパイル
+- `bun run build:types` — `tsconfig.declaration.json` を使い `tsc --emitDeclarationOnly` で `dist/types/*.d.ts` を生成 (Issue #12)
 - `bun run lint` — Biome による静的解析・フォーマット修正
 
 ## プロジェクト構成
 
 ```
-download-helper.ts     # 汎用ダウンロード UI / ZIP 生成のソースコード
-download-helper.js     # トランスパイル済み出力（コミット対象）
-fanbox-collector.ts    # FANBOX 固有の収集ロジック (fanbox-downloader / fanbox-downloader-extension 共用)
-fanbox-collector.js    # トランスパイル済み出力（コミット対象）
-biome.json             # Biome 設定
-.mise.toml             # mise ツールバージョン管理
+download-helper.ts         # 汎用ダウンロード UI / ZIP 生成のソースコード
+download-helper.js         # トランスパイル済み出力（コミット対象）
+fanbox-collector.ts        # FANBOX 固有の収集ロジック (fanbox-downloader / fanbox-downloader-extension 共用)
+fanbox-collector.js        # トランスパイル済み出力（コミット対象）
+dist/types/                # tsc --emitDeclarationOnly の出力 (コミット対象。詳細は下記)
+  download-helper.d.ts
+  fanbox-collector.d.ts
+biome.json                 # Biome 設定
+.mise.toml                 # mise ツールバージョン管理
 package.json
-tsconfig.json
+tsconfig.json               # エディタの型チェック用 (noEmit)
+tsconfig.declaration.json   # dist/types/ 生成専用 (declaration: true, entry point を2ファイルに限定)
 ```
 
-- `package.json` の `files` で `download-helper.js` / `download-helper.ts` / `fanbox-collector.js` / `fanbox-collector.ts` を配布対象に指定
-- `download-helper.js` / `fanbox-collector.js` はgit管理対象。ビルド後に差分があればコミットすること
+- `package.json` の `exports` で `"."` / `"./download-helper"` / `"./fanbox-collector"` それぞれの runtime (`.js`) と types (`.d.ts`) を固定している。ルートの `types` も `dist/types/download-helper.d.ts` を指す
+- `download-helper.js` / `fanbox-collector.js` / `dist/types/*.d.ts` はgit管理対象。ビルド後に差分があればコミットすること
+- `.d.ts` を `download-helper.ts` と同じディレクトリではなく `dist/types/` に分離しているのは、`fanbox-collector.ts` が `./download-helper` を相対 import しており、同じディレクトリに置くと宣言間の相対 import が `exports` を通らず `.ts` を再び選びうるため (Issue #12)。`dist/types/` 内で相対 import が閉じるようにしている
+- `.ts` はソースであり実行時の配布対象ではないため `files` / `exports` には含めない。ただし `github:` 参照では `files` はフィルタとして機能しない (Bun の GitHub 依存は `files` を無視する) ので、リポジトリ自体には引き続き含まれる
 - npm パッケージとしてではなく `github:ValerianDillon/download-helper#vX.X.X` (git tag) で参照される
 
 ## 技術スタック
