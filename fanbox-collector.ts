@@ -312,6 +312,38 @@ function isValidBlock(value: unknown): boolean {
 }
 
 /**
+ * urlEmbedMap の要素を検証する。
+ *
+ * embedMap の要素と違い、消費側 (addByPostInfo 内の 'url_embed' 分岐) は
+ * `urlEmbedInfo.type` を直接読む。要素が null や配列などの非 record だとそこで即座に
+ * 例外になるため、まず record であることを必須にする。
+ * 既知の type ('default' / 'html' / 'html.card' / 'fanbox.post') はさらに、消費側が
+ * 文字列メソッド (escapeHtml の String.prototype.replace、html.match) を直接呼ぶ
+ * フィールドだけを検証する。未知の type は消費側が JSON.stringify + escapeHtml で
+ * 吸収し例外にならないため、record であること以上は検証しない。
+ */
+function isValidUrlEmbedInfo(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  switch (value.type) {
+    case 'default':
+      return (
+        typeof (value as { url?: unknown }).url === 'string' && typeof (value as { host?: unknown }).host === 'string'
+      );
+    case 'html':
+    case 'html.card':
+      return typeof (value as { html?: unknown }).html === 'string';
+    case 'fanbox.post': {
+      const postInfo = (value as { postInfo?: unknown }).postInfo;
+      // creatorId / id はテンプレートリテラルに埋め込まれるだけで未定義でも例外にならないが、
+      // title は escapeHtml に渡るため文字列を必須にする
+      return isRecord(postInfo) && typeof (postInfo as { title?: unknown }).title === 'string';
+    }
+    default:
+      return true;
+  }
+}
+
+/**
  * 投稿タイプごとに、本文の取り込みで実際に触るフィールドを検査し、欠けているものを返す。
  *
  * addByPostInfo は投稿を downloadObject に登録してから本文を触るため、途中で例外になると
@@ -335,8 +367,11 @@ function checkBody(postInfo: PostInfo & { type: KnownPostType }): string[] {
       if (!Array.isArray(body.blocks) || !body.blocks.every(isValidBlock)) missing.push('body.blocks');
       if (!isRecord(body.imageMap) || !Object.values(body.imageMap).every(isImageInfo)) missing.push('body.imageMap');
       if (!isRecord(body.fileMap) || !Object.values(body.fileMap).every(isFileInfo)) missing.push('body.fileMap');
+      // embedMap の要素は消費側で JSON.stringify に渡すだけ (JSON.parse 由来の値である限り
+      // null を含め常に文字列化できる) なので、コンテナが record であること以上は検証しない
       if (!isRecord(body.embedMap)) missing.push('body.embedMap');
-      if (!isRecord(body.urlEmbedMap)) missing.push('body.urlEmbedMap');
+      if (!isRecord(body.urlEmbedMap) || !Object.values(body.urlEmbedMap).every(isValidUrlEmbedInfo))
+        missing.push('body.urlEmbedMap');
       break;
     case 'text':
       if (typeof body.text !== 'string') missing.push('body.text');

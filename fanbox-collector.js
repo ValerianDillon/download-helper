@@ -68,6 +68,23 @@ function isValidBlock(value) {
   }
   return true;
 }
+function isValidUrlEmbedInfo(value) {
+  if (!isRecord(value))
+    return false;
+  switch (value.type) {
+    case "default":
+      return typeof value.url === "string" && typeof value.host === "string";
+    case "html":
+    case "html.card":
+      return typeof value.html === "string";
+    case "fanbox.post": {
+      const postInfo = value.postInfo;
+      return isRecord(postInfo) && typeof postInfo.title === "string";
+    }
+    default:
+      return true;
+  }
+}
 function checkBody(postInfo) {
   const body = postInfo.body;
   const missing = [];
@@ -93,7 +110,7 @@ function checkBody(postInfo) {
         missing.push("body.fileMap");
       if (!isRecord(body.embedMap))
         missing.push("body.embedMap");
-      if (!isRecord(body.urlEmbedMap))
+      if (!isRecord(body.urlEmbedMap) || !Object.values(body.urlEmbedMap).every(isValidUrlEmbedInfo))
         missing.push("body.urlEmbedMap");
       break;
     case "text":

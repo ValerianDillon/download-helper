@@ -270,6 +270,15 @@ describe('addByPostInfo - 取り込み結果', () => {
     expect(postCount(m)).toBe(0);
   });
 
+  test('isRestricted かつ本文も無い場合も restricted を返す (missing-body に落ちない)', () => {
+    const m = createManage();
+    expect(addByPostInfo(m, basePost({ isRestricted: true, body: undefined } as Partial<PostInfo>))).toEqual({
+      status: 'unavailable',
+      reason: 'restricted',
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
   test('本文の形式が想定と違えば invalid を返し、壊れた投稿を残さない', () => {
     const m = createManage();
     // image タイプなのに images が無い: 従来は登録後に TypeError となり空の投稿が残っていた
@@ -334,6 +343,72 @@ describe('addByPostInfo - 取り込み結果', () => {
       type: 'article',
       missing: ['body.blocks'],
     });
+  });
+
+  test('urlEmbedMap の要素が null なら invalid を返す (type 参照で例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({
+      type: 'article',
+      body: { blocks: [], imageMap: {}, fileMap: {}, embedMap: {}, urlEmbedMap: { u1: null } },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'article',
+      missing: ['body.urlEmbedMap'],
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('urlEmbedMap の html 要素で html が null なら invalid を返す (String.prototype.match が無く例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({
+      type: 'article',
+      body: {
+        blocks: [],
+        imageMap: {},
+        fileMap: {},
+        embedMap: {},
+        urlEmbedMap: { u1: { id: 'u1', type: 'html', html: null } },
+      },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'article',
+      missing: ['body.urlEmbedMap'],
+    });
+  });
+
+  test('urlEmbedMap の未知 type は消費側が JSON.stringify で吸収するため検証を通す', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'article',
+      body: {
+        blocks: [],
+        imageMap: {},
+        fileMap: {},
+        embedMap: {},
+        urlEmbedMap: { u1: { id: 'u1', type: 'oembed', anything: 'goes' } },
+      },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+  });
+
+  test('urlEmbedMap が正常な既知 type (default) のみなら取り込める', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'article',
+      body: {
+        blocks: [],
+        imageMap: {},
+        fileMap: {},
+        embedMap: {},
+        urlEmbedMap: { u1: { id: 'u1', type: 'default', url: 'https://example.com', host: 'example.com' } },
+      },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    expect(postCount(m)).toBe(1);
   });
 
   test('本文が壊れていても取得件数上限を消費しない', () => {
