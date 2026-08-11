@@ -726,6 +726,20 @@ function concatBytes(parts: Uint8Array<ArrayBuffer>[]): Uint8Array<ArrayBuffer> 
 /**
  * ZIP ファイル書き込みクラス (stored / 非圧縮)
  * File System Access API の FileSystemWritableFileStream に直接書き込む
+ *
+ * 利用契約:
+ * - **直列に await して使うこと。** addFile / addDirectory / close は呼び出しごとに await してから次を
+ *   呼ぶ前提で、内部状態 (書き込みオフセットやエントリ一覧) を単一の呼び出し系列でのみ更新する。
+ *   前の呼び出しを await せずに次を呼ぶ (並行呼び出し) は誤用であり、直列化して待たせるのではなく
+ *   即座に例外にする (呼び出し順序の保証という新しい契約を暗黙に増やさないため)。
+ * - **close() 成功後、または addFile / addDirectory / close のいずれかが失敗した後は再利用できない。**
+ *   前者は File System Access API 上ストリームが既に確定しているため、後者は書き込み先ストリームを
+ *   既に abort 済みのため。どちらも以後の呼び出しは冒頭で例外を投げる (terminal 状態)。
+ * - **close() の実行中は公開 abort() で中断できない。** Streams 仕様上、in-flight の close は abort で
+ *   中断されず close の完了が優先されるため、close 実行中に abort() が成功したように見えても実際には
+ *   ファイルがコミットされてしまいうる (「破棄したはずが実はコミットされていた」という嘘になる)。
+ *   そのため close 実行中の abort() は例外を投げて拒否し、呼び出し側に close 自身の結果 (成功/失敗) を
+ *   await させる。
  * @internal
  */
 export class ZipWriter {
@@ -743,6 +757,24 @@ export class ZipWriter {
     externalAttr: number;
   }[] = [];
   private encoder = new TextEncoder();
+  /**
+   * インスタンスの状態 (Issue #17 フォローアップ)。
+   * - 'open': 通常状態。addFile / addDirectory / close を呼べる
+   * - 'closed': close() が成功した後。File System Access API 上ストリームは既に確定しており、
+   *   以後の書き込みはできない
+   * - 'failed': addFile / addDirectory / close のいずれかで例外が発生し abort 済み (terminal)。
+   *   abort() 自体が失敗した場合もこの状態のまま残るため、二重 abort の防止も兼ねる
+   */
+  private state: 'open' | 'closed' | 'failed' = 'open';
+  /**
+   * 現在実行中の操作。実行中でなければ false、実行中ならどのメソッドが実行中かを保持する。
+   * このクラスは直列利用を契約とするため (クラス doc 参照)、実行中に別の呼び出しが来たら
+   * プログラミングエラーとして即座に例外にする。async 関数本体は最初の await まで同期的に走るため、
+   * beginOperation をメソッド先頭で呼べば、呼び出し元が返り値を await していなくても検出できる。
+   * 操作種別を持たせているのは、公開 abort() が 'close' 実行中かどうかを区別する必要があるため
+   * (close は abort で中断できない。クラス doc 参照)。
+   */
+  private inFlight: false | 'addFile' | 'addDirectory' | 'close' = false;
 
   constructor(writable: FileSystemWritableFileStream) {
     this.writable = writable;
@@ -750,56 +782,78 @@ export class ZipWriter {
 
   /**
    * ファイルを ZIP に追加する
-   * @param name ZIP 内のファイルパス (UTF-8)
+   * @param name ZIP 内のファイルパス (UTF-8)。末尾が `/` の名前は拒否する (ディレクトリと紛らわしいため。
+   *   ディレクトリを追加したい場合は addDirectory を使う)
    * @param data ファイルデータ
    * @param date 任意。指定時は DOS time/date に加え NTFS / Extended Timestamp Extra Field を書き込む。
    *   省略または Invalid Date の場合は従来挙動 (DOS 0、extra field なし) でバイト列を維持する。
    *   1980-01-01 〜 2107-12-31 23:59:58 にクランプ。Extended Timestamp は clamp 後の Unix time が
    *   signed int32 範囲に収まる場合のみ書く。
+   * @throws {Error} このインスタンスが使用不能な状態 (close 済み、以前の失敗、または他の呼び出しが
+   *   実行中) の場合。name をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を
+   *   含む場合、または末尾が `/` の場合 (downloadZip 側でも同じ検証を行うが、addFile を直接呼ぶ利用者を
+   *   無防備にしないための多層防御として ZipWriter 自身にも検証を持たせている、Issue #17)。
+   *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)
    */
   async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
-    // 公開 API なので引数は Uint8Array のまま受ける。File System Access API の write は
-    // ArrayBuffer backed しか受け付けないので、SharedArrayBuffer backed ならコピーして揃える。
-    const bytes: Uint8Array<ArrayBuffer> =
-      data.buffer instanceof ArrayBuffer ? (data as Uint8Array<ArrayBuffer>) : new Uint8Array(data);
-    // TextEncoder.encode は常に新しい ArrayBuffer を確保する (TypeScript 5.7 未満では
-    // 戻り値が ArrayBufferLike 扱いになるためアサーションで補う)
-    const nameBytes = this.encoder.encode(name) as Uint8Array<ArrayBuffer>;
-    const fileCrc = crc32(bytes);
-    const localHeaderOffset = this.offset;
+    this.beginOperation('addFile');
+    try {
+      assertValidZipEntryName(name, 'addFile');
 
-    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+      // 公開 API なので引数は Uint8Array のまま受ける。File System Access API の write は
+      // ArrayBuffer backed しか受け付けないので、SharedArrayBuffer backed ならコピーして揃える。
+      const bytes: Uint8Array<ArrayBuffer> =
+        data.buffer instanceof ArrayBuffer ? (data as Uint8Array<ArrayBuffer>) : new Uint8Array(data);
+      // TextEncoder.encode は常に新しい ArrayBuffer を確保する (TypeScript 5.7 未満では
+      // 戻り値が ArrayBufferLike 扱いになるためアサーションで補う)
+      const nameBytes = this.encoder.encode(name) as Uint8Array<ArrayBuffer>;
+      assertValidZipEntryNameByteLength(nameBytes, name, 'addFile');
+      const fileCrc = crc32(bytes);
+      const localHeaderOffset = this.offset;
 
-    // Local File Header (30 bytes + name length + extra field length)
-    const header = new ArrayBuffer(30);
-    const view = new DataView(header);
-    view.setUint32(0, 0x04034b50, true); // signature
-    view.setUint16(4, 20, true); // version needed (2.0)
-    view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
-    view.setUint16(8, 0, true); // compression method (stored)
-    view.setUint16(10, dosTime, true); // mod time
-    view.setUint16(12, dosDate, true); // mod date
-    view.setUint32(14, fileCrc, true); // crc-32
-    view.setUint32(18, bytes.length, true); // compressed size
-    view.setUint32(22, bytes.length, true); // uncompressed size
-    view.setUint16(26, nameBytes.length, true); // file name length
-    view.setUint16(28, extraLfh.length, true); // extra field length
+      const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
 
-    await this.write(new Uint8Array(header));
-    await this.write(nameBytes);
-    if (extraLfh.length > 0) await this.write(extraLfh);
-    await this.write(bytes);
+      // Local File Header (30 bytes + name length + extra field length)
+      const header = new ArrayBuffer(30);
+      const view = new DataView(header);
+      view.setUint32(0, 0x04034b50, true); // signature
+      view.setUint16(4, 20, true); // version needed (2.0)
+      view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
+      view.setUint16(8, 0, true); // compression method (stored)
+      view.setUint16(10, dosTime, true); // mod time
+      view.setUint16(12, dosDate, true); // mod date
+      view.setUint32(14, fileCrc, true); // crc-32
+      view.setUint32(18, bytes.length, true); // compressed size
+      view.setUint32(22, bytes.length, true); // uncompressed size
+      view.setUint16(26, nameBytes.length, true); // file name length
+      view.setUint16(28, extraLfh.length, true); // extra field length
 
-    this.entries.push({
-      name: nameBytes,
-      crc: fileCrc,
-      size: bytes.length,
-      offset: localHeaderOffset,
-      dosTime,
-      dosDate,
-      extraCd,
-      externalAttr: 0,
-    });
+      await this.write(new Uint8Array(header));
+      await this.write(nameBytes);
+      if (extraLfh.length > 0) await this.write(extraLfh);
+      await this.write(bytes);
+
+      // 最後の write() が resolve してからこの行に来るまでの間 (await this.write(bytes) の継続が挟む
+      // マイクロタスク境界) にも、公開 abort() が割り込む窓が残るため、entries.push() 直前で再確認する
+      // (Issue #17 フォローアップ)
+      this.assertStillOpen('addFile');
+
+      this.entries.push({
+        name: nameBytes,
+        crc: fileCrc,
+        size: bytes.length,
+        offset: localHeaderOffset,
+        dosTime,
+        dosDate,
+        extraCd,
+        externalAttr: 0,
+      });
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
+    } finally {
+      this.inFlight = false;
+    }
   }
 
   /**
@@ -807,50 +861,65 @@ export class ZipWriter {
    * @param name ZIP 内のディレクトリパス (UTF-8)。末尾が `/` でなければ自動的に付与する
    * @param date 任意。addFile と同一の日時ロジック (DOS time/date + NTFS Extra + Extended Timestamp) を適用する。
    *   省略または Invalid Date の場合は DOS time/date = 0、extra field なし
-   * @throws {Error} 正規化後の名前が `/` になる (name が空文字列)、または先頭が `/` の場合。
+   * @throws {Error} このインスタンスが使用不能な状態 (close 済み、以前の失敗、または他の呼び出しが
+   *   実行中) の場合。正規化後の名前をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." /
+   *   `\` `:` を含むセグメントがある場合 (name が空文字列、または先頭が `/` の場合を含む)。
    *   APPNOTE 4.4.17.1 が ZIP 内のパスを相対パスに限り、先頭 `/` を禁じるため。
-   *   drive letter (`C:/dir`) や `\` 区切りは検証しない (addFile と非対称にしないため。呼び出し側の事前条件とする)
+   *   addFile と同じ検証をセグメント単位で適用するため、drive letter (`C:/dir`) や `\` 区切りも拒否する
+   *   (Issue #14 時点では addFile と非対称にしないため未検証としていたが、Issue #17 で addFile 側にも
+   *   検証を追加したため、この非対称は解消されている)。
+   *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)
    */
   async addDirectory(name: string, date?: Date): Promise<void> {
-    const dirName = name.endsWith('/') ? name : `${name}/`;
-    if (dirName.startsWith('/')) {
-      throw new Error(`addDirectory: name must not be empty or start with "/": ${JSON.stringify(name)}`);
+    this.beginOperation('addDirectory');
+    try {
+      const dirName = name.endsWith('/') ? name : `${name}/`;
+      assertValidZipEntryName(dirName, 'addDirectory');
+
+      const nameBytes = this.encoder.encode(dirName) as Uint8Array<ArrayBuffer>;
+      assertValidZipEntryNameByteLength(nameBytes, dirName, 'addDirectory');
+      const localHeaderOffset = this.offset;
+
+      const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+
+      // Local File Header (30 bytes + name length + extra field length)。CRC / size は常に 0、データ本体は書かない
+      const header = new ArrayBuffer(30);
+      const view = new DataView(header);
+      view.setUint32(0, 0x04034b50, true); // signature
+      view.setUint16(4, 20, true); // version needed (2.0)
+      view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
+      view.setUint16(8, 0, true); // compression method (stored)
+      view.setUint16(10, dosTime, true); // mod time
+      view.setUint16(12, dosDate, true); // mod date
+      view.setUint32(14, 0, true); // crc-32
+      view.setUint32(18, 0, true); // compressed size
+      view.setUint32(22, 0, true); // uncompressed size
+      view.setUint16(26, nameBytes.length, true); // file name length
+      view.setUint16(28, extraLfh.length, true); // extra field length
+
+      await this.write(new Uint8Array(header));
+      await this.write(nameBytes);
+      if (extraLfh.length > 0) await this.write(extraLfh);
+
+      // addFile と同様、最後の write() の resolve から entries.push() までの窓を塞ぐ (Issue #17 フォローアップ)
+      this.assertStillOpen('addDirectory');
+
+      this.entries.push({
+        name: nameBytes,
+        crc: 0,
+        size: 0,
+        offset: localHeaderOffset,
+        dosTime,
+        dosDate,
+        extraCd,
+        externalAttr: 0x10, // FILE_ATTRIBUTE_DIRECTORY
+      });
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
+    } finally {
+      this.inFlight = false;
     }
-
-    const nameBytes = this.encoder.encode(dirName) as Uint8Array<ArrayBuffer>;
-    const localHeaderOffset = this.offset;
-
-    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
-
-    // Local File Header (30 bytes + name length + extra field length)。CRC / size は常に 0、データ本体は書かない
-    const header = new ArrayBuffer(30);
-    const view = new DataView(header);
-    view.setUint32(0, 0x04034b50, true); // signature
-    view.setUint16(4, 20, true); // version needed (2.0)
-    view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
-    view.setUint16(8, 0, true); // compression method (stored)
-    view.setUint16(10, dosTime, true); // mod time
-    view.setUint16(12, dosDate, true); // mod date
-    view.setUint32(14, 0, true); // crc-32
-    view.setUint32(18, 0, true); // compressed size
-    view.setUint32(22, 0, true); // uncompressed size
-    view.setUint16(26, nameBytes.length, true); // file name length
-    view.setUint16(28, extraLfh.length, true); // extra field length
-
-    await this.write(new Uint8Array(header));
-    await this.write(nameBytes);
-    if (extraLfh.length > 0) await this.write(extraLfh);
-
-    this.entries.push({
-      name: nameBytes,
-      crc: 0,
-      size: 0,
-      offset: localHeaderOffset,
-      dosTime,
-      dosDate,
-      extraCd,
-      externalAttr: 0x10, // FILE_ATTRIBUTE_DIRECTORY
-    });
   }
 
   /**
@@ -862,57 +931,189 @@ export class ZipWriter {
    * `0xFFFF` / `0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値のため、
    * エントリ数が 65,535 件以上、またはサイズ/オフセットが `0xFFFFFFFF` bytes 以上になると壊れた ZIP を出力する。
    * ディレクトリエントリの追加でエントリ数が「投稿数 + 1」増える分、上限に到達しやすくなる点に留意する。
+   * @throws {Error} このインスタンスが使用不能な状態 (close 済み、以前の失敗、または他の呼び出しが
+   *   実行中) の場合 (Issue #17 フォローアップ)
    */
   async close(): Promise<void> {
-    const cdOffset = this.offset;
+    this.beginOperation('close');
+    try {
+      const cdOffset = this.offset;
 
-    for (const entry of this.entries) {
-      const cdHeader = new ArrayBuffer(46);
-      const view = new DataView(cdHeader);
-      view.setUint32(0, 0x02014b50, true); // signature
-      view.setUint16(4, 20, true); // version made by
-      view.setUint16(6, 20, true); // version needed
-      view.setUint16(8, 0x0800, true); // general purpose bit flag (UTF-8)
-      view.setUint16(10, 0, true); // compression method
-      view.setUint16(12, entry.dosTime, true); // mod time
-      view.setUint16(14, entry.dosDate, true); // mod date
-      view.setUint32(16, entry.crc, true); // crc-32
-      view.setUint32(20, entry.size, true); // compressed size
-      view.setUint32(24, entry.size, true); // uncompressed size
-      view.setUint16(28, entry.name.length, true); // file name length
-      view.setUint16(30, entry.extraCd.length, true); // extra field length
-      view.setUint16(32, 0, true); // file comment length
-      view.setUint16(34, 0, true); // disk number start
-      view.setUint16(36, 0, true); // internal file attributes
-      view.setUint32(38, entry.externalAttr, true); // external file attributes
-      view.setUint32(42, entry.offset, true); // local header offset
+      for (const entry of this.entries) {
+        const cdHeader = new ArrayBuffer(46);
+        const view = new DataView(cdHeader);
+        view.setUint32(0, 0x02014b50, true); // signature
+        view.setUint16(4, 20, true); // version made by
+        view.setUint16(6, 20, true); // version needed
+        view.setUint16(8, 0x0800, true); // general purpose bit flag (UTF-8)
+        view.setUint16(10, 0, true); // compression method
+        view.setUint16(12, entry.dosTime, true); // mod time
+        view.setUint16(14, entry.dosDate, true); // mod date
+        view.setUint32(16, entry.crc, true); // crc-32
+        view.setUint32(20, entry.size, true); // compressed size
+        view.setUint32(24, entry.size, true); // uncompressed size
+        view.setUint16(28, entry.name.length, true); // file name length
+        view.setUint16(30, entry.extraCd.length, true); // extra field length
+        view.setUint16(32, 0, true); // file comment length
+        view.setUint16(34, 0, true); // disk number start
+        view.setUint16(36, 0, true); // internal file attributes
+        view.setUint32(38, entry.externalAttr, true); // external file attributes
+        view.setUint32(42, entry.offset, true); // local header offset
 
-      await this.write(new Uint8Array(cdHeader));
-      await this.write(entry.name);
-      if (entry.extraCd.length > 0) await this.write(entry.extraCd);
+        await this.write(new Uint8Array(cdHeader));
+        await this.write(entry.name);
+        if (entry.extraCd.length > 0) await this.write(entry.extraCd);
+      }
+
+      const cdSize = this.offset - cdOffset;
+
+      // End of Central Directory Record (22 bytes)
+      const eocd = new ArrayBuffer(22);
+      const eocdView = new DataView(eocd);
+      eocdView.setUint32(0, 0x06054b50, true); // signature
+      eocdView.setUint16(4, 0, true); // disk number
+      eocdView.setUint16(6, 0, true); // CD disk number
+      eocdView.setUint16(8, this.entries.length, true); // CD entries on this disk
+      eocdView.setUint16(10, this.entries.length, true); // total CD entries
+      eocdView.setUint32(12, cdSize, true); // CD size
+      eocdView.setUint32(16, cdOffset, true); // CD offset
+      eocdView.setUint16(20, 0, true); // comment length
+
+      await this.write(new Uint8Array(eocd));
+      await this.writable.close();
+      // ここに到達した時点で state は必ず 'open' のままである: close 実行中は inFlight === 'close' であり、
+      // 公開 abort() はその間例外を投げて拒否するため (state を書き換える経路を持たない)、close 自身の
+      // catch (state = 'failed') 以外に state を動かす者がいない。したがってこの代入が 'failed' を
+      // 上書きしてしまうことはない (Issue #17 フォローアップ)。
+      this.state = 'closed';
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
+    } finally {
+      this.inFlight = false;
     }
-
-    const cdSize = this.offset - cdOffset;
-
-    // End of Central Directory Record (22 bytes)
-    const eocd = new ArrayBuffer(22);
-    const eocdView = new DataView(eocd);
-    eocdView.setUint32(0, 0x06054b50, true); // signature
-    eocdView.setUint16(4, 0, true); // disk number
-    eocdView.setUint16(6, 0, true); // CD disk number
-    eocdView.setUint16(8, this.entries.length, true); // CD entries on this disk
-    eocdView.setUint16(10, this.entries.length, true); // total CD entries
-    eocdView.setUint32(12, cdSize, true); // CD size
-    eocdView.setUint32(16, cdOffset, true); // CD offset
-    eocdView.setUint16(20, 0, true); // comment length
-
-    await this.write(new Uint8Array(eocd));
-    await this.writable.close();
   }
 
+  /**
+   * 外部 (downloadZip など、ZipWriter の外側のコード) で発生した例外に対してストリームを破棄するための
+   * public API (Issue #17 フォローアップ)。addFile / addDirectory / close はコールバックを持たず内部で
+   * 完結するため abortOnFailure で自己完結できるが、downloadZip は fetchFile / log / progress /
+   * remainTime という呼び出し側のコールバックを挟んでおり、これらが投げた例外は ZipWriter の外で
+   * catch することになる。その catch から呼ぶための入口がこのメソッドである。
+   *
+   * close 実行中 (inFlight === 'close') は例外を投げて拒否する。Streams 仕様上、in-flight の close は
+   * abort で中断されず close の完了が優先されるため、ここで abort を受理して成功したように見せると、
+   * 実際には close が完走してファイルがコミットされているのに abort 側は「破棄できた」と誤認する
+   * (state を無条件に 'closed' で上書きする経路にもなり、既に 'failed' にした状態を握りつぶしうる)。
+   * 呼び出し側には close 自身の結果 (成功/失敗) を待たせるのが誠実なので、ここでは例外にして
+   * 「今は中断できない、close の完了を待て」と伝える。
+   *
+   * close 実行中でなく、かつ既に 'open' でない (close 済み、または addFile/addDirectory/close 自身の
+   * 失敗で既に abort 済み) 場合は no-op にする。ここでの判定はあくまで早期リターンの最適化であり、
+   * 実際に二重 abort を防いでいるのは abortOnFailure 側の同じチェックである (in-flight な
+   * addFile/addDirectory の I/O 待ち中に abort() が呼ばれるレースでは、ここでの判定時点では
+   * まだ 'open' のままになりうるため。詳細は abortOnFailure のコメントを参照)。
+   * @param reason 破棄理由 (writable.abort() に渡される)
+   * @throws {Error} close が実行中の場合
+   */
+  async abort(reason?: unknown): Promise<void> {
+    if (this.inFlight === 'close') {
+      throw new Error('ZipWriter.abort: close 実行中のため abort できません。close の完了を待ってください');
+    }
+    if (this.state !== 'open') return;
+    await this.abortOnFailure(reason);
+  }
+
+  /**
+   * writable への実書き込み。addFile / addDirectory / close の各書き込み点から呼ばれる。
+   *
+   * Streams 仕様は abort() が保留中の write() を必ず reject することを保証しない。そのため、
+   * addFile / addDirectory の I/O 待ち中に公開 abort() が呼ばれても、この write() 自体は正常に
+   * resolve してしまいうる。それを検出しないと、addFile / addDirectory が abort 後も「書けた」まま
+   * 成功として resolve してしまう (契約の嘘になる。ZIP の実コミットは close() 側で state を見て
+   * 弾かれるため実際には起きないが、呼び出し元への戻り値としての嘘は起きる)。
+   * そこで実書き込みが resolve した直後に state を再確認し、'open' でなくなっていれば例外を投げる。
+   * close() は in-flight 中は公開 abort() 自体が拒否される (別項参照) ため、close 自身の CD / EOCD
+   * 書き込みではこのチェックは通常発火しない。
+   * @throws {Error} 書き込みが resolve した時点で state が 'open' でなくなっていた場合 (Issue #17 フォローアップ)
+   */
   private async write(data: Uint8Array<ArrayBuffer>): Promise<void> {
     await this.writable.write(data);
+    if (this.state !== 'open') {
+      throw new Error('ZipWriter: 書き込み中に abort されました');
+    }
     this.offset += data.length;
+  }
+
+  /**
+   * state が 'open' のままであることを再確認する (Issue #17 フォローアップ)。
+   * write() 内のチェックは、その write() 自身が resolve した時点の state しか見られない。
+   * addFile / addDirectory では、最後の write() が resolve してから entries.push() に到達するまでの間にも
+   * (呼び出し元での `await this.write(...)` の継続がマイクロタスク境界を挟むため) 公開 abort() が
+   * 割り込む窓が残る。entries.push() 直前でこの確認を挟むことでその窓を塞ぐ。
+   * @throws {Error} state が 'open' でない場合
+   */
+  private assertStillOpen(method: 'addFile' | 'addDirectory'): void {
+    if (this.state !== 'open') {
+      throw new Error(`ZipWriter.${method}: 書き込み中に abort されました`);
+    }
+  }
+
+  /**
+   * addFile / addDirectory / close の共通の入口処理 (Issue #17 フォローアップ)。
+   * - close 済み、または以前の失敗で terminal 状態になっている場合は使用不可として例外を投げる
+   * - 既に他の呼び出しが実行中 (inFlight) の場合も、並行呼び出しは誤用として即座に例外を投げる
+   *   (「直列化して待たせる」のではなく「検出して拒否する」方針。暗黙の直列化はキュー順序の保証という
+   *   新しい契約を増やすため採らない)
+   * - 上記のいずれにも該当しなければ inFlight に method 自身を立てる (公開 abort() が 'close' 実行中かを
+   *   区別できるようにするため、単なる boolean ではなく操作種別を保持する)。
+   *   呼び出し元は必ず finally で inFlight を false に戻すこと
+   * @throws {Error} 上記のいずれかに該当する場合
+   */
+  private beginOperation(method: 'addFile' | 'addDirectory' | 'close'): void {
+    if (this.state === 'failed') {
+      throw new Error(`ZipWriter.${method}: 以前の失敗により使用不可です`);
+    }
+    if (this.state === 'closed') {
+      throw new Error(`ZipWriter.${method}: close 済みのため使用不可です`);
+    }
+    if (this.inFlight !== false) {
+      throw new Error(
+        `ZipWriter.${method}: 別の呼び出しが実行中です (ZipWriter は呼び出しごとに await してから次を呼ぶ直列利用が前提です)`,
+      );
+    }
+    this.inFlight = method;
+  }
+
+  /**
+   * 書き込み中に例外が発生した場合のストリーム cleanup (Issue #17)。
+   * `createWritable()` で得たストリームは、close() を呼ばない限り書き込み先の実ファイルへ反映されない
+   * (File System Access API の仕様上、変更は close() で初めてコミットされる)。
+   * そのため、addFile / addDirectory / close の途中で例外が発生した場合は、
+   * 中途半端な (Central Directory / EOCD を欠いた壊れた) ZIP を実ファイルとしてコミットしてしまわないよう、
+   * close() ではなく abort() でストリームを破棄する。abort() 自体の失敗は元の例外を握りつぶさないよう無視する。
+   *
+   * 冒頭の `state !== 'open'` チェックが二重 abort 防止の実体である (Issue #17 フォローアップ)。
+   * 公開 abort() は in-flight (addFile/addDirectory/close の I/O 待ち中) かどうかを考慮しないため、
+   * 進行中の操作の write() 待ちの最中に外部から abort() が呼ばれるレースが起こりうる。
+   * このとき abort() 経由の呼び出しが先に writable.abort() を発火させ、それによって進行中の write() が
+   * reject されると、進行中メソッド自身の catch も abortOnFailure を呼ぶため、対策が無いと
+   * writable.abort() が二重に実行されてしまう。
+   * ここでの「state を確認してから 'failed' に遷移させ、その後で writable.abort() を await する」という
+   * 順序が対策になっている。チェックと代入の間に await を挟まないため単一スレッドの JS 上では
+   * 不可分に実行され、2 つの呼び出しが競合しても後着側は必ず `state !== 'open'` を見て no-op になる。
+   * state は abort() の成否に関わらず 'failed' のまま維持し、以後のすべての呼び出しを
+   * beginOperation で拒否することで、「失敗後もまだ生きているストリームへの書き込みが通ってしまう」
+   * 問題も防ぐ。
+   */
+  private async abortOnFailure(reason: unknown): Promise<void> {
+    if (this.state !== 'open') return;
+    this.state = 'failed';
+    try {
+      await this.writable.abort(reason);
+    } catch {
+      // abort 自体の失敗は元の例外を握りつぶさないよう無視する
+    }
   }
 }
 
@@ -929,23 +1130,77 @@ export type DownloadZipOptions = {
 };
 
 /**
- * ZIP パスの 1 セグメントとして安全か検証する (encodedId / post.encodedName 用)
- * 空文字列 / "." / ".." / "/" "\" ":" を含むものを拒否する。
- * post.encodedName は isDownloadJsonObj で型 (string) すら検証されないため、value を unknown として受ける
+ * ZIP パスの 1 セグメントとして安全か検証する。
+ * 空文字列 / "/" "\" ":" を含むもの、制御文字 (U+0000-U+001F, U+007F) を含むものを拒否する。
+ * downloadZip の事前検証 (encodedId / post.encodedName / post.cover.name / file.encodedName) と
+ * ZipWriter.addFile / addDirectory 自体の入力検証 (assertValidZipEntryName 経由) の両方で共有する。
+ * cover.name / file.encodedName はパス区切りを含まない 1 セグメント名である前提のため、
+ * これらにも同じ検証をそのまま適用してよい (Issue #17)。
+ * post.encodedName 等は isDownloadJsonObj で型 (string) すら検証されないため、value を unknown として受ける
+ *
+ * Win32 系の展開実装は、ファイル名末尾の空白とピリオドを取り除いてから解釈する。そのため "." / ".." の
+ * 完全一致だけでなく、末尾の空白・ピリオドを取り除いた結果が空文字列 / "." / ".." になるセグメント
+ * (".. ", "...", ". ." 等) も、展開先で親ディレクトリと同等に扱われうるため拒否する。
+ * それ以外の末尾空白・ピリオド (例: "a. ") は Windows 上でのファイル名の互換性問題ではあるが
+ * トラバーサルではないため拒否しない (Issue #17 フォローアップ)。
  * @internal
  */
 function isValidPathSegment(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value !== '.' && value !== '..' && !/[/\\:]/.test(value);
+  if (typeof value !== 'string' || value.length === 0) return false;
+  if (/[/\\:]/.test(value)) return false;
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: 制御文字を意図的に拒否するための検証
+  if (/[\u0000-\u001f\u007f]/.test(value)) return false;
+  const trimmedTrailing = value.replace(/[ .]+$/, '');
+  return trimmedTrailing.length > 0 && trimmedTrailing !== '.' && trimmedTrailing !== '..';
 }
 
 /**
- * ディレクトリエントリと同名衝突を避けるためのファイル名検証 (post.cover.name / file.encodedName 用)
- * これらは isDownloadJsonObj で型 (string) までは検証済みのため、空文字列 / "." / ".." のみを拒否する
- * (`/` `\` `:` の検証と addFile 自体への入力検証は本 Issue のスコープ外。#17 で扱う)
+ * ZIP エントリ名 (`/` 区切りの複数セグメントパス) の各セグメントを isValidPathSegment で検証する。
+ * ZipWriter.addFile / addDirectory 自体への入力検証用で、結合済みのエントリ名をまとめて検証する。
+ * downloadZip の事前検証はフィールドごとに isValidPathSegment を個別に呼ぶため、
+ * ロジックの実体 (isValidPathSegment) は共有しつつ、ここでは呼び出し形だけをまとめている (重複実装を避ける)。
+ * 末尾 `/` の扱いは method によって非対称にする。addDirectory は呼び出し元 (このファイル内の addDirectory)
+ * が必ず正規化後の "dir/" 形式で渡すため、末尾の `/` を 1 つだけ取り除いてから分割する。
+ * addFile は取り除かない。取り除いてしまうと `addFile("dir/", data)` のような、名前上はディレクトリなのに
+ * データ本体を持つ矛盾したエントリを許してしまうため、末尾 `/` は素通しでセグメント分割にかけ、
+ * 分割で生じる空文字列セグメントとして isValidPathSegment に拒否させる (Issue #17 フォローアップ)。
+ * @param name 検証対象のエントリ名
+ * @param method エラーメッセージに含める呼び出し元メソッド名。addDirectory の場合のみ末尾 `/` を除去する
+ * @throws {Error} いずれかのセグメントが isValidPathSegment を満たさない場合
+ *   (空文字列 / "." / ".." / "/" "\" ":" を含む。空文字列は name が空、先頭・末尾が `/`、または `//` の埋め込みで発生する)
  * @internal
  */
-function isValidFileNameSegment(name: string): boolean {
-  return name.length > 0 && name !== '.' && name !== '..';
+function assertValidZipEntryName(name: string, method: 'addFile' | 'addDirectory'): void {
+  const segmentsSource = method === 'addDirectory' && name.endsWith('/') ? name.slice(0, -1) : name;
+  for (const segment of segmentsSource.split('/')) {
+    if (!isValidPathSegment(segment)) {
+      throw new Error(`ZipWriter.${method}: 不正な ZIP エントリ名です (${JSON.stringify(name)})`);
+    }
+  }
+}
+
+/**
+ * ZIP エントリ名の UTF-8 バイト長を検証する。
+ * LFH / CD の file name length フィールドは 16 bit (uint16) のため、65535 bytes を超える名前を
+ * そのまま書くと setUint16 が値を切り詰め、直後に書く名前バイト列自体は全長書き込まれてしまい、
+ * 後続のデータ (extra field やファイル本体) の位置がずれた壊れた ZIP になる。
+ * 入力は非信頼という前提のため、約 64 KiB の名前は実際に発生しうる (Issue #17 フォローアップ)。
+ * @param nameBytes エンコード後のエントリ名バイト列
+ * @param name エラーメッセージ用の元の名前 (addDirectory の場合は正規化後の "dir/" 形式)
+ * @param method エラーメッセージに含める呼び出し元メソッド名
+ * @throws {Error} nameBytes.length が 65535 を超える場合
+ * @internal
+ */
+function assertValidZipEntryNameByteLength(
+  nameBytes: Uint8Array,
+  name: string,
+  method: 'addFile' | 'addDirectory',
+): void {
+  if (nameBytes.length > 0xffff) {
+    throw new Error(
+      `ZipWriter.${method}: エントリ名が長すぎます (UTF-8 ${nameBytes.length} bytes, 上限 65535 bytes): ${JSON.stringify(name)}`,
+    );
+  }
 }
 
 /**
@@ -1113,10 +1368,15 @@ export class DownloadHelper {
 
   /**
    * ZIPでダウンロード
+   *
+   * progress / log / remainTime は同期コールバック限定である。戻り値型が void のため async 関数も
+   * 型上は渡せてしまうが、呼び出しを await しないので、返された Promise の rejection はこのメソッドの
+   * catch (ストリームの abort) に到達せず、未処理 rejection のまま ZIP 生成が継続する。
+   * 同期的に throw した場合は catch に入り、書き込み途中ならストリームを abort して再スローする。
    * @param downloadObj ダウンロード対象オブジェクト
-   * @param progress 進捗率出力関数
-   * @param log ログ出力関数
-   * @param remainTime 終了予測出力関数
+   * @param progress 進捗率出力関数 (同期)
+   * @param log ログ出力関数 (同期)
+   * @param remainTime 終了予測出力関数 (同期)
    * @param options handle/signal/fetchFile を差し替えるためのオプション (省略時は従来どおりの挙動)
    */
   async downloadZip(
@@ -1144,11 +1404,11 @@ export class DownloadHelper {
         throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
       }
       seenEncodedNames.add(post.encodedName);
-      if (post.cover !== undefined && !isValidFileNameSegment(post.cover.name)) {
+      if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
         throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
       }
       for (const file of post.files) {
-        if (!isValidFileNameSegment(file.encodedName)) {
+        if (!isValidPathSegment(file.encodedName)) {
           throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
         }
       }
@@ -1157,93 +1417,103 @@ export class DownloadHelper {
     const handle = options?.handle ?? (await showSaveFilePicker({ suggestedName: `${encodedId}.zip` }));
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
-    const fetchFile = options?.fetchFile ?? ((url: string, name: string) => utils.fetchWithLimit({ url, name }, 1));
 
-    const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
-      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
-    };
+    // createWritable() 以降の ZIP 生成処理全体を try/catch で囲む。fetchFile / log / progress / remainTime は
+    // 呼び出し側が渡すコールバックであり、これらが例外を投げても writable が未 close のまま残らないようにする
+    // (toUint8Array 内の Blob.arrayBuffer も同様に投げうる)。zip.addFile 等が投げた場合は ZipWriter が内部で
+    // 既に abort 済み (terminal) のため、ここでの zip.abort は no-op になる。
+    try {
+      const fetchFile = options?.fetchFile ?? ((url: string, name: string) => utils.fetchWithLimit({ url, name }, 1));
 
-    const parsePublishedDate = (iso?: string): Date | undefined => {
-      if (!iso) return undefined;
-      const d = new Date(iso);
-      return Number.isFinite(d.getTime()) ? d : undefined;
-    };
+      const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
+        await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
+      };
 
-    const startTime = Math.floor(Date.now() / 1000);
-    let count = 0;
-    let failedCount = 0;
+      const parsePublishedDate = (iso?: string): Date | undefined => {
+        if (!iso) return undefined;
+        const d = new Date(iso);
+        return Number.isFinite(d.getTime()) ? d : undefined;
+      };
 
-    log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
-    // ルートディレクトリ (日時は有効な publishedDatetime の最大値。有効な値が 1 件も無ければ date なし)
-    const rootDate = downloadObj.posts.reduce<Date | undefined>((max, post) => {
-      const d = parsePublishedDate(post.publishedDatetime);
-      if (d === undefined) return max;
-      return max === undefined || d.getTime() > max.getTime() ? d : max;
-    }, undefined);
-    await zip.addDirectory(`${encodedId}/`, rootDate);
-    // ルートhtml (post に紐づかないので date は付与しない)
-    await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html');
-    // 投稿処理
-    let postCount = 0;
-    for (const post of downloadObj.posts) {
-      if (options?.signal?.aborted) {
-        await zip.close();
-        return;
-      }
-      log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
-      const postDate = parsePublishedDate(post.publishedDatetime);
-      // 投稿ディレクトリ (配下ファイルより前に書く)
-      await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
-      // 投稿情報+html
-      const informationFile = utils.createInformationFile(post.informationText);
-      await enqueue(
-        informationFile.content,
-        `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`,
-        postDate,
-      );
-      await enqueue(
-        [this.createHtmlFromBody(post.originalName, post.htmlText)],
-        `${post.encodedName}/index.html`,
-        postDate,
-      );
-      // カバー画像
-      if (post.cover) {
-        log(`download ${post.cover.name}`);
-        const blob = await fetchFile(post.cover.url, post.cover.name);
-        if (blob) {
-          await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
-        }
-      }
-      // ファイル処理
-      let fileCount = 0;
-      for (const file of post.files) {
+      const startTime = Math.floor(Date.now() / 1000);
+      let count = 0;
+      let failedCount = 0;
+
+      log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
+      // ルートディレクトリ (日時は有効な publishedDatetime の最大値。有効な値が 1 件も無ければ date なし)
+      const rootDate = downloadObj.posts.reduce<Date | undefined>((max, post) => {
+        const d = parsePublishedDate(post.publishedDatetime);
+        if (d === undefined) return max;
+        return max === undefined || d.getTime() > max.getTime() ? d : max;
+      }, undefined);
+      await zip.addDirectory(`${encodedId}/`, rootDate);
+      // ルートhtml (post に紐づかないので date は付与しない)
+      await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html');
+      // 投稿処理
+      let postCount = 0;
+      for (const post of downloadObj.posts) {
         if (options?.signal?.aborted) {
           await zip.close();
           return;
         }
-        log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-        const blob = await fetchFile(file.url, file.encodedName);
-        if (blob) {
-          await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
-        } else {
-          failedCount++;
-          console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
-          log(`${file.encodedName}のダウンロードに失敗`);
+        log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
+        const postDate = parsePublishedDate(post.publishedDatetime);
+        // 投稿ディレクトリ (配下ファイルより前に書く)
+        await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
+        // 投稿情報+html
+        const informationFile = utils.createInformationFile(post.informationText);
+        await enqueue(
+          informationFile.content,
+          `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`,
+          postDate,
+        );
+        await enqueue(
+          [this.createHtmlFromBody(post.originalName, post.htmlText)],
+          `${post.encodedName}/index.html`,
+          postDate,
+        );
+        // カバー画像
+        if (post.cover) {
+          log(`download ${post.cover.name}`);
+          const blob = await fetchFile(post.cover.url, post.cover.name);
+          if (blob) {
+            await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
+          }
         }
-        count++;
-        const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
-        const remain = Math.floor((elapsedSec * (downloadObj.fileCount - count)) / count);
-        remainTime(formatRemain(remain));
-        progress(((count * 100) / downloadObj.fileCount) | 0);
-        await utils.sleep(100);
+        // ファイル処理
+        let fileCount = 0;
+        for (const file of post.files) {
+          if (options?.signal?.aborted) {
+            await zip.close();
+            return;
+          }
+          log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
+          const blob = await fetchFile(file.url, file.encodedName);
+          if (blob) {
+            await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
+          } else {
+            failedCount++;
+            console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
+            log(`${file.encodedName}のダウンロードに失敗`);
+          }
+          count++;
+          const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
+          const remain = Math.floor((elapsedSec * (downloadObj.fileCount - count)) / count);
+          remainTime(formatRemain(remain));
+          progress(((count * 100) / downloadObj.fileCount) | 0);
+          await utils.sleep(100);
+        }
       }
+      if (failedCount > 0) {
+        log(`完了 (${failedCount}件のダウンロードに失敗)`);
+      } else {
+        log('完了');
+      }
+      await zip.close();
+    } catch (e) {
+      await zip.abort(e);
+      throw e;
     }
-    if (failedCount > 0) {
-      log(`完了 (${failedCount}件のダウンロードに失敗)`);
-    } else {
-      log('完了');
-    }
-    await zip.close();
   }
 
   /**

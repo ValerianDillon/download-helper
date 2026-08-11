@@ -433,131 +433,214 @@ export class ZipWriter {
   offset = 0;
   entries = [];
   encoder = new TextEncoder;
+  state = "open";
+  inFlight = false;
   constructor(writable) {
     this.writable = writable;
   }
   async addFile(name, data, date) {
-    const bytes = data.buffer instanceof ArrayBuffer ? data : new Uint8Array(data);
-    const nameBytes = this.encoder.encode(name);
-    const fileCrc = crc32(bytes);
-    const localHeaderOffset = this.offset;
-    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
-    const header = new ArrayBuffer(30);
-    const view = new DataView(header);
-    view.setUint32(0, 67324752, true);
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 2048, true);
-    view.setUint16(8, 0, true);
-    view.setUint16(10, dosTime, true);
-    view.setUint16(12, dosDate, true);
-    view.setUint32(14, fileCrc, true);
-    view.setUint32(18, bytes.length, true);
-    view.setUint32(22, bytes.length, true);
-    view.setUint16(26, nameBytes.length, true);
-    view.setUint16(28, extraLfh.length, true);
-    await this.write(new Uint8Array(header));
-    await this.write(nameBytes);
-    if (extraLfh.length > 0)
-      await this.write(extraLfh);
-    await this.write(bytes);
-    this.entries.push({
-      name: nameBytes,
-      crc: fileCrc,
-      size: bytes.length,
-      offset: localHeaderOffset,
-      dosTime,
-      dosDate,
-      extraCd,
-      externalAttr: 0
-    });
+    this.beginOperation("addFile");
+    try {
+      assertValidZipEntryName(name, "addFile");
+      const bytes = data.buffer instanceof ArrayBuffer ? data : new Uint8Array(data);
+      const nameBytes = this.encoder.encode(name);
+      assertValidZipEntryNameByteLength(nameBytes, name, "addFile");
+      const fileCrc = crc32(bytes);
+      const localHeaderOffset = this.offset;
+      const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+      const header = new ArrayBuffer(30);
+      const view = new DataView(header);
+      view.setUint32(0, 67324752, true);
+      view.setUint16(4, 20, true);
+      view.setUint16(6, 2048, true);
+      view.setUint16(8, 0, true);
+      view.setUint16(10, dosTime, true);
+      view.setUint16(12, dosDate, true);
+      view.setUint32(14, fileCrc, true);
+      view.setUint32(18, bytes.length, true);
+      view.setUint32(22, bytes.length, true);
+      view.setUint16(26, nameBytes.length, true);
+      view.setUint16(28, extraLfh.length, true);
+      await this.write(new Uint8Array(header));
+      await this.write(nameBytes);
+      if (extraLfh.length > 0)
+        await this.write(extraLfh);
+      await this.write(bytes);
+      this.assertStillOpen("addFile");
+      this.entries.push({
+        name: nameBytes,
+        crc: fileCrc,
+        size: bytes.length,
+        offset: localHeaderOffset,
+        dosTime,
+        dosDate,
+        extraCd,
+        externalAttr: 0
+      });
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
+    } finally {
+      this.inFlight = false;
+    }
   }
   async addDirectory(name, date) {
-    const dirName = name.endsWith("/") ? name : `${name}/`;
-    if (dirName.startsWith("/")) {
-      throw new Error(`addDirectory: name must not be empty or start with "/": ${JSON.stringify(name)}`);
+    this.beginOperation("addDirectory");
+    try {
+      const dirName = name.endsWith("/") ? name : `${name}/`;
+      assertValidZipEntryName(dirName, "addDirectory");
+      const nameBytes = this.encoder.encode(dirName);
+      assertValidZipEntryNameByteLength(nameBytes, dirName, "addDirectory");
+      const localHeaderOffset = this.offset;
+      const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+      const header = new ArrayBuffer(30);
+      const view = new DataView(header);
+      view.setUint32(0, 67324752, true);
+      view.setUint16(4, 20, true);
+      view.setUint16(6, 2048, true);
+      view.setUint16(8, 0, true);
+      view.setUint16(10, dosTime, true);
+      view.setUint16(12, dosDate, true);
+      view.setUint32(14, 0, true);
+      view.setUint32(18, 0, true);
+      view.setUint32(22, 0, true);
+      view.setUint16(26, nameBytes.length, true);
+      view.setUint16(28, extraLfh.length, true);
+      await this.write(new Uint8Array(header));
+      await this.write(nameBytes);
+      if (extraLfh.length > 0)
+        await this.write(extraLfh);
+      this.assertStillOpen("addDirectory");
+      this.entries.push({
+        name: nameBytes,
+        crc: 0,
+        size: 0,
+        offset: localHeaderOffset,
+        dosTime,
+        dosDate,
+        extraCd,
+        externalAttr: 16
+      });
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
+    } finally {
+      this.inFlight = false;
     }
-    const nameBytes = this.encoder.encode(dirName);
-    const localHeaderOffset = this.offset;
-    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
-    const header = new ArrayBuffer(30);
-    const view = new DataView(header);
-    view.setUint32(0, 67324752, true);
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 2048, true);
-    view.setUint16(8, 0, true);
-    view.setUint16(10, dosTime, true);
-    view.setUint16(12, dosDate, true);
-    view.setUint32(14, 0, true);
-    view.setUint32(18, 0, true);
-    view.setUint32(22, 0, true);
-    view.setUint16(26, nameBytes.length, true);
-    view.setUint16(28, extraLfh.length, true);
-    await this.write(new Uint8Array(header));
-    await this.write(nameBytes);
-    if (extraLfh.length > 0)
-      await this.write(extraLfh);
-    this.entries.push({
-      name: nameBytes,
-      crc: 0,
-      size: 0,
-      offset: localHeaderOffset,
-      dosTime,
-      dosDate,
-      extraCd,
-      externalAttr: 16
-    });
   }
   async close() {
-    const cdOffset = this.offset;
-    for (const entry of this.entries) {
-      const cdHeader = new ArrayBuffer(46);
-      const view = new DataView(cdHeader);
-      view.setUint32(0, 33639248, true);
-      view.setUint16(4, 20, true);
-      view.setUint16(6, 20, true);
-      view.setUint16(8, 2048, true);
-      view.setUint16(10, 0, true);
-      view.setUint16(12, entry.dosTime, true);
-      view.setUint16(14, entry.dosDate, true);
-      view.setUint32(16, entry.crc, true);
-      view.setUint32(20, entry.size, true);
-      view.setUint32(24, entry.size, true);
-      view.setUint16(28, entry.name.length, true);
-      view.setUint16(30, entry.extraCd.length, true);
-      view.setUint16(32, 0, true);
-      view.setUint16(34, 0, true);
-      view.setUint16(36, 0, true);
-      view.setUint32(38, entry.externalAttr, true);
-      view.setUint32(42, entry.offset, true);
-      await this.write(new Uint8Array(cdHeader));
-      await this.write(entry.name);
-      if (entry.extraCd.length > 0)
-        await this.write(entry.extraCd);
+    this.beginOperation("close");
+    try {
+      const cdOffset = this.offset;
+      for (const entry of this.entries) {
+        const cdHeader = new ArrayBuffer(46);
+        const view = new DataView(cdHeader);
+        view.setUint32(0, 33639248, true);
+        view.setUint16(4, 20, true);
+        view.setUint16(6, 20, true);
+        view.setUint16(8, 2048, true);
+        view.setUint16(10, 0, true);
+        view.setUint16(12, entry.dosTime, true);
+        view.setUint16(14, entry.dosDate, true);
+        view.setUint32(16, entry.crc, true);
+        view.setUint32(20, entry.size, true);
+        view.setUint32(24, entry.size, true);
+        view.setUint16(28, entry.name.length, true);
+        view.setUint16(30, entry.extraCd.length, true);
+        view.setUint16(32, 0, true);
+        view.setUint16(34, 0, true);
+        view.setUint16(36, 0, true);
+        view.setUint32(38, entry.externalAttr, true);
+        view.setUint32(42, entry.offset, true);
+        await this.write(new Uint8Array(cdHeader));
+        await this.write(entry.name);
+        if (entry.extraCd.length > 0)
+          await this.write(entry.extraCd);
+      }
+      const cdSize = this.offset - cdOffset;
+      const eocd = new ArrayBuffer(22);
+      const eocdView = new DataView(eocd);
+      eocdView.setUint32(0, 101010256, true);
+      eocdView.setUint16(4, 0, true);
+      eocdView.setUint16(6, 0, true);
+      eocdView.setUint16(8, this.entries.length, true);
+      eocdView.setUint16(10, this.entries.length, true);
+      eocdView.setUint32(12, cdSize, true);
+      eocdView.setUint32(16, cdOffset, true);
+      eocdView.setUint16(20, 0, true);
+      await this.write(new Uint8Array(eocd));
+      await this.writable.close();
+      this.state = "closed";
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
+    } finally {
+      this.inFlight = false;
     }
-    const cdSize = this.offset - cdOffset;
-    const eocd = new ArrayBuffer(22);
-    const eocdView = new DataView(eocd);
-    eocdView.setUint32(0, 101010256, true);
-    eocdView.setUint16(4, 0, true);
-    eocdView.setUint16(6, 0, true);
-    eocdView.setUint16(8, this.entries.length, true);
-    eocdView.setUint16(10, this.entries.length, true);
-    eocdView.setUint32(12, cdSize, true);
-    eocdView.setUint32(16, cdOffset, true);
-    eocdView.setUint16(20, 0, true);
-    await this.write(new Uint8Array(eocd));
-    await this.writable.close();
+  }
+  async abort(reason) {
+    if (this.inFlight === "close") {
+      throw new Error("ZipWriter.abort: close 実行中のため abort できません。close の完了を待ってください");
+    }
+    if (this.state !== "open")
+      return;
+    await this.abortOnFailure(reason);
   }
   async write(data) {
     await this.writable.write(data);
+    if (this.state !== "open") {
+      throw new Error("ZipWriter: 書き込み中に abort されました");
+    }
     this.offset += data.length;
+  }
+  assertStillOpen(method) {
+    if (this.state !== "open") {
+      throw new Error(`ZipWriter.${method}: 書き込み中に abort されました`);
+    }
+  }
+  beginOperation(method) {
+    if (this.state === "failed") {
+      throw new Error(`ZipWriter.${method}: 以前の失敗により使用不可です`);
+    }
+    if (this.state === "closed") {
+      throw new Error(`ZipWriter.${method}: close 済みのため使用不可です`);
+    }
+    if (this.inFlight !== false) {
+      throw new Error(`ZipWriter.${method}: 別の呼び出しが実行中です (ZipWriter は呼び出しごとに await してから次を呼ぶ直列利用が前提です)`);
+    }
+    this.inFlight = method;
+  }
+  async abortOnFailure(reason) {
+    if (this.state !== "open")
+      return;
+    this.state = "failed";
+    try {
+      await this.writable.abort(reason);
+    } catch {}
   }
 }
 function isValidPathSegment(value) {
-  return typeof value === "string" && value.length > 0 && value !== "." && value !== ".." && !/[/\\:]/.test(value);
+  if (typeof value !== "string" || value.length === 0)
+    return false;
+  if (/[/\\:]/.test(value))
+    return false;
+  if (/[\u0000-\u001f\u007f]/.test(value))
+    return false;
+  const trimmedTrailing = value.replace(/[ .]+$/, "");
+  return trimmedTrailing.length > 0 && trimmedTrailing !== "." && trimmedTrailing !== "..";
 }
-function isValidFileNameSegment(name) {
-  return name.length > 0 && name !== "." && name !== "..";
+function assertValidZipEntryName(name, method) {
+  const segmentsSource = method === "addDirectory" && name.endsWith("/") ? name.slice(0, -1) : name;
+  for (const segment of segmentsSource.split("/")) {
+    if (!isValidPathSegment(segment)) {
+      throw new Error(`ZipWriter.${method}: 不正な ZIP エントリ名です (${JSON.stringify(name)})`);
+    }
+  }
+}
+function assertValidZipEntryNameByteLength(nameBytes, name, method) {
+  if (nameBytes.length > 65535) {
+    throw new Error(`ZipWriter.${method}: エントリ名が長すぎます (UTF-8 ${nameBytes.length} bytes, 上限 65535 bytes): ${JSON.stringify(name)}`);
+  }
 }
 function pad2(n) {
   return `00${n}`.slice(-2);
@@ -711,11 +794,11 @@ export class DownloadHelper {
         throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
       }
       seenEncodedNames.add(post.encodedName);
-      if (post.cover !== undefined && !isValidFileNameSegment(post.cover.name)) {
+      if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
         throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
       }
       for (const file of post.files) {
-        if (!isValidFileNameSegment(file.encodedName)) {
+        if (!isValidPathSegment(file.encodedName)) {
           throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
         }
       }
@@ -723,76 +806,81 @@ export class DownloadHelper {
     const handle = options?.handle ?? await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
-    const fetchFile = options?.fetchFile ?? ((url, name) => utils.fetchWithLimit({ url, name }, 1));
-    const enqueue = async (fileBits, path, date) => {
-      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
-    };
-    const parsePublishedDate = (iso) => {
-      if (!iso)
-        return;
-      const d = new Date(iso);
-      return Number.isFinite(d.getTime()) ? d : undefined;
-    };
-    const startTime = Math.floor(Date.now() / 1000);
-    let count = 0;
-    let failedCount = 0;
-    log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
-    const rootDate = downloadObj.posts.reduce((max, post) => {
-      const d = parsePublishedDate(post.publishedDatetime);
-      if (d === undefined)
-        return max;
-      return max === undefined || d.getTime() > max.getTime() ? d : max;
-    }, undefined);
-    await zip.addDirectory(`${encodedId}/`, rootDate);
-    await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html");
-    let postCount = 0;
-    for (const post of downloadObj.posts) {
-      if (options?.signal?.aborted) {
-        await zip.close();
-        return;
-      }
-      log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
-      const postDate = parsePublishedDate(post.publishedDatetime);
-      await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
-      const informationFile = utils.createInformationFile(post.informationText);
-      await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`, postDate);
-      await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`, postDate);
-      if (post.cover) {
-        log(`download ${post.cover.name}`);
-        const blob = await fetchFile(post.cover.url, post.cover.name);
-        if (blob) {
-          await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
-        }
-      }
-      let fileCount = 0;
-      for (const file of post.files) {
+    try {
+      const fetchFile = options?.fetchFile ?? ((url, name) => utils.fetchWithLimit({ url, name }, 1));
+      const enqueue = async (fileBits, path, date) => {
+        await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
+      };
+      const parsePublishedDate = (iso) => {
+        if (!iso)
+          return;
+        const d = new Date(iso);
+        return Number.isFinite(d.getTime()) ? d : undefined;
+      };
+      const startTime = Math.floor(Date.now() / 1000);
+      let count = 0;
+      let failedCount = 0;
+      log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
+      const rootDate = downloadObj.posts.reduce((max, post) => {
+        const d = parsePublishedDate(post.publishedDatetime);
+        if (d === undefined)
+          return max;
+        return max === undefined || d.getTime() > max.getTime() ? d : max;
+      }, undefined);
+      await zip.addDirectory(`${encodedId}/`, rootDate);
+      await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html");
+      let postCount = 0;
+      for (const post of downloadObj.posts) {
         if (options?.signal?.aborted) {
           await zip.close();
           return;
         }
-        log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-        const blob = await fetchFile(file.url, file.encodedName);
-        if (blob) {
-          await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
-        } else {
-          failedCount++;
-          console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
-          log(`${file.encodedName}のダウンロードに失敗`);
+        log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
+        const postDate = parsePublishedDate(post.publishedDatetime);
+        await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
+        const informationFile = utils.createInformationFile(post.informationText);
+        await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`, postDate);
+        await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`, postDate);
+        if (post.cover) {
+          log(`download ${post.cover.name}`);
+          const blob = await fetchFile(post.cover.url, post.cover.name);
+          if (blob) {
+            await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
+          }
         }
-        count++;
-        const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
-        const remain = Math.floor(elapsedSec * (downloadObj.fileCount - count) / count);
-        remainTime(formatRemain(remain));
-        progress(count * 100 / downloadObj.fileCount | 0);
-        await utils.sleep(100);
+        let fileCount = 0;
+        for (const file of post.files) {
+          if (options?.signal?.aborted) {
+            await zip.close();
+            return;
+          }
+          log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
+          const blob = await fetchFile(file.url, file.encodedName);
+          if (blob) {
+            await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
+          } else {
+            failedCount++;
+            console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
+            log(`${file.encodedName}のダウンロードに失敗`);
+          }
+          count++;
+          const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
+          const remain = Math.floor(elapsedSec * (downloadObj.fileCount - count) / count);
+          remainTime(formatRemain(remain));
+          progress(count * 100 / downloadObj.fileCount | 0);
+          await utils.sleep(100);
+        }
       }
+      if (failedCount > 0) {
+        log(`完了 (${failedCount}件のダウンロードに失敗)`);
+      } else {
+        log("完了");
+      }
+      await zip.close();
+    } catch (e) {
+      await zip.abort(e);
+      throw e;
     }
-    if (failedCount > 0) {
-      log(`完了 (${failedCount}件のダウンロードに失敗)`);
-    } else {
-      log("完了");
-    }
-    await zip.close();
   }
   isDownloadJsonObj(target) {
     if (typeof target !== "object" || target === null) {
