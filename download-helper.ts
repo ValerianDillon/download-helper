@@ -735,6 +735,11 @@ function concatBytes(parts: Uint8Array<ArrayBuffer>[]): Uint8Array<ArrayBuffer> 
  * - **close() 成功後、または addFile / addDirectory / close のいずれかが失敗した後は再利用できない。**
  *   前者は File System Access API 上ストリームが既に確定しているため、後者は書き込み先ストリームを
  *   既に abort 済みのため。どちらも以後の呼び出しは冒頭で例外を投げる (terminal 状態)。
+ * - **close() の実行中は公開 abort() で中断できない。** Streams 仕様上、in-flight の close は abort で
+ *   中断されず close の完了が優先されるため、close 実行中に abort() が成功したように見えても実際には
+ *   ファイルがコミットされてしまいうる (「破棄したはずが実はコミットされていた」という嘘になる)。
+ *   そのため close 実行中の abort() は例外を投げて拒否し、呼び出し側に close 自身の結果 (成功/失敗) を
+ *   await させる。
  * @internal
  */
 export class ZipWriter {
@@ -762,12 +767,14 @@ export class ZipWriter {
    */
   private state: 'open' | 'closed' | 'failed' = 'open';
   /**
-   * 現在 addFile / addDirectory / close のいずれかを実行中かどうか。
+   * 現在実行中の操作。実行中でなければ false、実行中ならどのメソッドが実行中かを保持する。
    * このクラスは直列利用を契約とするため (クラス doc 参照)、実行中に別の呼び出しが来たら
    * プログラミングエラーとして即座に例外にする。async 関数本体は最初の await まで同期的に走るため、
    * beginOperation をメソッド先頭で呼べば、呼び出し元が返り値を await していなくても検出できる。
+   * 操作種別を持たせているのは、公開 abort() が 'close' 実行中かどうかを区別する必要があるため
+   * (close は abort で中断できない。クラス doc 参照)。
    */
-  private inFlight = false;
+  private inFlight: false | 'addFile' | 'addDirectory' | 'close' = false;
 
   constructor(writable: FileSystemWritableFileStream) {
     this.writable = writable;
@@ -966,6 +973,10 @@ export class ZipWriter {
 
       await this.write(new Uint8Array(eocd));
       await this.writable.close();
+      // ここに到達した時点で state は必ず 'open' のままである: close 実行中は inFlight === 'close' であり、
+      // 公開 abort() はその間例外を投げて拒否するため (state を書き換える経路を持たない)、close 自身の
+      // catch (state = 'failed') 以外に state を動かす者がいない。したがってこの代入が 'failed' を
+      // 上書きしてしまうことはない (Issue #17 フォローアップ)。
       this.state = 'closed';
     } catch (e) {
       await this.abortOnFailure(e);
@@ -982,14 +993,25 @@ export class ZipWriter {
    * remainTime という呼び出し側のコールバックを挟んでおり、これらが投げた例外は ZipWriter の外で
    * catch することになる。その catch から呼ぶための入口がこのメソッドである。
    *
-   * 既に 'open' でない (close 済み、または addFile/addDirectory/close 自身の失敗で既に abort 済み) 場合は
-   * no-op にする。ここでの判定はあくまで早期リターンの最適化であり、実際に二重 abort を防いでいるのは
-   * abortOnFailure 側の同じチェックである (in-flight な addFile/addDirectory/close の I/O 待ち中に
-   * abort() が呼ばれるレースでは、ここでの判定時点ではまだ 'open' のままになりうるため。詳細は
-   * abortOnFailure のコメントを参照)。
+   * close 実行中 (inFlight === 'close') は例外を投げて拒否する。Streams 仕様上、in-flight の close は
+   * abort で中断されず close の完了が優先されるため、ここで abort を受理して成功したように見せると、
+   * 実際には close が完走してファイルがコミットされているのに abort 側は「破棄できた」と誤認する
+   * (state を無条件に 'closed' で上書きする経路にもなり、既に 'failed' にした状態を握りつぶしうる)。
+   * 呼び出し側には close 自身の結果 (成功/失敗) を待たせるのが誠実なので、ここでは例外にして
+   * 「今は中断できない、close の完了を待て」と伝える。
+   *
+   * close 実行中でなく、かつ既に 'open' でない (close 済み、または addFile/addDirectory/close 自身の
+   * 失敗で既に abort 済み) 場合は no-op にする。ここでの判定はあくまで早期リターンの最適化であり、
+   * 実際に二重 abort を防いでいるのは abortOnFailure 側の同じチェックである (in-flight な
+   * addFile/addDirectory の I/O 待ち中に abort() が呼ばれるレースでは、ここでの判定時点では
+   * まだ 'open' のままになりうるため。詳細は abortOnFailure のコメントを参照)。
    * @param reason 破棄理由 (writable.abort() に渡される)
+   * @throws {Error} close が実行中の場合
    */
   async abort(reason?: unknown): Promise<void> {
+    if (this.inFlight === 'close') {
+      throw new Error('ZipWriter.abort: close 実行中のため abort できません。close の完了を待ってください');
+    }
     if (this.state !== 'open') return;
     await this.abortOnFailure(reason);
   }
@@ -1005,7 +1027,9 @@ export class ZipWriter {
    * - 既に他の呼び出しが実行中 (inFlight) の場合も、並行呼び出しは誤用として即座に例外を投げる
    *   (「直列化して待たせる」のではなく「検出して拒否する」方針。暗黙の直列化はキュー順序の保証という
    *   新しい契約を増やすため採らない)
-   * - 上記のいずれにも該当しなければ inFlight を立てる。呼び出し元は必ず finally で inFlight を戻すこと
+   * - 上記のいずれにも該当しなければ inFlight に method 自身を立てる (公開 abort() が 'close' 実行中かを
+   *   区別できるようにするため、単なる boolean ではなく操作種別を保持する)。
+   *   呼び出し元は必ず finally で inFlight を false に戻すこと
    * @throws {Error} 上記のいずれかに該当する場合
    */
   private beginOperation(method: 'addFile' | 'addDirectory' | 'close'): void {
@@ -1015,12 +1039,12 @@ export class ZipWriter {
     if (this.state === 'closed') {
       throw new Error(`ZipWriter.${method}: close 済みのため使用不可です`);
     }
-    if (this.inFlight) {
+    if (this.inFlight !== false) {
       throw new Error(
         `ZipWriter.${method}: 別の呼び出しが実行中です (ZipWriter は呼び出しごとに await してから次を呼ぶ直列利用が前提です)`,
       );
     }
-    this.inFlight = true;
+    this.inFlight = method;
   }
 
   /**

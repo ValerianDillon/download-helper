@@ -1476,6 +1476,45 @@ describe('ZipWriter', () => {
       await expect(addDirectoryPromise).rejects.toThrow();
       expect(abortCalls).toBe(1);
     });
+
+    test('close() 実行中に abort() を呼ぶと拒否され、close は正常に完走して writable.abort() は呼ばれない', async () => {
+      const mock = new MockWritableStream();
+      let abortCalls = 0;
+      let releaseClose: (() => void) | undefined;
+      const closeGate = new Promise<void>((resolve) => {
+        releaseClose = resolve;
+      });
+      const originalClose = mock.close.bind(mock);
+
+      // writable.close() を、明示的に解放するまで pending にする。Streams 仕様上、in-flight の close は
+      // abort で中断されないため、この間の abort() は拒否されなければならない。
+      mock.close = async () => {
+        await closeGate;
+        await originalClose();
+      };
+      mock.abort = async () => {
+        abortCalls++;
+      };
+
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.addFile('a.txt', encoder.encode('x'));
+
+      const closePromise = zip.close(); // await しない (writable.close() が pending になる)
+
+      // close 実行中 (inFlight === 'close') の abort() は拒否される。
+      // ここで abort が「成功」してしまうと、close が後で完走してファイルがコミットされたときに
+      // 「破棄できたはず」という嘘になる。
+      await expect(zip.abort(new Error('外部からの abort'))).rejects.toThrow();
+
+      releaseClose?.();
+      await closePromise;
+
+      expect(mock.closed).toBe(true);
+      expect(abortCalls).toBe(0);
+
+      // close 成功後は 'closed' として terminal 状態を維持する (state が 'failed' に化けていない)
+      await expect(zip.addFile('b.txt', encoder.encode('y'))).rejects.toThrow();
+    });
   });
 
   // ----------------------------------------------------------

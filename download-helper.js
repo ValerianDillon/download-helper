@@ -577,6 +577,9 @@ export class ZipWriter {
     }
   }
   async abort(reason) {
+    if (this.inFlight === "close") {
+      throw new Error("ZipWriter.abort: close 実行中のため abort できません。close の完了を待ってください");
+    }
     if (this.state !== "open")
       return;
     await this.abortOnFailure(reason);
@@ -592,10 +595,10 @@ export class ZipWriter {
     if (this.state === "closed") {
       throw new Error(`ZipWriter.${method}: close 済みのため使用不可です`);
     }
-    if (this.inFlight) {
+    if (this.inFlight !== false) {
       throw new Error(`ZipWriter.${method}: 別の呼び出しが実行中です (ZipWriter は呼び出しごとに await してから次を呼ぶ直列利用が前提です)`);
     }
-    this.inFlight = true;
+    this.inFlight = method;
   }
   async abortOnFailure(reason) {
     if (this.state !== "open")
