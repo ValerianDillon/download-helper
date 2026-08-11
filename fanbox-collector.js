@@ -52,39 +52,90 @@ export class DownloadManage {
   }
 }
 function isRecord(value) {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function hasSupportedBody(postInfo) {
+function isImageInfo(value) {
+  return isRecord(value) && typeof value.originalUrl === "string" && typeof value.extension === "string";
+}
+function isFileInfo(value) {
+  return isRecord(value) && typeof value.url === "string" && typeof value.name === "string" && typeof value.extension === "string";
+}
+function isValidBlock(value) {
+  if (!isRecord(value) || typeof value.type !== "string")
+    return false;
+  if (value.type === "p" || value.type === "header") {
+    return typeof value.text === "string";
+  }
+  return true;
+}
+function checkBody(postInfo) {
   const body = postInfo.body;
+  const missing = [];
   switch (postInfo.type) {
     case "image":
-      return Array.isArray(body.images) && typeof body.text === "string";
+      if (!Array.isArray(body.images) || !body.images.every(isImageInfo))
+        missing.push("body.images");
+      if (typeof body.text !== "string")
+        missing.push("body.text");
+      break;
     case "file":
-      return Array.isArray(body.files) && typeof body.text === "string";
+      if (!Array.isArray(body.files) || !body.files.every(isFileInfo))
+        missing.push("body.files");
+      if (typeof body.text !== "string")
+        missing.push("body.text");
+      break;
     case "article":
-      return Array.isArray(body.blocks) && isRecord(body.imageMap) && isRecord(body.fileMap) && isRecord(body.embedMap) && isRecord(body.urlEmbedMap);
+      if (!Array.isArray(body.blocks) || !body.blocks.every(isValidBlock))
+        missing.push("body.blocks");
+      if (!isRecord(body.imageMap) || !Object.values(body.imageMap).every(isImageInfo))
+        missing.push("body.imageMap");
+      if (!isRecord(body.fileMap) || !Object.values(body.fileMap).every(isFileInfo))
+        missing.push("body.fileMap");
+      if (!isRecord(body.embedMap))
+        missing.push("body.embedMap");
+      if (!isRecord(body.urlEmbedMap))
+        missing.push("body.urlEmbedMap");
+      break;
     case "text":
-      return typeof body.text === "string";
-    default:
-      return true;
+      if (typeof body.text !== "string")
+        missing.push("body.text");
+      break;
   }
+  return missing;
 }
 export function addByPostInfo(downloadManage, postInfo) {
   if (!postInfo) {
-    return "unavailable";
+    return { status: "unavailable", reason: "missing-body" };
   }
   if (downloadManage.isIgnoreFree && postInfo.feeRequired === 0) {
-    return "ignored";
+    return { status: "ignored" };
   }
-  if (!postInfo.body || postInfo.isRestricted) {
+  if (postInfo.isRestricted) {
     console.log(`取得できませんでした(支援がたりない？)
 feeRequired: ${postInfo.feeRequired}@${postInfo.id}`);
-    return "unavailable";
+    return { status: "unavailable", reason: "restricted" };
   }
-  if (!hasSupportedBody(postInfo)) {
-    console.error(`本文の形式が想定と違うため取り込みませんでした
+  if (!postInfo.body) {
+    console.log(`本文がありませんでした
+feeRequired: ${postInfo.feeRequired}@${postInfo.id}`);
+    return { status: "unavailable", reason: "missing-body" };
+  }
+  switch (postInfo.type) {
+    case "image":
+    case "file":
+    case "article":
+    case "text":
+      break;
+    default:
+      console.error(`未知の投稿タイプのため取り込みませんでした
 ${postInfo.type}@${postInfo.id}`);
-    return "invalid";
+      return { status: "unsupported", postId: postInfo.id, type: postInfo.type };
+  }
+  const missing = checkBody(postInfo);
+  if (missing.length > 0) {
+    console.error(`本文の形式が想定と違うため取り込みませんでした
+${postInfo.type}@${postInfo.id} missing: ${missing.join(", ")}`);
+    return { status: "invalid", postId: postInfo.id, type: postInfo.type, missing };
   }
   const postName = postInfo.title;
   const postObject = downloadManage.downloadObject.addPost(postName);
@@ -202,13 +253,6 @@ ${DownloadManage.utils.escapeHtml(urlEmbedInfo.html)}
       postObject.setHtml(header + body);
       break;
     }
-    default:
-      parsedText = `不明なタイプ
-${postInfo.type}@${postInfo.id}
-`;
-      console.log(`不明なタイプ
-${postInfo.type}@${postInfo.id}`);
-      break;
   }
   const informationObject = {
     postId: postInfo.id,
@@ -231,7 +275,7 @@ parsedText:
 ${parsedText}`);
   }
   downloadManage.decrementLimit();
-  return "added";
+  return { status: "added" };
 }
 export function convertImageMap(imageMap, blocks) {
   const imageOrder = blocks.filter((it) => it.type === "image").map((it) => it.imageId);

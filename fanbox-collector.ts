@@ -246,50 +246,103 @@ export class DownloadManage {
 
 /**
  * addByPostInfo の処理結果
- * 呼び出し側が「意図した除外」と「取れなかった投稿」を区別できるようにするための戻り値。
- * 一括して読み飛ばすと、本文の在り処が変わったときに全投稿が無言で消えても気付けない。
+ * 呼び出し側が「意図した除外」と「取れなかった投稿」、および取れなかった理由を
+ * 区別できるようにするための判別可能な戻り値。文字列 1 個への集約だと、呼び出し側が
+ * 理由ごとに別対応 (継続 / 中断 / 表示の出し分け) をしたくても情報が足りない。
  */
 export type AddPostResult =
   /** 取り込んだ */
-  | 'added'
+  | { status: 'added' }
   /** isIgnoreFree の設定により意図的に除外した */
-  | 'ignored'
-  /** 本文が無い (支援額が足りない、または本文の在り処が変わった) */
-  | 'unavailable'
-  /** 本文の形式が想定と違う */
-  | 'invalid';
+  | { status: 'ignored' }
+  /** 本文を取り込めなかった。reason で理由を区別する */
+  | {
+      status: 'unavailable';
+      /**
+       * 'restricted': 一覧時点で isRestricted だった (支援額不足など、正常系でも起こりうる)
+       * 'missing-body': isRestricted ではないのに本文が無い、または postInfo 自体が取得できなかった。
+       *   一覧で unrestricted だった投稿の本文欠落は構造的な不一致の疑いがあるが、
+       *   ここでは isRestricted の有無以上の判別材料を持たないため 'missing-body' に丸める
+       */
+      reason: 'restricted' | 'missing-body';
+    }
+  /** 既知の投稿タイプだが、本文の必要フィールドが揃っていない (構造的な不一致) */
+  | { status: 'invalid'; postId: string; type: string; missing: string[] }
+  /** 未知の投稿タイプ。本文を読めないので取り込めないが、収集全体は中断しない */
+  | { status: 'unsupported'; postId: string; type: string };
 
-function isRecord(value: unknown): boolean {
-  return typeof value === 'object' && value !== null;
+/** postInfo.body の中で addByPostInfo が実際に処理できる投稿タイプ */
+type KnownPostType = 'image' | 'file' | 'article' | 'text';
+
+/** 配列ではないオブジェクトか (Record として扱ってよいか) を判定する。配列は isRecord ではない */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isImageInfo(value: unknown): value is ImageInfo {
+  return (
+    isRecord(value) &&
+    typeof (value as { originalUrl?: unknown }).originalUrl === 'string' &&
+    typeof (value as { extension?: unknown }).extension === 'string'
+  );
+}
+
+function isFileInfo(value: unknown): value is FileInfo {
+  return (
+    isRecord(value) &&
+    typeof (value as { url?: unknown }).url === 'string' &&
+    typeof (value as { name?: unknown }).name === 'string' &&
+    typeof (value as { extension?: unknown }).extension === 'string'
+  );
 }
 
 /**
- * 投稿タイプごとに、本文の取り込みで実際に触るフィールドが揃っているかを検査する。
+ * article の block を検証する。type だけが全 block 共通で参照されるフィールドで、
+ * 'p' / 'header' はさらに text を DownloadUtils.escapeHtml に直接渡すため
+ * (非文字列を渡すと String.prototype.replace が無く例外になる)、その 2 種のみ text も見る。
+ * embed / url_embed / 未知の block type は該当データが無ければ JSON.stringify や
+ * デフォルト分岐で吸収され例外にならないため、ここでは検証しない。
+ */
+function isValidBlock(value: unknown): boolean {
+  if (!isRecord(value) || typeof value.type !== 'string') return false;
+  if (value.type === 'p' || value.type === 'header') {
+    return typeof (value as { text?: unknown }).text === 'string';
+  }
+  return true;
+}
+
+/**
+ * 投稿タイプごとに、本文の取り込みで実際に触るフィールドを検査し、欠けているものを返す。
  *
  * addByPostInfo は投稿を downloadObject に登録してから本文を触るため、途中で例外になると
  * 空の投稿が出力に残り、取得件数上限の減算も飛ばされる。登録前にここで弾いて
- * その状態を作らせない。未知タイプは本文を触らないので検査しない。
+ * その状態を作らせない。呼び出し側は addByPostInfo が既知タイプと確認した後にのみ呼ぶため、
+ * 未知タイプはここに来ない。
  */
-function hasSupportedBody(postInfo: PostInfo): boolean {
+function checkBody(postInfo: PostInfo & { type: KnownPostType }): string[] {
   const body = postInfo.body as Record<string, unknown>;
+  const missing: string[] = [];
   switch (postInfo.type) {
     case 'image':
-      return Array.isArray(body.images) && typeof body.text === 'string';
+      if (!Array.isArray(body.images) || !body.images.every(isImageInfo)) missing.push('body.images');
+      if (typeof body.text !== 'string') missing.push('body.text');
+      break;
     case 'file':
-      return Array.isArray(body.files) && typeof body.text === 'string';
+      if (!Array.isArray(body.files) || !body.files.every(isFileInfo)) missing.push('body.files');
+      if (typeof body.text !== 'string') missing.push('body.text');
+      break;
     case 'article':
-      return (
-        Array.isArray(body.blocks) &&
-        isRecord(body.imageMap) &&
-        isRecord(body.fileMap) &&
-        isRecord(body.embedMap) &&
-        isRecord(body.urlEmbedMap)
-      );
+      if (!Array.isArray(body.blocks) || !body.blocks.every(isValidBlock)) missing.push('body.blocks');
+      if (!isRecord(body.imageMap) || !Object.values(body.imageMap).every(isImageInfo)) missing.push('body.imageMap');
+      if (!isRecord(body.fileMap) || !Object.values(body.fileMap).every(isFileInfo)) missing.push('body.fileMap');
+      if (!isRecord(body.embedMap)) missing.push('body.embedMap');
+      if (!isRecord(body.urlEmbedMap)) missing.push('body.urlEmbedMap');
+      break;
     case 'text':
-      return typeof body.text === 'string';
-    default:
-      return true;
+      if (typeof body.text !== 'string') missing.push('body.text');
+      break;
   }
+  return missing;
 }
 
 /**
@@ -300,18 +353,40 @@ function hasSupportedBody(postInfo: PostInfo): boolean {
  */
 export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | undefined): AddPostResult {
   if (!postInfo) {
-    return 'unavailable';
+    // postInfo 自体が無い場合は isRestricted も分からないため missing-body に丸める
+    return { status: 'unavailable', reason: 'missing-body' };
   }
   if (downloadManage.isIgnoreFree && postInfo.feeRequired === 0) {
-    return 'ignored';
+    return { status: 'ignored' };
   }
-  if (!postInfo.body || postInfo.isRestricted) {
+  if (postInfo.isRestricted) {
+    // isRestricted は一覧/詳細どちらの API も返す既知のフィールドなので、reason として確定できる
     console.log(`取得できませんでした(支援がたりない？)\nfeeRequired: ${postInfo.feeRequired}@${postInfo.id}`);
-    return 'unavailable';
+    return { status: 'unavailable', reason: 'restricted' };
   }
-  if (!hasSupportedBody(postInfo)) {
-    console.error(`本文の形式が想定と違うため取り込みませんでした\n${postInfo.type}@${postInfo.id}`);
-    return 'invalid';
+  if (!postInfo.body) {
+    console.log(`本文がありませんでした\nfeeRequired: ${postInfo.feeRequired}@${postInfo.id}`);
+    return { status: 'unavailable', reason: 'missing-body' };
+  }
+  // switch の discriminant として type を直接比較することで、以降のコードで
+  // postInfo.type が KnownPostType (image/file/article/text) に絞り込まれた状態を
+  // TypeScript に伝える (ヘルパー関数越しの判定では絞り込みが postInfo 全体に伝播しない)
+  switch (postInfo.type) {
+    case 'image':
+    case 'file':
+    case 'article':
+    case 'text':
+      break;
+    default:
+      console.error(`未知の投稿タイプのため取り込みませんでした\n${postInfo.type}@${postInfo.id}`);
+      return { status: 'unsupported', postId: postInfo.id, type: postInfo.type };
+  }
+  const missing = checkBody(postInfo);
+  if (missing.length > 0) {
+    console.error(
+      `本文の形式が想定と違うため取り込みませんでした\n${postInfo.type}@${postInfo.id} missing: ${missing.join(', ')}`,
+    );
+    return { status: 'invalid', postId: postInfo.id, type: postInfo.type, missing };
   }
   const postName = postInfo.title;
   const postObject = downloadManage.downloadObject.addPost(postName);
@@ -430,10 +505,8 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
       postObject.setHtml(header + body);
       break;
     }
-    default:
-      parsedText = `不明なタイプ\n${postInfo.type}@${postInfo.id}\n`;
-      console.log(`不明なタイプ\n${postInfo.type}@${postInfo.id}`);
-      break;
+    // 未知タイプは手前の switch で既に unsupported として返しているため、
+    // ここに来た時点で postInfo.type は KnownPostType の 4 種のいずれかに絞り込まれている
   }
 
   const informationObject = {
@@ -456,7 +529,7 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
     postObject.setInfo(`${exportInfoText}\nparsedText:\n${parsedText}`);
   }
   downloadManage.decrementLimit();
-  return 'added';
+  return { status: 'added' };
 }
 
 export function convertImageMap(imageMap: Record<string, ImageInfo>, blocks: Block[]): ImageInfo[] {
