@@ -1519,21 +1519,44 @@ describe('ZipWriter', () => {
     // Streams 仕様は abort() が保留中の write() を必ず reject することを保証しない。
     // write() 自体が正常に resolve してしまうケースでも、addFile / addDirectory が abort 後に
     // 「書けた」まま成功として resolve してはならない。
-    test('addFile: 最終 write() の実行中に abort() を呼び、write 自体は正常 resolve しても addFile は reject される', async () => {
+    //
+    // 以下の 2 テストは write() 内部の post-await state チェック (Issue #17 フォローアップ) を、
+    // entries.push() 直前の assertStillOpen とは切り離して検証する。もし最後の write を pending にして
+    // abort すると、write() 内チェックを外しても assertStillOpen (entries.push 直前) が同じ state 変化を
+    // 検出してしまい reject 自体は起きるため、reject の有無だけでは write() 内チェックの有無を区別できない
+    // (実際に確認済み: write() 内チェックだけを外しても、この作り方のテストは通ってしまう)。
+    // そこで 1 回目の write (header) を pending にして abort し、write() 内チェックが機能していれば
+    // 「1 回目の write が resolve した直後に例外が投げられ、2 回目以降の write() には一切進まない」ことを
+    // writeCallCount で検証する。write() 内チェックが無ければ (assertStillOpen だけが残っていれば)、
+    // abort 後も write #2 (・#3) まで進んでから reject される。
+    //
+    // abort() は「対象の write が実際に mock.write に到達し、pending になった後」まで待ってから呼ぶ必要が
+    // ある。addFilePromise を await せずに zip.abort(...) を先に await してしまうと、addFile 側の
+    // await チェーンがどこまで進んでいるかの保証がなく、対象の write にまだ到達していない状態で abort()
+    // の完了を待つことになりうる。その場合 resolve 用コールバックはまだ未代入 (undefined) で
+    // `resolve?.()` が no-op になり、対象の write が永遠に pending のまま addFilePromise が settle せず、
+    // テストが hang する。そのため、mock.write が対象の呼び出しに到達したことを示す reached を待ってから
+    // abort する。
+    test('addFile: 1 回目の write() 実行中に abort() を呼び、write 自体は正常 resolve しても以降の write() には進まず reject される (write() 内チェック)', async () => {
       const mock = new MockWritableStream();
       let abortCalls = 0;
       let writeCallCount = 0;
-      let resolveLastWrite: (() => void) | undefined;
+      let resolveFirstWrite: (() => void) | undefined;
+      let notifyFirstWriteReached: (() => void) | undefined;
+      const firstWriteReached = new Promise<void>((resolve) => {
+        notifyFirstWriteReached = resolve;
+      });
       const originalWrite = mock.write.bind(mock);
       const originalAbort = mock.abort.bind(mock);
 
       mock.write = async (data: Uint8Array) => {
         writeCallCount++;
-        if (writeCallCount === 3) {
-          // 最後の write (ファイル本体データ。日時なしなので header → name → data の 3 回) だけ
-          // 明示的に解放するまで pending にする
+        if (writeCallCount === 1) {
+          // 1 回目の write (Local File Header) に到達したことを知らせてから、明示的に解放するまで
+          // pending にする
+          notifyFirstWriteReached?.();
           await new Promise<void>((resolve) => {
-            resolveLastWrite = resolve;
+            resolveFirstWrite = resolve;
           });
         }
         await originalWrite(data);
@@ -1546,31 +1569,41 @@ describe('ZipWriter', () => {
       };
 
       const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
-      const addFilePromise = zip.addFile('a.txt', encoder.encode('x')); // await しない (3 回目の write() で pending)
+      const addFilePromise = zip.addFile('a.txt', encoder.encode('x')); // await しない (1 回目の write() で pending)
 
+      // 1 回目の write が実際に pending になるまで待ってから abort する
+      await firstWriteReached;
       await zip.abort(new Error('外部からの abort'));
 
-      // write() 自体は (abort による reject ではなく) 正常に resolve させる
-      resolveLastWrite?.();
+      // write() 自体は (abort による reject ではなく) 正常に resolve させる。これにより write() 内部の
+      // `await this.writable.write(data)` の直後にある state チェックが発火することを検証する。
+      resolveFirstWrite?.();
 
       await expect(addFilePromise).rejects.toThrow();
+      // write() 内チェックが機能していれば、1 回目の write の直後に例外が投げられ、
+      // 2 回目以降 (name / data) の write() には一切進まない
+      expect(writeCallCount).toBe(1);
       expect(abortCalls).toBe(1); // addFile 自身の catch が二重に abort していない
     });
 
-    test('addDirectory: 最終 write() の実行中に abort() を呼び、write 自体は正常 resolve しても addDirectory は reject される', async () => {
+    test('addDirectory: 1 回目の write() 実行中に abort() を呼び、write 自体は正常 resolve しても以降の write() には進まず reject される (write() 内チェック)', async () => {
       const mock = new MockWritableStream();
       let abortCalls = 0;
       let writeCallCount = 0;
-      let resolveLastWrite: (() => void) | undefined;
+      let resolveFirstWrite: (() => void) | undefined;
+      let notifyFirstWriteReached: (() => void) | undefined;
+      const firstWriteReached = new Promise<void>((resolve) => {
+        notifyFirstWriteReached = resolve;
+      });
       const originalWrite = mock.write.bind(mock);
       const originalAbort = mock.abort.bind(mock);
 
       mock.write = async (data: Uint8Array) => {
         writeCallCount++;
-        if (writeCallCount === 2) {
-          // 最後の write (エントリ名。日時なしなので header → name の 2 回) だけ pending にする
+        if (writeCallCount === 1) {
+          notifyFirstWriteReached?.();
           await new Promise<void>((resolve) => {
-            resolveLastWrite = resolve;
+            resolveFirstWrite = resolve;
           });
         }
         await originalWrite(data);
@@ -1581,14 +1614,44 @@ describe('ZipWriter', () => {
       };
 
       const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
-      const addDirectoryPromise = zip.addDirectory('dir'); // await しない (2 回目の write() で pending)
+      const addDirectoryPromise = zip.addDirectory('dir'); // await しない (1 回目の write() で pending)
 
+      await firstWriteReached;
       await zip.abort(new Error('外部からの abort'));
 
-      resolveLastWrite?.();
+      resolveFirstWrite?.();
 
       await expect(addDirectoryPromise).rejects.toThrow();
+      // 1 回目の write (header) の直後に例外が投げられ、2 回目 (name) の write() には進まない
+      expect(writeCallCount).toBe(1);
       expect(abortCalls).toBe(1);
+    });
+
+    /**
+     * ZipWriter.assertStillOpen (private) にアクセスするための最小限の型。
+     * entries.push() 直前のガードは「最後の write() の resolve から push までの間に abort が割り込む」
+     * という 1 tick 未満の窓を防ぐものであり、real timer / real promise だけでその窓に正確に abort を
+     * 差し込む決定的なテストを組むのは非実用的 (write() 自身の post-await チェックが同じ state 変化を
+     * 先に検出してしまい、この窓だけを独立に再現できない)。そのため、ガード自体の入出力をユニットレベルで
+     * 直接検証する (state が 'open' でなければ確実に例外を投げること)。
+     */
+    type ZipWriterInternals = {
+      state: 'open' | 'closed' | 'failed';
+      assertStillOpen: (method: 'addFile' | 'addDirectory') => void;
+    };
+
+    test('assertStillOpen: state が "open" なら通過し、"open" でなければ例外を投げる (entries.push 直前ガードの単体検証)', () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream) as unknown as ZipWriterInternals;
+
+      // ガードが無いと通ってしまう入力: state が 'open' のときは通過する (誤検知しないことの確認)
+      expect(() => zip.assertStillOpen('addFile')).not.toThrow();
+      expect(() => zip.assertStillOpen('addDirectory')).not.toThrow();
+
+      // ガードが無いと通ってしまう入力: state が abort によって 'failed' に遷移した後は拒否する
+      zip.state = 'failed';
+      expect(() => zip.assertStillOpen('addFile')).toThrow();
+      expect(() => zip.assertStillOpen('addDirectory')).toThrow();
     });
   });
 
