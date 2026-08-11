@@ -1368,10 +1368,15 @@ export class DownloadHelper {
 
   /**
    * ZIPでダウンロード
+   *
+   * progress / log / remainTime は同期コールバック限定である。戻り値型が void のため async 関数も
+   * 型上は渡せてしまうが、呼び出しを await しないので、返された Promise の rejection はこのメソッドの
+   * catch (ストリームの abort) に到達せず、未処理 rejection のまま ZIP 生成が継続する。
+   * 同期的に throw した場合は catch に入り、書き込み途中ならストリームを abort して再スローする。
    * @param downloadObj ダウンロード対象オブジェクト
-   * @param progress 進捗率出力関数
-   * @param log ログ出力関数
-   * @param remainTime 終了予測出力関数
+   * @param progress 進捗率出力関数 (同期)
+   * @param log ログ出力関数 (同期)
+   * @param remainTime 終了予測出力関数 (同期)
    * @param options handle/signal/fetchFile を差し替えるためのオプション (省略時は従来どおりの挙動)
    */
   async downloadZip(
