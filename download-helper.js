@@ -433,131 +433,159 @@ export class ZipWriter {
   offset = 0;
   entries = [];
   encoder = new TextEncoder;
+  aborted = false;
   constructor(writable) {
     this.writable = writable;
   }
   async addFile(name, data, date) {
-    const bytes = data.buffer instanceof ArrayBuffer ? data : new Uint8Array(data);
-    const nameBytes = this.encoder.encode(name);
-    const fileCrc = crc32(bytes);
-    const localHeaderOffset = this.offset;
-    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
-    const header = new ArrayBuffer(30);
-    const view = new DataView(header);
-    view.setUint32(0, 67324752, true);
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 2048, true);
-    view.setUint16(8, 0, true);
-    view.setUint16(10, dosTime, true);
-    view.setUint16(12, dosDate, true);
-    view.setUint32(14, fileCrc, true);
-    view.setUint32(18, bytes.length, true);
-    view.setUint32(22, bytes.length, true);
-    view.setUint16(26, nameBytes.length, true);
-    view.setUint16(28, extraLfh.length, true);
-    await this.write(new Uint8Array(header));
-    await this.write(nameBytes);
-    if (extraLfh.length > 0)
-      await this.write(extraLfh);
-    await this.write(bytes);
-    this.entries.push({
-      name: nameBytes,
-      crc: fileCrc,
-      size: bytes.length,
-      offset: localHeaderOffset,
-      dosTime,
-      dosDate,
-      extraCd,
-      externalAttr: 0
-    });
+    try {
+      assertValidZipEntryName(name, "addFile");
+      const bytes = data.buffer instanceof ArrayBuffer ? data : new Uint8Array(data);
+      const nameBytes = this.encoder.encode(name);
+      const fileCrc = crc32(bytes);
+      const localHeaderOffset = this.offset;
+      const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+      const header = new ArrayBuffer(30);
+      const view = new DataView(header);
+      view.setUint32(0, 67324752, true);
+      view.setUint16(4, 20, true);
+      view.setUint16(6, 2048, true);
+      view.setUint16(8, 0, true);
+      view.setUint16(10, dosTime, true);
+      view.setUint16(12, dosDate, true);
+      view.setUint32(14, fileCrc, true);
+      view.setUint32(18, bytes.length, true);
+      view.setUint32(22, bytes.length, true);
+      view.setUint16(26, nameBytes.length, true);
+      view.setUint16(28, extraLfh.length, true);
+      await this.write(new Uint8Array(header));
+      await this.write(nameBytes);
+      if (extraLfh.length > 0)
+        await this.write(extraLfh);
+      await this.write(bytes);
+      this.entries.push({
+        name: nameBytes,
+        crc: fileCrc,
+        size: bytes.length,
+        offset: localHeaderOffset,
+        dosTime,
+        dosDate,
+        extraCd,
+        externalAttr: 0
+      });
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
+    }
   }
   async addDirectory(name, date) {
-    const dirName = name.endsWith("/") ? name : `${name}/`;
-    if (dirName.startsWith("/")) {
-      throw new Error(`addDirectory: name must not be empty or start with "/": ${JSON.stringify(name)}`);
+    try {
+      const dirName = name.endsWith("/") ? name : `${name}/`;
+      assertValidZipEntryName(dirName, "addDirectory");
+      const nameBytes = this.encoder.encode(dirName);
+      const localHeaderOffset = this.offset;
+      const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+      const header = new ArrayBuffer(30);
+      const view = new DataView(header);
+      view.setUint32(0, 67324752, true);
+      view.setUint16(4, 20, true);
+      view.setUint16(6, 2048, true);
+      view.setUint16(8, 0, true);
+      view.setUint16(10, dosTime, true);
+      view.setUint16(12, dosDate, true);
+      view.setUint32(14, 0, true);
+      view.setUint32(18, 0, true);
+      view.setUint32(22, 0, true);
+      view.setUint16(26, nameBytes.length, true);
+      view.setUint16(28, extraLfh.length, true);
+      await this.write(new Uint8Array(header));
+      await this.write(nameBytes);
+      if (extraLfh.length > 0)
+        await this.write(extraLfh);
+      this.entries.push({
+        name: nameBytes,
+        crc: 0,
+        size: 0,
+        offset: localHeaderOffset,
+        dosTime,
+        dosDate,
+        extraCd,
+        externalAttr: 16
+      });
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
     }
-    const nameBytes = this.encoder.encode(dirName);
-    const localHeaderOffset = this.offset;
-    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
-    const header = new ArrayBuffer(30);
-    const view = new DataView(header);
-    view.setUint32(0, 67324752, true);
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 2048, true);
-    view.setUint16(8, 0, true);
-    view.setUint16(10, dosTime, true);
-    view.setUint16(12, dosDate, true);
-    view.setUint32(14, 0, true);
-    view.setUint32(18, 0, true);
-    view.setUint32(22, 0, true);
-    view.setUint16(26, nameBytes.length, true);
-    view.setUint16(28, extraLfh.length, true);
-    await this.write(new Uint8Array(header));
-    await this.write(nameBytes);
-    if (extraLfh.length > 0)
-      await this.write(extraLfh);
-    this.entries.push({
-      name: nameBytes,
-      crc: 0,
-      size: 0,
-      offset: localHeaderOffset,
-      dosTime,
-      dosDate,
-      extraCd,
-      externalAttr: 16
-    });
   }
   async close() {
-    const cdOffset = this.offset;
-    for (const entry of this.entries) {
-      const cdHeader = new ArrayBuffer(46);
-      const view = new DataView(cdHeader);
-      view.setUint32(0, 33639248, true);
-      view.setUint16(4, 20, true);
-      view.setUint16(6, 20, true);
-      view.setUint16(8, 2048, true);
-      view.setUint16(10, 0, true);
-      view.setUint16(12, entry.dosTime, true);
-      view.setUint16(14, entry.dosDate, true);
-      view.setUint32(16, entry.crc, true);
-      view.setUint32(20, entry.size, true);
-      view.setUint32(24, entry.size, true);
-      view.setUint16(28, entry.name.length, true);
-      view.setUint16(30, entry.extraCd.length, true);
-      view.setUint16(32, 0, true);
-      view.setUint16(34, 0, true);
-      view.setUint16(36, 0, true);
-      view.setUint32(38, entry.externalAttr, true);
-      view.setUint32(42, entry.offset, true);
-      await this.write(new Uint8Array(cdHeader));
-      await this.write(entry.name);
-      if (entry.extraCd.length > 0)
-        await this.write(entry.extraCd);
+    try {
+      const cdOffset = this.offset;
+      for (const entry of this.entries) {
+        const cdHeader = new ArrayBuffer(46);
+        const view = new DataView(cdHeader);
+        view.setUint32(0, 33639248, true);
+        view.setUint16(4, 20, true);
+        view.setUint16(6, 20, true);
+        view.setUint16(8, 2048, true);
+        view.setUint16(10, 0, true);
+        view.setUint16(12, entry.dosTime, true);
+        view.setUint16(14, entry.dosDate, true);
+        view.setUint32(16, entry.crc, true);
+        view.setUint32(20, entry.size, true);
+        view.setUint32(24, entry.size, true);
+        view.setUint16(28, entry.name.length, true);
+        view.setUint16(30, entry.extraCd.length, true);
+        view.setUint16(32, 0, true);
+        view.setUint16(34, 0, true);
+        view.setUint16(36, 0, true);
+        view.setUint32(38, entry.externalAttr, true);
+        view.setUint32(42, entry.offset, true);
+        await this.write(new Uint8Array(cdHeader));
+        await this.write(entry.name);
+        if (entry.extraCd.length > 0)
+          await this.write(entry.extraCd);
+      }
+      const cdSize = this.offset - cdOffset;
+      const eocd = new ArrayBuffer(22);
+      const eocdView = new DataView(eocd);
+      eocdView.setUint32(0, 101010256, true);
+      eocdView.setUint16(4, 0, true);
+      eocdView.setUint16(6, 0, true);
+      eocdView.setUint16(8, this.entries.length, true);
+      eocdView.setUint16(10, this.entries.length, true);
+      eocdView.setUint32(12, cdSize, true);
+      eocdView.setUint32(16, cdOffset, true);
+      eocdView.setUint16(20, 0, true);
+      await this.write(new Uint8Array(eocd));
+      await this.writable.close();
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
     }
-    const cdSize = this.offset - cdOffset;
-    const eocd = new ArrayBuffer(22);
-    const eocdView = new DataView(eocd);
-    eocdView.setUint32(0, 101010256, true);
-    eocdView.setUint16(4, 0, true);
-    eocdView.setUint16(6, 0, true);
-    eocdView.setUint16(8, this.entries.length, true);
-    eocdView.setUint16(10, this.entries.length, true);
-    eocdView.setUint32(12, cdSize, true);
-    eocdView.setUint32(16, cdOffset, true);
-    eocdView.setUint16(20, 0, true);
-    await this.write(new Uint8Array(eocd));
-    await this.writable.close();
   }
   async write(data) {
     await this.writable.write(data);
     this.offset += data.length;
   }
+  async abortOnFailure(reason) {
+    if (this.aborted)
+      return;
+    this.aborted = true;
+    try {
+      await this.writable.abort(reason);
+    } catch {}
+  }
 }
 function isValidPathSegment(value) {
   return typeof value === "string" && value.length > 0 && value !== "." && value !== ".." && !/[/\\:]/.test(value);
 }
-function isValidFileNameSegment(name) {
-  return name.length > 0 && name !== "." && name !== "..";
+function assertValidZipEntryName(name, method) {
+  const withoutTrailingSlash = name.endsWith("/") ? name.slice(0, -1) : name;
+  for (const segment of withoutTrailingSlash.split("/")) {
+    if (!isValidPathSegment(segment)) {
+      throw new Error(`ZipWriter.${method}: 不正な ZIP エントリ名です (${JSON.stringify(name)})`);
+    }
+  }
 }
 function pad2(n) {
   return `00${n}`.slice(-2);
@@ -711,11 +739,11 @@ export class DownloadHelper {
         throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
       }
       seenEncodedNames.add(post.encodedName);
-      if (post.cover !== undefined && !isValidFileNameSegment(post.cover.name)) {
+      if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
         throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
       }
       for (const file of post.files) {
-        if (!isValidFileNameSegment(file.encodedName)) {
+        if (!isValidPathSegment(file.encodedName)) {
           throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
         }
       }

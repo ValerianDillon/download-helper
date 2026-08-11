@@ -743,6 +743,8 @@ export class ZipWriter {
     externalAttr: number;
   }[] = [];
   private encoder = new TextEncoder();
+  /** writable に対して abort 済みかどうか。二重 abort を避けるためのフラグ (Issue #17) */
+  private aborted = false;
 
   constructor(writable: FileSystemWritableFileStream) {
     this.writable = writable;
@@ -756,50 +758,60 @@ export class ZipWriter {
    *   省略または Invalid Date の場合は従来挙動 (DOS 0、extra field なし) でバイト列を維持する。
    *   1980-01-01 〜 2107-12-31 23:59:58 にクランプ。Extended Timestamp は clamp 後の Unix time が
    *   signed int32 範囲に収まる場合のみ書く。
+   * @throws {Error} name をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "/" "\" ":" を
+   *   含むセグメントがある場合。downloadZip 側でも同じ検証を行うが、addFile を直接呼ぶ利用者を
+   *   無防備にしないための多層防御として ZipWriter 自身にも検証を持たせている (Issue #17)
    */
   async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
-    // 公開 API なので引数は Uint8Array のまま受ける。File System Access API の write は
-    // ArrayBuffer backed しか受け付けないので、SharedArrayBuffer backed ならコピーして揃える。
-    const bytes: Uint8Array<ArrayBuffer> =
-      data.buffer instanceof ArrayBuffer ? (data as Uint8Array<ArrayBuffer>) : new Uint8Array(data);
-    // TextEncoder.encode は常に新しい ArrayBuffer を確保する (TypeScript 5.7 未満では
-    // 戻り値が ArrayBufferLike 扱いになるためアサーションで補う)
-    const nameBytes = this.encoder.encode(name) as Uint8Array<ArrayBuffer>;
-    const fileCrc = crc32(bytes);
-    const localHeaderOffset = this.offset;
+    try {
+      assertValidZipEntryName(name, 'addFile');
 
-    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+      // 公開 API なので引数は Uint8Array のまま受ける。File System Access API の write は
+      // ArrayBuffer backed しか受け付けないので、SharedArrayBuffer backed ならコピーして揃える。
+      const bytes: Uint8Array<ArrayBuffer> =
+        data.buffer instanceof ArrayBuffer ? (data as Uint8Array<ArrayBuffer>) : new Uint8Array(data);
+      // TextEncoder.encode は常に新しい ArrayBuffer を確保する (TypeScript 5.7 未満では
+      // 戻り値が ArrayBufferLike 扱いになるためアサーションで補う)
+      const nameBytes = this.encoder.encode(name) as Uint8Array<ArrayBuffer>;
+      const fileCrc = crc32(bytes);
+      const localHeaderOffset = this.offset;
 
-    // Local File Header (30 bytes + name length + extra field length)
-    const header = new ArrayBuffer(30);
-    const view = new DataView(header);
-    view.setUint32(0, 0x04034b50, true); // signature
-    view.setUint16(4, 20, true); // version needed (2.0)
-    view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
-    view.setUint16(8, 0, true); // compression method (stored)
-    view.setUint16(10, dosTime, true); // mod time
-    view.setUint16(12, dosDate, true); // mod date
-    view.setUint32(14, fileCrc, true); // crc-32
-    view.setUint32(18, bytes.length, true); // compressed size
-    view.setUint32(22, bytes.length, true); // uncompressed size
-    view.setUint16(26, nameBytes.length, true); // file name length
-    view.setUint16(28, extraLfh.length, true); // extra field length
+      const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
 
-    await this.write(new Uint8Array(header));
-    await this.write(nameBytes);
-    if (extraLfh.length > 0) await this.write(extraLfh);
-    await this.write(bytes);
+      // Local File Header (30 bytes + name length + extra field length)
+      const header = new ArrayBuffer(30);
+      const view = new DataView(header);
+      view.setUint32(0, 0x04034b50, true); // signature
+      view.setUint16(4, 20, true); // version needed (2.0)
+      view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
+      view.setUint16(8, 0, true); // compression method (stored)
+      view.setUint16(10, dosTime, true); // mod time
+      view.setUint16(12, dosDate, true); // mod date
+      view.setUint32(14, fileCrc, true); // crc-32
+      view.setUint32(18, bytes.length, true); // compressed size
+      view.setUint32(22, bytes.length, true); // uncompressed size
+      view.setUint16(26, nameBytes.length, true); // file name length
+      view.setUint16(28, extraLfh.length, true); // extra field length
 
-    this.entries.push({
-      name: nameBytes,
-      crc: fileCrc,
-      size: bytes.length,
-      offset: localHeaderOffset,
-      dosTime,
-      dosDate,
-      extraCd,
-      externalAttr: 0,
-    });
+      await this.write(new Uint8Array(header));
+      await this.write(nameBytes);
+      if (extraLfh.length > 0) await this.write(extraLfh);
+      await this.write(bytes);
+
+      this.entries.push({
+        name: nameBytes,
+        crc: fileCrc,
+        size: bytes.length,
+        offset: localHeaderOffset,
+        dosTime,
+        dosDate,
+        extraCd,
+        externalAttr: 0,
+      });
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
+    }
   }
 
   /**
@@ -807,50 +819,56 @@ export class ZipWriter {
    * @param name ZIP 内のディレクトリパス (UTF-8)。末尾が `/` でなければ自動的に付与する
    * @param date 任意。addFile と同一の日時ロジック (DOS time/date + NTFS Extra + Extended Timestamp) を適用する。
    *   省略または Invalid Date の場合は DOS time/date = 0、extra field なし
-   * @throws {Error} 正規化後の名前が `/` になる (name が空文字列)、または先頭が `/` の場合。
+   * @throws {Error} 正規化後の名前をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を
+   *   含むセグメントがある場合 (name が空文字列、または先頭が `/` の場合を含む)。
    *   APPNOTE 4.4.17.1 が ZIP 内のパスを相対パスに限り、先頭 `/` を禁じるため。
-   *   drive letter (`C:/dir`) や `\` 区切りは検証しない (addFile と非対称にしないため。呼び出し側の事前条件とする)
+   *   addFile と同じ検証をセグメント単位で適用するため、drive letter (`C:/dir`) や `\` 区切りも拒否する
+   *   (Issue #14 時点では addFile と非対称にしないため未検証としていたが、Issue #17 で addFile 側にも
+   *   検証を追加したため、この非対称は解消されている)
    */
   async addDirectory(name: string, date?: Date): Promise<void> {
-    const dirName = name.endsWith('/') ? name : `${name}/`;
-    if (dirName.startsWith('/')) {
-      throw new Error(`addDirectory: name must not be empty or start with "/": ${JSON.stringify(name)}`);
+    try {
+      const dirName = name.endsWith('/') ? name : `${name}/`;
+      assertValidZipEntryName(dirName, 'addDirectory');
+
+      const nameBytes = this.encoder.encode(dirName) as Uint8Array<ArrayBuffer>;
+      const localHeaderOffset = this.offset;
+
+      const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
+
+      // Local File Header (30 bytes + name length + extra field length)。CRC / size は常に 0、データ本体は書かない
+      const header = new ArrayBuffer(30);
+      const view = new DataView(header);
+      view.setUint32(0, 0x04034b50, true); // signature
+      view.setUint16(4, 20, true); // version needed (2.0)
+      view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
+      view.setUint16(8, 0, true); // compression method (stored)
+      view.setUint16(10, dosTime, true); // mod time
+      view.setUint16(12, dosDate, true); // mod date
+      view.setUint32(14, 0, true); // crc-32
+      view.setUint32(18, 0, true); // compressed size
+      view.setUint32(22, 0, true); // uncompressed size
+      view.setUint16(26, nameBytes.length, true); // file name length
+      view.setUint16(28, extraLfh.length, true); // extra field length
+
+      await this.write(new Uint8Array(header));
+      await this.write(nameBytes);
+      if (extraLfh.length > 0) await this.write(extraLfh);
+
+      this.entries.push({
+        name: nameBytes,
+        crc: 0,
+        size: 0,
+        offset: localHeaderOffset,
+        dosTime,
+        dosDate,
+        extraCd,
+        externalAttr: 0x10, // FILE_ATTRIBUTE_DIRECTORY
+      });
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
     }
-
-    const nameBytes = this.encoder.encode(dirName) as Uint8Array<ArrayBuffer>;
-    const localHeaderOffset = this.offset;
-
-    const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
-
-    // Local File Header (30 bytes + name length + extra field length)。CRC / size は常に 0、データ本体は書かない
-    const header = new ArrayBuffer(30);
-    const view = new DataView(header);
-    view.setUint32(0, 0x04034b50, true); // signature
-    view.setUint16(4, 20, true); // version needed (2.0)
-    view.setUint16(6, 0x0800, true); // general purpose bit flag (bit 11 = UTF-8)
-    view.setUint16(8, 0, true); // compression method (stored)
-    view.setUint16(10, dosTime, true); // mod time
-    view.setUint16(12, dosDate, true); // mod date
-    view.setUint32(14, 0, true); // crc-32
-    view.setUint32(18, 0, true); // compressed size
-    view.setUint32(22, 0, true); // uncompressed size
-    view.setUint16(26, nameBytes.length, true); // file name length
-    view.setUint16(28, extraLfh.length, true); // extra field length
-
-    await this.write(new Uint8Array(header));
-    await this.write(nameBytes);
-    if (extraLfh.length > 0) await this.write(extraLfh);
-
-    this.entries.push({
-      name: nameBytes,
-      crc: 0,
-      size: 0,
-      offset: localHeaderOffset,
-      dosTime,
-      dosDate,
-      extraCd,
-      externalAttr: 0x10, // FILE_ATTRIBUTE_DIRECTORY
-    });
   }
 
   /**
@@ -864,55 +882,79 @@ export class ZipWriter {
    * ディレクトリエントリの追加でエントリ数が「投稿数 + 1」増える分、上限に到達しやすくなる点に留意する。
    */
   async close(): Promise<void> {
-    const cdOffset = this.offset;
+    try {
+      const cdOffset = this.offset;
 
-    for (const entry of this.entries) {
-      const cdHeader = new ArrayBuffer(46);
-      const view = new DataView(cdHeader);
-      view.setUint32(0, 0x02014b50, true); // signature
-      view.setUint16(4, 20, true); // version made by
-      view.setUint16(6, 20, true); // version needed
-      view.setUint16(8, 0x0800, true); // general purpose bit flag (UTF-8)
-      view.setUint16(10, 0, true); // compression method
-      view.setUint16(12, entry.dosTime, true); // mod time
-      view.setUint16(14, entry.dosDate, true); // mod date
-      view.setUint32(16, entry.crc, true); // crc-32
-      view.setUint32(20, entry.size, true); // compressed size
-      view.setUint32(24, entry.size, true); // uncompressed size
-      view.setUint16(28, entry.name.length, true); // file name length
-      view.setUint16(30, entry.extraCd.length, true); // extra field length
-      view.setUint16(32, 0, true); // file comment length
-      view.setUint16(34, 0, true); // disk number start
-      view.setUint16(36, 0, true); // internal file attributes
-      view.setUint32(38, entry.externalAttr, true); // external file attributes
-      view.setUint32(42, entry.offset, true); // local header offset
+      for (const entry of this.entries) {
+        const cdHeader = new ArrayBuffer(46);
+        const view = new DataView(cdHeader);
+        view.setUint32(0, 0x02014b50, true); // signature
+        view.setUint16(4, 20, true); // version made by
+        view.setUint16(6, 20, true); // version needed
+        view.setUint16(8, 0x0800, true); // general purpose bit flag (UTF-8)
+        view.setUint16(10, 0, true); // compression method
+        view.setUint16(12, entry.dosTime, true); // mod time
+        view.setUint16(14, entry.dosDate, true); // mod date
+        view.setUint32(16, entry.crc, true); // crc-32
+        view.setUint32(20, entry.size, true); // compressed size
+        view.setUint32(24, entry.size, true); // uncompressed size
+        view.setUint16(28, entry.name.length, true); // file name length
+        view.setUint16(30, entry.extraCd.length, true); // extra field length
+        view.setUint16(32, 0, true); // file comment length
+        view.setUint16(34, 0, true); // disk number start
+        view.setUint16(36, 0, true); // internal file attributes
+        view.setUint32(38, entry.externalAttr, true); // external file attributes
+        view.setUint32(42, entry.offset, true); // local header offset
 
-      await this.write(new Uint8Array(cdHeader));
-      await this.write(entry.name);
-      if (entry.extraCd.length > 0) await this.write(entry.extraCd);
+        await this.write(new Uint8Array(cdHeader));
+        await this.write(entry.name);
+        if (entry.extraCd.length > 0) await this.write(entry.extraCd);
+      }
+
+      const cdSize = this.offset - cdOffset;
+
+      // End of Central Directory Record (22 bytes)
+      const eocd = new ArrayBuffer(22);
+      const eocdView = new DataView(eocd);
+      eocdView.setUint32(0, 0x06054b50, true); // signature
+      eocdView.setUint16(4, 0, true); // disk number
+      eocdView.setUint16(6, 0, true); // CD disk number
+      eocdView.setUint16(8, this.entries.length, true); // CD entries on this disk
+      eocdView.setUint16(10, this.entries.length, true); // total CD entries
+      eocdView.setUint32(12, cdSize, true); // CD size
+      eocdView.setUint32(16, cdOffset, true); // CD offset
+      eocdView.setUint16(20, 0, true); // comment length
+
+      await this.write(new Uint8Array(eocd));
+      await this.writable.close();
+    } catch (e) {
+      await this.abortOnFailure(e);
+      throw e;
     }
-
-    const cdSize = this.offset - cdOffset;
-
-    // End of Central Directory Record (22 bytes)
-    const eocd = new ArrayBuffer(22);
-    const eocdView = new DataView(eocd);
-    eocdView.setUint32(0, 0x06054b50, true); // signature
-    eocdView.setUint16(4, 0, true); // disk number
-    eocdView.setUint16(6, 0, true); // CD disk number
-    eocdView.setUint16(8, this.entries.length, true); // CD entries on this disk
-    eocdView.setUint16(10, this.entries.length, true); // total CD entries
-    eocdView.setUint32(12, cdSize, true); // CD size
-    eocdView.setUint32(16, cdOffset, true); // CD offset
-    eocdView.setUint16(20, 0, true); // comment length
-
-    await this.write(new Uint8Array(eocd));
-    await this.writable.close();
   }
 
   private async write(data: Uint8Array<ArrayBuffer>): Promise<void> {
     await this.writable.write(data);
     this.offset += data.length;
+  }
+
+  /**
+   * 書き込み中に例外が発生した場合のストリーム cleanup (Issue #17)。
+   * `createWritable()` で得たストリームは、close() を呼ばない限り書き込み先の実ファイルへ反映されない
+   * (File System Access API の仕様上、変更は close() で初めてコミットされる)。
+   * そのため、addFile / addDirectory / close の途中で例外が発生した場合は、
+   * 中途半端な (Central Directory / EOCD を欠いた壊れた) ZIP を実ファイルとしてコミットしてしまわないよう、
+   * close() ではなく abort() でストリームを破棄する。abort() 自体の失敗は元の例外を握りつぶさないよう無視し、
+   * 二重に abort しないよう aborted フラグで一度きりに制限する。
+   */
+  private async abortOnFailure(reason: unknown): Promise<void> {
+    if (this.aborted) return;
+    this.aborted = true;
+    try {
+      await this.writable.abort(reason);
+    } catch {
+      // abort 自体の失敗は元の例外を握りつぶさないよう無視する
+    }
   }
 }
 
@@ -929,9 +971,13 @@ export type DownloadZipOptions = {
 };
 
 /**
- * ZIP パスの 1 セグメントとして安全か検証する (encodedId / post.encodedName 用)
+ * ZIP パスの 1 セグメントとして安全か検証する。
  * 空文字列 / "." / ".." / "/" "\" ":" を含むものを拒否する。
- * post.encodedName は isDownloadJsonObj で型 (string) すら検証されないため、value を unknown として受ける
+ * downloadZip の事前検証 (encodedId / post.encodedName / post.cover.name / file.encodedName) と
+ * ZipWriter.addFile / addDirectory 自体の入力検証 (assertValidZipEntryName 経由) の両方で共有する。
+ * cover.name / file.encodedName はパス区切りを含まない 1 セグメント名である前提のため、
+ * これらにも同じ検証をそのまま適用してよい (Issue #17)。
+ * post.encodedName 等は isDownloadJsonObj で型 (string) すら検証されないため、value を unknown として受ける
  * @internal
  */
 function isValidPathSegment(value: unknown): value is string {
@@ -939,13 +985,24 @@ function isValidPathSegment(value: unknown): value is string {
 }
 
 /**
- * ディレクトリエントリと同名衝突を避けるためのファイル名検証 (post.cover.name / file.encodedName 用)
- * これらは isDownloadJsonObj で型 (string) までは検証済みのため、空文字列 / "." / ".." のみを拒否する
- * (`/` `\` `:` の検証と addFile 自体への入力検証は本 Issue のスコープ外。#17 で扱う)
+ * ZIP エントリ名 (`/` 区切りの複数セグメントパス) の各セグメントを isValidPathSegment で検証する。
+ * ZipWriter.addFile / addDirectory 自体への入力検証用で、結合済みのエントリ名をまとめて検証する。
+ * downloadZip の事前検証はフィールドごとに isValidPathSegment を個別に呼ぶため、
+ * ロジックの実体 (isValidPathSegment) は共有しつつ、ここでは呼び出し形だけをまとめている (重複実装を避ける)。
+ * @param name 検証対象のエントリ名。末尾が `/` なら 1 つだけ取り除いてから分割する
+ *   (addDirectory が正規化後の "dir/" 形式で渡すため。末尾以外の `/` はセグメント区切りとして扱う)
+ * @param method エラーメッセージに含める呼び出し元メソッド名
+ * @throws {Error} いずれかのセグメントが isValidPathSegment を満たさない場合
+ *   (空文字列 / "." / ".." / "/" "\" ":" を含む。空文字列は name が空、先頭が `/`、または `//` の埋め込みで発生する)
  * @internal
  */
-function isValidFileNameSegment(name: string): boolean {
-  return name.length > 0 && name !== '.' && name !== '..';
+function assertValidZipEntryName(name: string, method: 'addFile' | 'addDirectory'): void {
+  const withoutTrailingSlash = name.endsWith('/') ? name.slice(0, -1) : name;
+  for (const segment of withoutTrailingSlash.split('/')) {
+    if (!isValidPathSegment(segment)) {
+      throw new Error(`ZipWriter.${method}: 不正な ZIP エントリ名です (${JSON.stringify(name)})`);
+    }
+  }
 }
 
 /**
@@ -1144,11 +1201,11 @@ export class DownloadHelper {
         throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
       }
       seenEncodedNames.add(post.encodedName);
-      if (post.cover !== undefined && !isValidFileNameSegment(post.cover.name)) {
+      if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
         throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
       }
       for (const file of post.files) {
-        if (!isValidFileNameSegment(file.encodedName)) {
+        if (!isValidPathSegment(file.encodedName)) {
           throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
         }
       }
