@@ -1329,6 +1329,209 @@ describe('ZipWriter', () => {
       await expect(zip.close()).rejects.toThrow();
     });
   });
+
+  // ----------------------------------------------------------
+  // close 後は使用不能になる (terminal 状態、Issue #17 フォローアップ)
+  // close() 成功後も writer が使用可能なままだと (addFile が通ってしまうと)、File System Access API 上
+  // 既に確定したストリームに対する書き込みを試みることになる。close 成功後は 'closed' 状態にし、
+  // 以後の呼び出しを拒否する。close 済みは「失敗」ではないため abort は呼ばない。
+  // ----------------------------------------------------------
+  describe('close 後は使用不能になる (Issue #17 フォローアップ)', () => {
+    test('close 成功後、addFile の呼び出しが拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.addFile('a.txt', encoder.encode('x'));
+      await zip.close();
+      await expect(zip.addFile('b.txt', encoder.encode('y'))).rejects.toThrow();
+    });
+
+    test('close 成功後、addDirectory の呼び出しが拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.close();
+      await expect(zip.addDirectory('dir')).rejects.toThrow();
+    });
+
+    test('close 成功後、close の再呼び出しが拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.close();
+      await expect(zip.close()).rejects.toThrow();
+    });
+
+    test('close 成功後に他の呼び出しが拒否されても、既に成功した close() の結果は変わらず abort もされない', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.close();
+      await expect(zip.addFile('b.txt', encoder.encode('y'))).rejects.toThrow();
+      expect(mock.closed).toBe(true);
+      expect(mock.aborted).toBe(false);
+    });
+  });
+
+  // ----------------------------------------------------------
+  // 公開 abort() (Issue #17 フォローアップ)
+  // downloadZip 側など、ZipWriter の外側で発生した例外に対してストリームを破棄するための入口。
+  // ----------------------------------------------------------
+  describe('公開 abort() (Issue #17 フォローアップ)', () => {
+    test('open 状態で abort() を呼ぶと writable が abort され、以後の呼び出しが拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const reason = new Error('外部エラー');
+      await zip.abort(reason);
+      expect(mock.aborted).toBe(true);
+      expect(mock.abortReason).toBe(reason);
+      await expect(zip.addFile('a.txt', encoder.encode('x'))).rejects.toThrow();
+    });
+
+    test('close 成功後に abort() を呼んでも no-op (writable.abort は呼ばれない)', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.close();
+      await zip.abort(new Error('後から呼ばれた abort'));
+      expect(mock.aborted).toBe(false);
+    });
+
+    test('addFile 自体の失敗で既に abort 済み (failed) の場合、abort() を呼んでも二重に abort されない', async () => {
+      const mock = new MockWritableStream();
+      let abortCalls = 0;
+      const originalAbort = mock.abort.bind(mock);
+      mock.abort = async (reason?: unknown) => {
+        abortCalls++;
+        await originalAbort(reason);
+      };
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await expect(zip.addFile('..', encoder.encode('x'))).rejects.toThrow();
+      expect(abortCalls).toBe(1);
+
+      // downloadZip の catch から呼ばれるのと同じ状況を模す: ZipWriter 内で既に abort 済みの例外が
+      // 外側の catch に伝播し、そこから zip.abort(e) が呼ばれても二重 abort にならない
+      await zip.abort(new Error('外側で catch された例外'));
+      expect(abortCalls).toBe(1);
+    });
+  });
+
+  // ----------------------------------------------------------
+  // 並行呼び出しの検出 (Issue #17 フォローアップ)
+  // このクラスは直列に await して使うことを契約とする。前の呼び出しの完了を待たずに次を呼ぶのは誤用であり、
+  // 暗黙に直列化してキューイングするのではなく、即座に例外にして誤用を顕在化させる。
+  // async 関数は最初の await まで同期的に実行されるため、beginOperation をメソッド先頭で呼べば、
+  // 呼び出し元が返り値を await していなくても「実行中かどうか」を同期的に検出できる。
+  // ----------------------------------------------------------
+  describe('並行呼び出しの検出 (Issue #17 フォローアップ)', () => {
+    /**
+     * mock.write の 1 回目の呼び出しだけを、明示的に解放するまで pending にする。
+     * 「addFile が実際に I/O 待ちをしている最中に別の呼び出しが来る」状況を作るためのヘルパー。
+     */
+    function gateFirstWrite(mock: MockWritableStream): () => void {
+      let release: (() => void) | undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let callCount = 0;
+      const originalWrite = mock.write.bind(mock);
+      mock.write = async (data: Uint8Array) => {
+        callCount++;
+        if (callCount === 1) await gate;
+        await originalWrite(data);
+      };
+      // biome-ignore lint/style/noNonNullAssertion: Promise executor 内で必ず代入される
+      return () => release!();
+    }
+
+    test('addFile の書き込み待ち中に別の addFile を呼ぶと即座に拒否され、最初の呼び出しは正常に完了する', async () => {
+      const mock = new MockWritableStream();
+      const releaseFirstWrite = gateFirstWrite(mock);
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+
+      const firstCall = zip.addFile('a.txt', encoder.encode('x')); // await しない
+
+      // 最初の addFile の write がまだ pending のうちに 2 回目を呼ぶ
+      await expect(zip.addFile('b.txt', encoder.encode('y'))).rejects.toThrow();
+
+      releaseFirstWrite();
+      await firstCall;
+      expect(mock.aborted).toBe(false);
+    });
+
+    test('addFile の実行中に close を呼ぶと即座に拒否され、最初の addFile は正常に完了する', async () => {
+      const mock = new MockWritableStream();
+      const releaseFirstWrite = gateFirstWrite(mock);
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+
+      const firstCall = zip.addFile('a.txt', encoder.encode('x'));
+
+      await expect(zip.close()).rejects.toThrow();
+
+      releaseFirstWrite();
+      await firstCall;
+      expect(mock.aborted).toBe(false);
+    });
+
+    test('addFile の実行中に別の addDirectory を呼ぶと即座に拒否される', async () => {
+      const mock = new MockWritableStream();
+      const releaseFirstWrite = gateFirstWrite(mock);
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+
+      const firstCall = zip.addFile('a.txt', encoder.encode('x'));
+
+      await expect(zip.addDirectory('dir')).rejects.toThrow();
+
+      releaseFirstWrite();
+      await firstCall;
+    });
+  });
+
+  // ----------------------------------------------------------
+  // Windows 互換の末尾空白・ピリオド正規化と制御文字の拒否 (Issue #17 フォローアップ)
+  // Win32 系の展開実装はファイル名末尾の空白・ピリオドを取り除いてから解釈するため、
+  // 取り除いた結果が空 / "." / ".." になるセグメントは、完全一致の "." / ".." チェックだけでは検出できない。
+  // ----------------------------------------------------------
+  describe('Windows 互換の末尾空白・ピリオド正規化と制御文字の拒否 (Issue #17 フォローアップ)', () => {
+    const normalizesToTraversal: [string, string][] = [
+      ['.. ', '末尾空白付き ".. " は Win32 展開実装で ".." と同等に扱われうる'],
+      ['...', '全体がピリオドのみの "..." は末尾のピリオドを取り除くと空になる'],
+      ['. .', '空白とピリオドが混在する ". ." も取り除くと空になる'],
+      ['   ', '空白のみのセグメントも取り除くと空になる'],
+    ];
+
+    for (const [name, description] of normalizesToTraversal) {
+      test(`addFile(${JSON.stringify(name)}) (${description}) が例外を投げる`, async () => {
+        const mock = new MockWritableStream();
+        const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+        await expect(zip.addFile(name, encoder.encode('x'))).rejects.toThrow();
+      });
+    }
+
+    test('タブ (制御文字) を含むセグメントは拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const name = `..${String.fromCharCode(9)}`; // ".." + タブ
+      await expect(zip.addFile(name, encoder.encode('x'))).rejects.toThrow();
+    });
+
+    test('NUL (制御文字) を含むセグメントは拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const name = `a${String.fromCharCode(0)}b`;
+      await expect(zip.addFile(name, encoder.encode('x'))).rejects.toThrow();
+    });
+
+    test('DEL (0x7F, 制御文字) を含むセグメントは拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const name = `a${String.fromCharCode(127)}b`;
+      await expect(zip.addFile(name, encoder.encode('x'))).rejects.toThrow();
+    });
+
+    test('末尾の空白・ピリオドはそれ単体では拒否しない (トラバーサルではなく互換性の問題のため。例: "a. ")', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.addFile('a. ', encoder.encode('x'));
+      await zip.close();
+      expect(mock.closed).toBe(true);
+    });
+  });
 });
 
 // ============================================================
@@ -1646,6 +1849,45 @@ describe('DownloadHelper.downloadZip', () => {
       obj.posts[0].files[0].encodedName = name;
       await expectValidationError(obj);
     });
+
+    // Windows 互換の末尾空白・ピリオド正規化 (Issue #17 フォローアップ)。Win32 系の展開実装は末尾の空白・
+    // ピリオドを取り除いてから解釈するため、取り除いた結果が空 / "." / ".." になるセグメントも
+    // 完全一致の "." / ".." チェックだけでは検出できず、拒否が必要。
+    const winNormalizedNames = ['.. ', '...', '. .', '   '];
+
+    test.each(winNormalizedNames)('post.encodedName が %s (Win32 正規化で "." "..") → 例外', async (name) => {
+      const obj = createValidObj();
+      obj.posts[0].encodedName = name;
+      await expectValidationError(obj);
+    });
+
+    test.each(winNormalizedNames)('post.cover.name が %s (Win32 正規化で "." "..") → 例外', async (name) => {
+      const obj = createValidObj();
+      obj.posts[0].cover = { url: 'https://example.com/c.png', name };
+      await expectValidationError(obj);
+    });
+
+    test.each(winNormalizedNames)('file.encodedName が %s (Win32 正規化で "." "..") → 例外', async (name) => {
+      const obj = createValidObj();
+      obj.posts[0].files[0].encodedName = name;
+      await expectValidationError(obj);
+    });
+
+    test('id が "..." (ピリオドのみ。encodeFileName の trim は空白しか取り除かない) → 例外', async () => {
+      await expectValidationError(createValidObj({ id: '...' }));
+    });
+
+    test('post.encodedName に制御文字 (タブ) を含む → 例外', async () => {
+      const obj = createValidObj();
+      obj.posts[0].encodedName = `post${String.fromCharCode(9)}1`;
+      await expectValidationError(obj);
+    });
+
+    test('file.encodedName に制御文字 (NUL) を含む → 例外', async () => {
+      const obj = createValidObj();
+      obj.posts[0].files[0].encodedName = `a${String.fromCharCode(0)}b.png`;
+      await expectValidationError(obj);
+    });
   });
 
   describe('構造 (ディレクトリエントリの配置と日時)', () => {
@@ -1765,6 +2007,111 @@ describe('DownloadHelper.downloadZip', () => {
       // 失敗した post1 のファイルはエントリが作られない一方、post2 のファイルは作られる
       expect(cd.byName.has('creator-id/post1/a.png')).toBe(false);
       expect(cd.byName.has('creator-id/post2/b.png')).toBe(true);
+    });
+  });
+
+  // ----------------------------------------------------------
+  // createWritable() 後のコールバック例外に対する cleanup (Issue #17 フォローアップ)
+  // fetchFile / log / progress / remainTime は呼び出し側が渡すコールバックであり、ZipWriter の外側で
+  // 例外を投げうる。ZipWriter 自身の内部 cleanup (addFile/addDirectory/close の catch) だけではこの経路を
+  // カバーできないため、downloadZip 自身が createWritable() 以降を try/catch し、catch で zip.abort() を
+  // 呼んで writable を破棄することを確認する。
+  // ----------------------------------------------------------
+  describe('createWritable() 後のコールバック例外に対する cleanup (Issue #17 フォローアップ)', () => {
+    function buildMockHandle(): { mock: MockWritableStream; handle: FileSystemFileHandle } {
+      const mock = new MockWritableStream();
+      const handle = {
+        async createWritable() {
+          return mock as unknown as FileSystemWritableFileStream;
+        },
+      };
+      return { mock, handle: handle as unknown as FileSystemFileHandle };
+    }
+
+    test('fetchFile が例外を投げると、その例外が伝播し writable が abort され close は呼ばれない', async () => {
+      const obj = createValidObj();
+      const { mock, handle } = buildMockHandle();
+      const fetchError = new Error('network error');
+      const fetchFile = async () => {
+        throw fetchError;
+      };
+      await expect(
+        helper.downloadZip(
+          obj,
+          () => {},
+          () => {},
+          () => {},
+          { handle, fetchFile },
+        ),
+      ).rejects.toThrow(fetchError);
+      expect(mock.aborted).toBe(true);
+      expect(mock.abortReason).toBe(fetchError);
+      expect(mock.closed).toBe(false);
+    });
+
+    test('log コールバックが例外を投げると、その例外が伝播し writable が abort され close は呼ばれない', async () => {
+      const obj = createValidObj();
+      const { mock, handle } = buildMockHandle();
+      const logError = new Error('log failed');
+      const fetchFile = async () => new Blob([new Uint8Array([1])]);
+      const log = () => {
+        throw logError;
+      };
+      await expect(
+        helper.downloadZip(
+          obj,
+          () => {},
+          log,
+          () => {},
+          { handle, fetchFile },
+        ),
+      ).rejects.toThrow(logError);
+      expect(mock.aborted).toBe(true);
+      expect(mock.abortReason).toBe(logError);
+      expect(mock.closed).toBe(false);
+    });
+
+    test('progress コールバックが例外を投げると、その例外が伝播し writable が abort され close は呼ばれない', async () => {
+      const obj = createValidObj();
+      const { mock, handle } = buildMockHandle();
+      const progressError = new Error('progress failed');
+      const fetchFile = async () => new Blob([new Uint8Array([1])]);
+      const progress = () => {
+        throw progressError;
+      };
+      await expect(
+        helper.downloadZip(
+          obj,
+          progress,
+          () => {},
+          () => {},
+          { handle, fetchFile },
+        ),
+      ).rejects.toThrow(progressError);
+      expect(mock.aborted).toBe(true);
+      expect(mock.abortReason).toBe(progressError);
+      expect(mock.closed).toBe(false);
+    });
+
+    test('remainTime コールバックが例外を投げると、その例外が伝播し writable が abort され close は呼ばれない', async () => {
+      const obj = createValidObj();
+      const { mock, handle } = buildMockHandle();
+      const remainTimeError = new Error('remainTime failed');
+      const fetchFile = async () => new Blob([new Uint8Array([1])]);
+      const remainTime = () => {
+        throw remainTimeError;
+      };
+      await expect(
+        helper.downloadZip(
+          obj,
+          () => {},
+          () => {},
+          remainTime,
+          { handle, fetchFile },
+        ),
+      ).rejects.toThrow(remainTimeError);
+      expect(mock.aborted).toBe(true);
+      expect(mock.closed).toBe(false);
     });
   });
 });

@@ -726,6 +726,15 @@ function concatBytes(parts: Uint8Array<ArrayBuffer>[]): Uint8Array<ArrayBuffer> 
 /**
  * ZIP ファイル書き込みクラス (stored / 非圧縮)
  * File System Access API の FileSystemWritableFileStream に直接書き込む
+ *
+ * 利用契約:
+ * - **直列に await して使うこと。** addFile / addDirectory / close は呼び出しごとに await してから次を
+ *   呼ぶ前提で、内部状態 (書き込みオフセットやエントリ一覧) を単一の呼び出し系列でのみ更新する。
+ *   前の呼び出しを await せずに次を呼ぶ (並行呼び出し) は誤用であり、直列化して待たせるのではなく
+ *   即座に例外にする (呼び出し順序の保証という新しい契約を暗黙に増やさないため)。
+ * - **close() 成功後、または addFile / addDirectory / close のいずれかが失敗した後は再利用できない。**
+ *   前者は File System Access API 上ストリームが既に確定しているため、後者は書き込み先ストリームを
+ *   既に abort 済みのため。どちらも以後の呼び出しは冒頭で例外を投げる (terminal 状態)。
  * @internal
  */
 export class ZipWriter {
@@ -744,12 +753,21 @@ export class ZipWriter {
   }[] = [];
   private encoder = new TextEncoder();
   /**
-   * このインスタンスが使用不能になっているかどうか。
-   * addFile / addDirectory / close のいずれかで例外が発生し abortOnFailure に入った時点で true になり、
-   * 以後すべての公開メソッドを拒否する terminal な状態を表す (Issue #17 フォローアップ)。
-   * abort() 自体が失敗した場合もこのフラグは true のまま残るため、二重 abort の防止も兼ねる。
+   * インスタンスの状態 (Issue #17 フォローアップ)。
+   * - 'open': 通常状態。addFile / addDirectory / close を呼べる
+   * - 'closed': close() が成功した後。File System Access API 上ストリームは既に確定しており、
+   *   以後の書き込みはできない
+   * - 'failed': addFile / addDirectory / close のいずれかで例外が発生し abort 済み (terminal)。
+   *   abort() 自体が失敗した場合もこの状態のまま残るため、二重 abort の防止も兼ねる
    */
-  private failed = false;
+  private state: 'open' | 'closed' | 'failed' = 'open';
+  /**
+   * 現在 addFile / addDirectory / close のいずれかを実行中かどうか。
+   * このクラスは直列利用を契約とするため (クラス doc 参照)、実行中に別の呼び出しが来たら
+   * プログラミングエラーとして即座に例外にする。async 関数本体は最初の await まで同期的に走るため、
+   * beginOperation をメソッド先頭で呼べば、呼び出し元が返り値を await していなくても検出できる。
+   */
+  private inFlight = false;
 
   constructor(writable: FileSystemWritableFileStream) {
     this.writable = writable;
@@ -764,14 +782,14 @@ export class ZipWriter {
    *   省略または Invalid Date の場合は従来挙動 (DOS 0、extra field なし) でバイト列を維持する。
    *   1980-01-01 〜 2107-12-31 23:59:58 にクランプ。Extended Timestamp は clamp 後の Unix time が
    *   signed int32 範囲に収まる場合のみ書く。
-   * @throws {Error} このインスタンスが以前の失敗により使用不能になっている場合。
-   *   name をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を含む場合、
-   *   または末尾が `/` の場合 (downloadZip 側でも同じ検証を行うが、addFile を直接呼ぶ利用者を
+   * @throws {Error} このインスタンスが使用不能な状態 (close 済み、以前の失敗、または他の呼び出しが
+   *   実行中) の場合。name をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を
+   *   含む場合、または末尾が `/` の場合 (downloadZip 側でも同じ検証を行うが、addFile を直接呼ぶ利用者を
    *   無防備にしないための多層防御として ZipWriter 自身にも検証を持たせている、Issue #17)。
    *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)
    */
   async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
-    this.assertNotFailed('addFile');
+    this.beginOperation('addFile');
     try {
       assertValidZipEntryName(name, 'addFile');
 
@@ -821,6 +839,8 @@ export class ZipWriter {
     } catch (e) {
       await this.abortOnFailure(e);
       throw e;
+    } finally {
+      this.inFlight = false;
     }
   }
 
@@ -829,9 +849,9 @@ export class ZipWriter {
    * @param name ZIP 内のディレクトリパス (UTF-8)。末尾が `/` でなければ自動的に付与する
    * @param date 任意。addFile と同一の日時ロジック (DOS time/date + NTFS Extra + Extended Timestamp) を適用する。
    *   省略または Invalid Date の場合は DOS time/date = 0、extra field なし
-   * @throws {Error} このインスタンスが以前の失敗により使用不能になっている場合。
-   *   正規化後の名前をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を
-   *   含むセグメントがある場合 (name が空文字列、または先頭が `/` の場合を含む)。
+   * @throws {Error} このインスタンスが使用不能な状態 (close 済み、以前の失敗、または他の呼び出しが
+   *   実行中) の場合。正規化後の名前をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." /
+   *   `\` `:` を含むセグメントがある場合 (name が空文字列、または先頭が `/` の場合を含む)。
    *   APPNOTE 4.4.17.1 が ZIP 内のパスを相対パスに限り、先頭 `/` を禁じるため。
    *   addFile と同じ検証をセグメント単位で適用するため、drive letter (`C:/dir`) や `\` 区切りも拒否する
    *   (Issue #14 時点では addFile と非対称にしないため未検証としていたが、Issue #17 で addFile 側にも
@@ -839,7 +859,7 @@ export class ZipWriter {
    *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)
    */
   async addDirectory(name: string, date?: Date): Promise<void> {
-    this.assertNotFailed('addDirectory');
+    this.beginOperation('addDirectory');
     try {
       const dirName = name.endsWith('/') ? name : `${name}/`;
       assertValidZipEntryName(dirName, 'addDirectory');
@@ -882,6 +902,8 @@ export class ZipWriter {
     } catch (e) {
       await this.abortOnFailure(e);
       throw e;
+    } finally {
+      this.inFlight = false;
     }
   }
 
@@ -894,10 +916,11 @@ export class ZipWriter {
    * `0xFFFF` / `0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値のため、
    * エントリ数が 65,535 件以上、またはサイズ/オフセットが `0xFFFFFFFF` bytes 以上になると壊れた ZIP を出力する。
    * ディレクトリエントリの追加でエントリ数が「投稿数 + 1」増える分、上限に到達しやすくなる点に留意する。
-   * @throws {Error} このインスタンスが以前の失敗により使用不能になっている場合 (Issue #17 フォローアップ)
+   * @throws {Error} このインスタンスが使用不能な状態 (close 済み、以前の失敗、または他の呼び出しが
+   *   実行中) の場合 (Issue #17 フォローアップ)
    */
   async close(): Promise<void> {
-    this.assertNotFailed('close');
+    this.beginOperation('close');
     try {
       const cdOffset = this.offset;
 
@@ -943,10 +966,30 @@ export class ZipWriter {
 
       await this.write(new Uint8Array(eocd));
       await this.writable.close();
+      this.state = 'closed';
     } catch (e) {
       await this.abortOnFailure(e);
       throw e;
+    } finally {
+      this.inFlight = false;
     }
+  }
+
+  /**
+   * 外部 (downloadZip など、ZipWriter の外側のコード) で発生した例外に対してストリームを破棄するための
+   * public API (Issue #17 フォローアップ)。addFile / addDirectory / close はコールバックを持たず内部で
+   * 完結するため abortOnFailure で自己完結できるが、downloadZip は fetchFile / log / progress /
+   * remainTime という呼び出し側のコールバックを挟んでおり、これらが投げた例外は ZipWriter の外で
+   * catch することになる。その catch から呼ぶための入口がこのメソッドである。
+   *
+   * 既に 'open' でない (close 済み、または addFile/addDirectory/close 自身の失敗で既に abort 済み) 場合は
+   * no-op にする。ZipWriter 内部の失敗はメソッド自身の catch が既に abortOnFailure 済みなので、
+   * その例外が呼び出し元まで伝播してここに渡されても二重に abort しない。
+   * @param reason 破棄理由 (writable.abort() に渡される)
+   */
+  async abort(reason?: unknown): Promise<void> {
+    if (this.state !== 'open') return;
+    await this.abortOnFailure(reason);
   }
 
   private async write(data: Uint8Array<ArrayBuffer>): Promise<void> {
@@ -955,17 +998,27 @@ export class ZipWriter {
   }
 
   /**
-   * このインスタンスが失敗後の terminal 状態でないことを確認する (Issue #17 フォローアップ)。
-   * failed フラグは abortOnFailure が一度でも実行されると true になり、abort() 自体が失敗しても戻らない。
-   * これが無いと、abort() 失敗後に呼ばれた addFile / addDirectory / close がまだ生きているストリームに
-   * 書き込みを続けてしまい、Central Directory / EOCD を欠いた壊れた ZIP や、無関係な内容の ZIP を
-   * そのままコミットしうる。
-   * @throws {Error} 既に failed 状態の場合
+   * addFile / addDirectory / close の共通の入口処理 (Issue #17 フォローアップ)。
+   * - close 済み、または以前の失敗で terminal 状態になっている場合は使用不可として例外を投げる
+   * - 既に他の呼び出しが実行中 (inFlight) の場合も、並行呼び出しは誤用として即座に例外を投げる
+   *   (「直列化して待たせる」のではなく「検出して拒否する」方針。暗黙の直列化はキュー順序の保証という
+   *   新しい契約を増やすため採らない)
+   * - 上記のいずれにも該当しなければ inFlight を立てる。呼び出し元は必ず finally で inFlight を戻すこと
+   * @throws {Error} 上記のいずれかに該当する場合
    */
-  private assertNotFailed(method: 'addFile' | 'addDirectory' | 'close'): void {
-    if (this.failed) {
+  private beginOperation(method: 'addFile' | 'addDirectory' | 'close'): void {
+    if (this.state === 'failed') {
       throw new Error(`ZipWriter.${method}: 以前の失敗により使用不可です`);
     }
+    if (this.state === 'closed') {
+      throw new Error(`ZipWriter.${method}: close 済みのため使用不可です`);
+    }
+    if (this.inFlight) {
+      throw new Error(
+        `ZipWriter.${method}: 別の呼び出しが実行中です (ZipWriter は呼び出しごとに await してから次を呼ぶ直列利用が前提です)`,
+      );
+    }
+    this.inFlight = true;
   }
 
   /**
@@ -975,13 +1028,13 @@ export class ZipWriter {
    * そのため、addFile / addDirectory / close の途中で例外が発生した場合は、
    * 中途半端な (Central Directory / EOCD を欠いた壊れた) ZIP を実ファイルとしてコミットしてしまわないよう、
    * close() ではなく abort() でストリームを破棄する。abort() 自体の失敗は元の例外を握りつぶさないよう無視する。
-   * failed フラグは abort() の成否に関わらず true のまま維持し、以後のすべての呼び出しを
-   * assertNotFailed で拒否することで、二重 abort と「失敗後もまだ生きているストリームへの書き込みが
-   * 通ってしまう」問題の両方を防ぐ (assertNotFailed が入口で弾くため、このメソッドが同一インスタンスに対して
-   * 複数回呼ばれることは実際には無い)。
+   * state は abort() の成否に関わらず 'failed' のまま維持し、以後のすべての呼び出しを
+   * beginOperation で拒否することで、二重 abort と「失敗後もまだ生きているストリームへの書き込みが
+   * 通ってしまう」問題の両方を防ぐ (addFile/addDirectory/close 自身からの呼び出しは beginOperation が
+   * 入口で弾くため複数回呼ばれない。public な abort() 経由の呼び出しも state !== 'open' なら no-op にしている)。
    */
   private async abortOnFailure(reason: unknown): Promise<void> {
-    this.failed = true;
+    this.state = 'failed';
     try {
       await this.writable.abort(reason);
     } catch {
@@ -1004,16 +1057,27 @@ export type DownloadZipOptions = {
 
 /**
  * ZIP パスの 1 セグメントとして安全か検証する。
- * 空文字列 / "." / ".." / "/" "\" ":" を含むものを拒否する。
+ * 空文字列 / "/" "\" ":" を含むもの、制御文字 (U+0000-U+001F, U+007F) を含むものを拒否する。
  * downloadZip の事前検証 (encodedId / post.encodedName / post.cover.name / file.encodedName) と
  * ZipWriter.addFile / addDirectory 自体の入力検証 (assertValidZipEntryName 経由) の両方で共有する。
  * cover.name / file.encodedName はパス区切りを含まない 1 セグメント名である前提のため、
  * これらにも同じ検証をそのまま適用してよい (Issue #17)。
  * post.encodedName 等は isDownloadJsonObj で型 (string) すら検証されないため、value を unknown として受ける
+ *
+ * Win32 系の展開実装は、ファイル名末尾の空白とピリオドを取り除いてから解釈する。そのため "." / ".." の
+ * 完全一致だけでなく、末尾の空白・ピリオドを取り除いた結果が空文字列 / "." / ".." になるセグメント
+ * (".. ", "...", ". ." 等) も、展開先で親ディレクトリと同等に扱われうるため拒否する。
+ * それ以外の末尾空白・ピリオド (例: "a. ") は Windows 上でのファイル名の互換性問題ではあるが
+ * トラバーサルではないため拒否しない (Issue #17 フォローアップ)。
  * @internal
  */
 function isValidPathSegment(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value !== '.' && value !== '..' && !/[/\\:]/.test(value);
+  if (typeof value !== 'string' || value.length === 0) return false;
+  if (/[/\\:]/.test(value)) return false;
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: 制御文字を意図的に拒否するための検証
+  if (/[\u0000-\u001f\u007f]/.test(value)) return false;
+  const trimmedTrailing = value.replace(/[ .]+$/, '');
+  return trimmedTrailing.length > 0 && trimmedTrailing !== '.' && trimmedTrailing !== '..';
 }
 
 /**
@@ -1274,93 +1338,103 @@ export class DownloadHelper {
     const handle = options?.handle ?? (await showSaveFilePicker({ suggestedName: `${encodedId}.zip` }));
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
-    const fetchFile = options?.fetchFile ?? ((url: string, name: string) => utils.fetchWithLimit({ url, name }, 1));
 
-    const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
-      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
-    };
+    // createWritable() 以降の ZIP 生成処理全体を try/catch で囲む。fetchFile / log / progress / remainTime は
+    // 呼び出し側が渡すコールバックであり、これらが例外を投げても writable が未 close のまま残らないようにする
+    // (toUint8Array 内の Blob.arrayBuffer も同様に投げうる)。zip.addFile 等が投げた場合は ZipWriter が内部で
+    // 既に abort 済み (terminal) のため、ここでの zip.abort は no-op になる。
+    try {
+      const fetchFile = options?.fetchFile ?? ((url: string, name: string) => utils.fetchWithLimit({ url, name }, 1));
 
-    const parsePublishedDate = (iso?: string): Date | undefined => {
-      if (!iso) return undefined;
-      const d = new Date(iso);
-      return Number.isFinite(d.getTime()) ? d : undefined;
-    };
+      const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
+        await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
+      };
 
-    const startTime = Math.floor(Date.now() / 1000);
-    let count = 0;
-    let failedCount = 0;
+      const parsePublishedDate = (iso?: string): Date | undefined => {
+        if (!iso) return undefined;
+        const d = new Date(iso);
+        return Number.isFinite(d.getTime()) ? d : undefined;
+      };
 
-    log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
-    // ルートディレクトリ (日時は有効な publishedDatetime の最大値。有効な値が 1 件も無ければ date なし)
-    const rootDate = downloadObj.posts.reduce<Date | undefined>((max, post) => {
-      const d = parsePublishedDate(post.publishedDatetime);
-      if (d === undefined) return max;
-      return max === undefined || d.getTime() > max.getTime() ? d : max;
-    }, undefined);
-    await zip.addDirectory(`${encodedId}/`, rootDate);
-    // ルートhtml (post に紐づかないので date は付与しない)
-    await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html');
-    // 投稿処理
-    let postCount = 0;
-    for (const post of downloadObj.posts) {
-      if (options?.signal?.aborted) {
-        await zip.close();
-        return;
-      }
-      log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
-      const postDate = parsePublishedDate(post.publishedDatetime);
-      // 投稿ディレクトリ (配下ファイルより前に書く)
-      await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
-      // 投稿情報+html
-      const informationFile = utils.createInformationFile(post.informationText);
-      await enqueue(
-        informationFile.content,
-        `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`,
-        postDate,
-      );
-      await enqueue(
-        [this.createHtmlFromBody(post.originalName, post.htmlText)],
-        `${post.encodedName}/index.html`,
-        postDate,
-      );
-      // カバー画像
-      if (post.cover) {
-        log(`download ${post.cover.name}`);
-        const blob = await fetchFile(post.cover.url, post.cover.name);
-        if (blob) {
-          await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
-        }
-      }
-      // ファイル処理
-      let fileCount = 0;
-      for (const file of post.files) {
+      const startTime = Math.floor(Date.now() / 1000);
+      let count = 0;
+      let failedCount = 0;
+
+      log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
+      // ルートディレクトリ (日時は有効な publishedDatetime の最大値。有効な値が 1 件も無ければ date なし)
+      const rootDate = downloadObj.posts.reduce<Date | undefined>((max, post) => {
+        const d = parsePublishedDate(post.publishedDatetime);
+        if (d === undefined) return max;
+        return max === undefined || d.getTime() > max.getTime() ? d : max;
+      }, undefined);
+      await zip.addDirectory(`${encodedId}/`, rootDate);
+      // ルートhtml (post に紐づかないので date は付与しない)
+      await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html');
+      // 投稿処理
+      let postCount = 0;
+      for (const post of downloadObj.posts) {
         if (options?.signal?.aborted) {
           await zip.close();
           return;
         }
-        log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-        const blob = await fetchFile(file.url, file.encodedName);
-        if (blob) {
-          await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
-        } else {
-          failedCount++;
-          console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
-          log(`${file.encodedName}のダウンロードに失敗`);
+        log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
+        const postDate = parsePublishedDate(post.publishedDatetime);
+        // 投稿ディレクトリ (配下ファイルより前に書く)
+        await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
+        // 投稿情報+html
+        const informationFile = utils.createInformationFile(post.informationText);
+        await enqueue(
+          informationFile.content,
+          `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`,
+          postDate,
+        );
+        await enqueue(
+          [this.createHtmlFromBody(post.originalName, post.htmlText)],
+          `${post.encodedName}/index.html`,
+          postDate,
+        );
+        // カバー画像
+        if (post.cover) {
+          log(`download ${post.cover.name}`);
+          const blob = await fetchFile(post.cover.url, post.cover.name);
+          if (blob) {
+            await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
+          }
         }
-        count++;
-        const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
-        const remain = Math.floor((elapsedSec * (downloadObj.fileCount - count)) / count);
-        remainTime(formatRemain(remain));
-        progress(((count * 100) / downloadObj.fileCount) | 0);
-        await utils.sleep(100);
+        // ファイル処理
+        let fileCount = 0;
+        for (const file of post.files) {
+          if (options?.signal?.aborted) {
+            await zip.close();
+            return;
+          }
+          log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
+          const blob = await fetchFile(file.url, file.encodedName);
+          if (blob) {
+            await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
+          } else {
+            failedCount++;
+            console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
+            log(`${file.encodedName}のダウンロードに失敗`);
+          }
+          count++;
+          const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
+          const remain = Math.floor((elapsedSec * (downloadObj.fileCount - count)) / count);
+          remainTime(formatRemain(remain));
+          progress(((count * 100) / downloadObj.fileCount) | 0);
+          await utils.sleep(100);
+        }
       }
+      if (failedCount > 0) {
+        log(`完了 (${failedCount}件のダウンロードに失敗)`);
+      } else {
+        log('完了');
+      }
+      await zip.close();
+    } catch (e) {
+      await zip.abort(e);
+      throw e;
     }
-    if (failedCount > 0) {
-      log(`完了 (${failedCount}件のダウンロードに失敗)`);
-    } else {
-      log('完了');
-    }
-    await zip.close();
   }
 
   /**

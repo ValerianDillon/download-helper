@@ -433,12 +433,13 @@ export class ZipWriter {
   offset = 0;
   entries = [];
   encoder = new TextEncoder;
-  failed = false;
+  state = "open";
+  inFlight = false;
   constructor(writable) {
     this.writable = writable;
   }
   async addFile(name, data, date) {
-    this.assertNotFailed("addFile");
+    this.beginOperation("addFile");
     try {
       assertValidZipEntryName(name, "addFile");
       const bytes = data.buffer instanceof ArrayBuffer ? data : new Uint8Array(data);
@@ -478,10 +479,12 @@ export class ZipWriter {
     } catch (e) {
       await this.abortOnFailure(e);
       throw e;
+    } finally {
+      this.inFlight = false;
     }
   }
   async addDirectory(name, date) {
-    this.assertNotFailed("addDirectory");
+    this.beginOperation("addDirectory");
     try {
       const dirName = name.endsWith("/") ? name : `${name}/`;
       assertValidZipEntryName(dirName, "addDirectory");
@@ -519,10 +522,12 @@ export class ZipWriter {
     } catch (e) {
       await this.abortOnFailure(e);
       throw e;
+    } finally {
+      this.inFlight = false;
     }
   }
   async close() {
-    this.assertNotFailed("close");
+    this.beginOperation("close");
     try {
       const cdOffset = this.offset;
       for (const entry of this.entries) {
@@ -563,29 +568,51 @@ export class ZipWriter {
       eocdView.setUint16(20, 0, true);
       await this.write(new Uint8Array(eocd));
       await this.writable.close();
+      this.state = "closed";
     } catch (e) {
       await this.abortOnFailure(e);
       throw e;
+    } finally {
+      this.inFlight = false;
     }
+  }
+  async abort(reason) {
+    if (this.state !== "open")
+      return;
+    await this.abortOnFailure(reason);
   }
   async write(data) {
     await this.writable.write(data);
     this.offset += data.length;
   }
-  assertNotFailed(method) {
-    if (this.failed) {
+  beginOperation(method) {
+    if (this.state === "failed") {
       throw new Error(`ZipWriter.${method}: 以前の失敗により使用不可です`);
     }
+    if (this.state === "closed") {
+      throw new Error(`ZipWriter.${method}: close 済みのため使用不可です`);
+    }
+    if (this.inFlight) {
+      throw new Error(`ZipWriter.${method}: 別の呼び出しが実行中です (ZipWriter は呼び出しごとに await してから次を呼ぶ直列利用が前提です)`);
+    }
+    this.inFlight = true;
   }
   async abortOnFailure(reason) {
-    this.failed = true;
+    this.state = "failed";
     try {
       await this.writable.abort(reason);
     } catch {}
   }
 }
 function isValidPathSegment(value) {
-  return typeof value === "string" && value.length > 0 && value !== "." && value !== ".." && !/[/\\:]/.test(value);
+  if (typeof value !== "string" || value.length === 0)
+    return false;
+  if (/[/\\:]/.test(value))
+    return false;
+  if (/[\u0000-\u001f\u007f]/.test(value))
+    return false;
+  const trimmedTrailing = value.replace(/[ .]+$/, "");
+  return trimmedTrailing.length > 0 && trimmedTrailing !== "." && trimmedTrailing !== "..";
 }
 function assertValidZipEntryName(name, method) {
   const segmentsSource = method === "addDirectory" && name.endsWith("/") ? name.slice(0, -1) : name;
@@ -764,76 +791,81 @@ export class DownloadHelper {
     const handle = options?.handle ?? await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
-    const fetchFile = options?.fetchFile ?? ((url, name) => utils.fetchWithLimit({ url, name }, 1));
-    const enqueue = async (fileBits, path, date) => {
-      await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
-    };
-    const parsePublishedDate = (iso) => {
-      if (!iso)
-        return;
-      const d = new Date(iso);
-      return Number.isFinite(d.getTime()) ? d : undefined;
-    };
-    const startTime = Math.floor(Date.now() / 1000);
-    let count = 0;
-    let failedCount = 0;
-    log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
-    const rootDate = downloadObj.posts.reduce((max, post) => {
-      const d = parsePublishedDate(post.publishedDatetime);
-      if (d === undefined)
-        return max;
-      return max === undefined || d.getTime() > max.getTime() ? d : max;
-    }, undefined);
-    await zip.addDirectory(`${encodedId}/`, rootDate);
-    await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html");
-    let postCount = 0;
-    for (const post of downloadObj.posts) {
-      if (options?.signal?.aborted) {
-        await zip.close();
-        return;
-      }
-      log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
-      const postDate = parsePublishedDate(post.publishedDatetime);
-      await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
-      const informationFile = utils.createInformationFile(post.informationText);
-      await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`, postDate);
-      await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`, postDate);
-      if (post.cover) {
-        log(`download ${post.cover.name}`);
-        const blob = await fetchFile(post.cover.url, post.cover.name);
-        if (blob) {
-          await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
-        }
-      }
-      let fileCount = 0;
-      for (const file of post.files) {
+    try {
+      const fetchFile = options?.fetchFile ?? ((url, name) => utils.fetchWithLimit({ url, name }, 1));
+      const enqueue = async (fileBits, path, date) => {
+        await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
+      };
+      const parsePublishedDate = (iso) => {
+        if (!iso)
+          return;
+        const d = new Date(iso);
+        return Number.isFinite(d.getTime()) ? d : undefined;
+      };
+      const startTime = Math.floor(Date.now() / 1000);
+      let count = 0;
+      let failedCount = 0;
+      log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
+      const rootDate = downloadObj.posts.reduce((max, post) => {
+        const d = parsePublishedDate(post.publishedDatetime);
+        if (d === undefined)
+          return max;
+        return max === undefined || d.getTime() > max.getTime() ? d : max;
+      }, undefined);
+      await zip.addDirectory(`${encodedId}/`, rootDate);
+      await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html");
+      let postCount = 0;
+      for (const post of downloadObj.posts) {
         if (options?.signal?.aborted) {
           await zip.close();
           return;
         }
-        log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-        const blob = await fetchFile(file.url, file.encodedName);
-        if (blob) {
-          await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
-        } else {
-          failedCount++;
-          console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
-          log(`${file.encodedName}のダウンロードに失敗`);
+        log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
+        const postDate = parsePublishedDate(post.publishedDatetime);
+        await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
+        const informationFile = utils.createInformationFile(post.informationText);
+        await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`, postDate);
+        await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`, postDate);
+        if (post.cover) {
+          log(`download ${post.cover.name}`);
+          const blob = await fetchFile(post.cover.url, post.cover.name);
+          if (blob) {
+            await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
+          }
         }
-        count++;
-        const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
-        const remain = Math.floor(elapsedSec * (downloadObj.fileCount - count) / count);
-        remainTime(formatRemain(remain));
-        progress(count * 100 / downloadObj.fileCount | 0);
-        await utils.sleep(100);
+        let fileCount = 0;
+        for (const file of post.files) {
+          if (options?.signal?.aborted) {
+            await zip.close();
+            return;
+          }
+          log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
+          const blob = await fetchFile(file.url, file.encodedName);
+          if (blob) {
+            await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
+          } else {
+            failedCount++;
+            console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
+            log(`${file.encodedName}のダウンロードに失敗`);
+          }
+          count++;
+          const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
+          const remain = Math.floor(elapsedSec * (downloadObj.fileCount - count) / count);
+          remainTime(formatRemain(remain));
+          progress(count * 100 / downloadObj.fileCount | 0);
+          await utils.sleep(100);
+        }
       }
+      if (failedCount > 0) {
+        log(`完了 (${failedCount}件のダウンロードに失敗)`);
+      } else {
+        log("完了");
+      }
+      await zip.close();
+    } catch (e) {
+      await zip.abort(e);
+      throw e;
     }
-    if (failedCount > 0) {
-      log(`完了 (${failedCount}件のダウンロードに失敗)`);
-    } else {
-      log("完了");
-    }
-    await zip.close();
   }
   isDownloadJsonObj(target) {
     if (typeof target !== "object" || target === null) {
