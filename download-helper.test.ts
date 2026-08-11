@@ -2390,6 +2390,69 @@ describe('DownloadHelper.downloadZip', () => {
       expect(result.writtenFileCount).toBe(1); // post1 の cover のみ
     });
 
+    test('ファイルループ先頭の中断チェックで打ち切られる場合、未着手のファイルは fetchFile が呼ばれない', async () => {
+      // 投稿 1 件に添付を 2 件持たせ、1 件目取得後に signal を立てる。
+      // 2 件目はループ先頭の signal チェック (fetchFile 呼び出し前) で打ち切られる分岐であり、
+      // 「fetchFile が null を返した直後に signal.aborted を見る」分岐 (別テストでカバー済み) とは経路が異なる
+      const obj: DownloadJsonObj = {
+        posts: [
+          {
+            originalName: 'post1',
+            encodedName: 'post1',
+            informationText: '{}',
+            htmlText: '<p>1</p>',
+            files: [
+              { url: 'https://example.com/p1-file1.png', originalName: 'file1.png', encodedName: 'file1.png' },
+              { url: 'https://example.com/p1-file2.png', originalName: 'file2.png', encodedName: 'file2.png' },
+            ],
+            tags: [],
+            cover: { url: 'https://example.com/p1-cover.png', name: 'cover.png' },
+          },
+        ],
+        id: 'creator-id',
+        url: 'https://example.com',
+        tags: [],
+        fileCount: 2,
+        postCount: 1,
+      };
+      const controller = new AbortController();
+      const calledUrls: string[] = [];
+      const fetchFile = async (url: string) => {
+        calledUrls.push(url);
+        if (url === 'https://example.com/p1-file1.png') {
+          // file1 の取得完了直後、file2 のループ先頭チェックより前に中断する
+          controller.abort();
+        }
+        return new Blob([new Uint8Array([1])]);
+      };
+      const result = await runForResult(obj, fetchFile, controller.signal);
+      expect(calledUrls).toEqual(['https://example.com/p1-cover.png', 'https://example.com/p1-file1.png']);
+      expect(result.aborted).toBe(true);
+      expect(result.completedPostCount).toBe(0); // file2 未着手のため投稿は未完了
+      expect(result.totalPostCount).toBe(1);
+      expect(result.writtenFileCount).toBe(2); // cover + file1
+      expect(result.failedFileCount).toBe(0);
+    });
+
+    test('カバー取得が中断により null を返す場合、failedFileCount に数えず投稿は completedPostCount に含めない', async () => {
+      const obj = createObjWithCovers();
+      const controller = new AbortController();
+      const fetchFile = async (url: string) => {
+        if (url === 'https://example.com/p1-cover.png') {
+          // カバー自体の取得中に中断される (post1 のカバー fetchFile 呼び出し中、top-of-loop チェックはまだ通過済み)
+          controller.abort();
+          return null;
+        }
+        return new Blob([new Uint8Array([1])]);
+      };
+      const result = await runForResult(obj, fetchFile, controller.signal);
+      expect(result.aborted).toBe(true);
+      expect(result.failedFileCount).toBe(0); // 中断由来の null は失敗として数えない
+      expect(result.completedPostCount).toBe(0); // post1 はカバーすら書けていないため未完了
+      expect(result.totalPostCount).toBe(2);
+      expect(result.writtenFileCount).toBe(0);
+    });
+
     test('全データを書き終えたあと (最終 zip.close() 実行中) に signal.aborted になった場合、aborted は false のまま', async () => {
       const obj = createObjWithCovers();
       const controller = new AbortController();
