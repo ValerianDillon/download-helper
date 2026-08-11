@@ -743,8 +743,13 @@ export class ZipWriter {
     externalAttr: number;
   }[] = [];
   private encoder = new TextEncoder();
-  /** writable に対して abort 済みかどうか。二重 abort を避けるためのフラグ (Issue #17) */
-  private aborted = false;
+  /**
+   * このインスタンスが使用不能になっているかどうか。
+   * addFile / addDirectory / close のいずれかで例外が発生し abortOnFailure に入った時点で true になり、
+   * 以後すべての公開メソッドを拒否する terminal な状態を表す (Issue #17 フォローアップ)。
+   * abort() 自体が失敗した場合もこのフラグは true のまま残るため、二重 abort の防止も兼ねる。
+   */
+  private failed = false;
 
   constructor(writable: FileSystemWritableFileStream) {
     this.writable = writable;
@@ -752,17 +757,21 @@ export class ZipWriter {
 
   /**
    * ファイルを ZIP に追加する
-   * @param name ZIP 内のファイルパス (UTF-8)
+   * @param name ZIP 内のファイルパス (UTF-8)。末尾が `/` の名前は拒否する (ディレクトリと紛らわしいため。
+   *   ディレクトリを追加したい場合は addDirectory を使う)
    * @param data ファイルデータ
    * @param date 任意。指定時は DOS time/date に加え NTFS / Extended Timestamp Extra Field を書き込む。
    *   省略または Invalid Date の場合は従来挙動 (DOS 0、extra field なし) でバイト列を維持する。
    *   1980-01-01 〜 2107-12-31 23:59:58 にクランプ。Extended Timestamp は clamp 後の Unix time が
    *   signed int32 範囲に収まる場合のみ書く。
-   * @throws {Error} name をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "/" "\" ":" を
-   *   含むセグメントがある場合。downloadZip 側でも同じ検証を行うが、addFile を直接呼ぶ利用者を
-   *   無防備にしないための多層防御として ZipWriter 自身にも検証を持たせている (Issue #17)
+   * @throws {Error} このインスタンスが以前の失敗により使用不能になっている場合。
+   *   name をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を含む場合、
+   *   または末尾が `/` の場合 (downloadZip 側でも同じ検証を行うが、addFile を直接呼ぶ利用者を
+   *   無防備にしないための多層防御として ZipWriter 自身にも検証を持たせている、Issue #17)。
+   *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)
    */
   async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
+    this.assertNotFailed('addFile');
     try {
       assertValidZipEntryName(name, 'addFile');
 
@@ -773,6 +782,7 @@ export class ZipWriter {
       // TextEncoder.encode は常に新しい ArrayBuffer を確保する (TypeScript 5.7 未満では
       // 戻り値が ArrayBufferLike 扱いになるためアサーションで補う)
       const nameBytes = this.encoder.encode(name) as Uint8Array<ArrayBuffer>;
+      assertValidZipEntryNameByteLength(nameBytes, name, 'addFile');
       const fileCrc = crc32(bytes);
       const localHeaderOffset = this.offset;
 
@@ -819,19 +829,23 @@ export class ZipWriter {
    * @param name ZIP 内のディレクトリパス (UTF-8)。末尾が `/` でなければ自動的に付与する
    * @param date 任意。addFile と同一の日時ロジック (DOS time/date + NTFS Extra + Extended Timestamp) を適用する。
    *   省略または Invalid Date の場合は DOS time/date = 0、extra field なし
-   * @throws {Error} 正規化後の名前をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を
+   * @throws {Error} このインスタンスが以前の失敗により使用不能になっている場合。
+   *   正規化後の名前をセグメント (`/` 区切り) ごとに見たとき、空文字列 / "." / ".." / "\" ":" を
    *   含むセグメントがある場合 (name が空文字列、または先頭が `/` の場合を含む)。
    *   APPNOTE 4.4.17.1 が ZIP 内のパスを相対パスに限り、先頭 `/` を禁じるため。
    *   addFile と同じ検証をセグメント単位で適用するため、drive letter (`C:/dir`) や `\` 区切りも拒否する
    *   (Issue #14 時点では addFile と非対称にしないため未検証としていたが、Issue #17 で addFile 側にも
-   *   検証を追加したため、この非対称は解消されている)
+   *   検証を追加したため、この非対称は解消されている)。
+   *   エンコード後の名前が 65535 bytes (UTF-8) を超える場合 (file name length フィールドが 16 bit のため)
    */
   async addDirectory(name: string, date?: Date): Promise<void> {
+    this.assertNotFailed('addDirectory');
     try {
       const dirName = name.endsWith('/') ? name : `${name}/`;
       assertValidZipEntryName(dirName, 'addDirectory');
 
       const nameBytes = this.encoder.encode(dirName) as Uint8Array<ArrayBuffer>;
+      assertValidZipEntryNameByteLength(nameBytes, dirName, 'addDirectory');
       const localHeaderOffset = this.offset;
 
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
@@ -880,8 +894,10 @@ export class ZipWriter {
    * `0xFFFF` / `0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値のため、
    * エントリ数が 65,535 件以上、またはサイズ/オフセットが `0xFFFFFFFF` bytes 以上になると壊れた ZIP を出力する。
    * ディレクトリエントリの追加でエントリ数が「投稿数 + 1」増える分、上限に到達しやすくなる点に留意する。
+   * @throws {Error} このインスタンスが以前の失敗により使用不能になっている場合 (Issue #17 フォローアップ)
    */
   async close(): Promise<void> {
+    this.assertNotFailed('close');
     try {
       const cdOffset = this.offset;
 
@@ -939,17 +955,33 @@ export class ZipWriter {
   }
 
   /**
+   * このインスタンスが失敗後の terminal 状態でないことを確認する (Issue #17 フォローアップ)。
+   * failed フラグは abortOnFailure が一度でも実行されると true になり、abort() 自体が失敗しても戻らない。
+   * これが無いと、abort() 失敗後に呼ばれた addFile / addDirectory / close がまだ生きているストリームに
+   * 書き込みを続けてしまい、Central Directory / EOCD を欠いた壊れた ZIP や、無関係な内容の ZIP を
+   * そのままコミットしうる。
+   * @throws {Error} 既に failed 状態の場合
+   */
+  private assertNotFailed(method: 'addFile' | 'addDirectory' | 'close'): void {
+    if (this.failed) {
+      throw new Error(`ZipWriter.${method}: 以前の失敗により使用不可です`);
+    }
+  }
+
+  /**
    * 書き込み中に例外が発生した場合のストリーム cleanup (Issue #17)。
    * `createWritable()` で得たストリームは、close() を呼ばない限り書き込み先の実ファイルへ反映されない
    * (File System Access API の仕様上、変更は close() で初めてコミットされる)。
    * そのため、addFile / addDirectory / close の途中で例外が発生した場合は、
    * 中途半端な (Central Directory / EOCD を欠いた壊れた) ZIP を実ファイルとしてコミットしてしまわないよう、
-   * close() ではなく abort() でストリームを破棄する。abort() 自体の失敗は元の例外を握りつぶさないよう無視し、
-   * 二重に abort しないよう aborted フラグで一度きりに制限する。
+   * close() ではなく abort() でストリームを破棄する。abort() 自体の失敗は元の例外を握りつぶさないよう無視する。
+   * failed フラグは abort() の成否に関わらず true のまま維持し、以後のすべての呼び出しを
+   * assertNotFailed で拒否することで、二重 abort と「失敗後もまだ生きているストリームへの書き込みが
+   * 通ってしまう」問題の両方を防ぐ (assertNotFailed が入口で弾くため、このメソッドが同一インスタンスに対して
+   * 複数回呼ばれることは実際には無い)。
    */
   private async abortOnFailure(reason: unknown): Promise<void> {
-    if (this.aborted) return;
-    this.aborted = true;
+    this.failed = true;
     try {
       await this.writable.abort(reason);
     } catch {
@@ -989,19 +1021,47 @@ function isValidPathSegment(value: unknown): value is string {
  * ZipWriter.addFile / addDirectory 自体への入力検証用で、結合済みのエントリ名をまとめて検証する。
  * downloadZip の事前検証はフィールドごとに isValidPathSegment を個別に呼ぶため、
  * ロジックの実体 (isValidPathSegment) は共有しつつ、ここでは呼び出し形だけをまとめている (重複実装を避ける)。
- * @param name 検証対象のエントリ名。末尾が `/` なら 1 つだけ取り除いてから分割する
- *   (addDirectory が正規化後の "dir/" 形式で渡すため。末尾以外の `/` はセグメント区切りとして扱う)
- * @param method エラーメッセージに含める呼び出し元メソッド名
+ * 末尾 `/` の扱いは method によって非対称にする。addDirectory は呼び出し元 (このファイル内の addDirectory)
+ * が必ず正規化後の "dir/" 形式で渡すため、末尾の `/` を 1 つだけ取り除いてから分割する。
+ * addFile は取り除かない。取り除いてしまうと `addFile("dir/", data)` のような、名前上はディレクトリなのに
+ * データ本体を持つ矛盾したエントリを許してしまうため、末尾 `/` は素通しでセグメント分割にかけ、
+ * 分割で生じる空文字列セグメントとして isValidPathSegment に拒否させる (Issue #17 フォローアップ)。
+ * @param name 検証対象のエントリ名
+ * @param method エラーメッセージに含める呼び出し元メソッド名。addDirectory の場合のみ末尾 `/` を除去する
  * @throws {Error} いずれかのセグメントが isValidPathSegment を満たさない場合
- *   (空文字列 / "." / ".." / "/" "\" ":" を含む。空文字列は name が空、先頭が `/`、または `//` の埋め込みで発生する)
+ *   (空文字列 / "." / ".." / "/" "\" ":" を含む。空文字列は name が空、先頭・末尾が `/`、または `//` の埋め込みで発生する)
  * @internal
  */
 function assertValidZipEntryName(name: string, method: 'addFile' | 'addDirectory'): void {
-  const withoutTrailingSlash = name.endsWith('/') ? name.slice(0, -1) : name;
-  for (const segment of withoutTrailingSlash.split('/')) {
+  const segmentsSource = method === 'addDirectory' && name.endsWith('/') ? name.slice(0, -1) : name;
+  for (const segment of segmentsSource.split('/')) {
     if (!isValidPathSegment(segment)) {
       throw new Error(`ZipWriter.${method}: 不正な ZIP エントリ名です (${JSON.stringify(name)})`);
     }
+  }
+}
+
+/**
+ * ZIP エントリ名の UTF-8 バイト長を検証する。
+ * LFH / CD の file name length フィールドは 16 bit (uint16) のため、65535 bytes を超える名前を
+ * そのまま書くと setUint16 が値を切り詰め、直後に書く名前バイト列自体は全長書き込まれてしまい、
+ * 後続のデータ (extra field やファイル本体) の位置がずれた壊れた ZIP になる。
+ * 入力は非信頼という前提のため、約 64 KiB の名前は実際に発生しうる (Issue #17 フォローアップ)。
+ * @param nameBytes エンコード後のエントリ名バイト列
+ * @param name エラーメッセージ用の元の名前 (addDirectory の場合は正規化後の "dir/" 形式)
+ * @param method エラーメッセージに含める呼び出し元メソッド名
+ * @throws {Error} nameBytes.length が 65535 を超える場合
+ * @internal
+ */
+function assertValidZipEntryNameByteLength(
+  nameBytes: Uint8Array,
+  name: string,
+  method: 'addFile' | 'addDirectory',
+): void {
+  if (nameBytes.length > 0xffff) {
+    throw new Error(
+      `ZipWriter.${method}: エントリ名が長すぎます (UTF-8 ${nameBytes.length} bytes, 上限 65535 bytes): ${JSON.stringify(name)}`,
+    );
   }
 }
 

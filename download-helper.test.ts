@@ -1192,7 +1192,7 @@ describe('ZipWriter', () => {
       await expect(zip.addFile('test.txt', encoder.encode('x'))).rejects.toThrow(writeError);
     });
 
-    test('失敗が連続しても abort は 1 回だけ呼ばれる (二重 abort しない)', async () => {
+    test('失敗が連続しても abort は 1 回だけ呼ばれる (二重 abort しない、2 回目は terminal 状態で即拒否される)', async () => {
       const mock = new MockWritableStream();
       let abortCalls = 0;
       const originalAbort = mock.abort.bind(mock);
@@ -1204,6 +1204,129 @@ describe('ZipWriter', () => {
       await expect(zip.addFile('..', encoder.encode('x'))).rejects.toThrow();
       await expect(zip.addFile('.', encoder.encode('x'))).rejects.toThrow();
       expect(abortCalls).toBe(1);
+    });
+  });
+
+  // ----------------------------------------------------------
+  // エントリ名の UTF-8 バイト長検証 (Issue #17 フォローアップ)
+  // LFH / CD の file name length フィールドは 16 bit (uint16) のため、65535 bytes を超える名前を
+  // そのまま書くと setUint16 が値を切り詰め、後続データの位置がずれた壊れた ZIP になる。境界の両側を検証する。
+  // ----------------------------------------------------------
+  describe('エントリ名の UTF-8 バイト長検証 (Issue #17 フォローアップ)', () => {
+    test('addFile: ちょうど 65535 bytes の名前は通る', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const name = 'a'.repeat(0xffff);
+      await zip.addFile(name, encoder.encode('x'));
+      await zip.close();
+      expect(mock.closed).toBe(true);
+    });
+
+    test('addFile: 65535 + 1 bytes の名前は拒否され、ストリームが abort される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      const name = 'a'.repeat(0xffff + 1);
+      await expect(zip.addFile(name, encoder.encode('x'))).rejects.toThrow();
+      expect(mock.aborted).toBe(true);
+      expect(mock.closed).toBe(false);
+    });
+
+    test('addDirectory: 付与される末尾 "/" を含めてちょうど 65535 bytes の名前は通る', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      // addDirectory が末尾に "/" (1 byte) を付与するため、name 自体は 65534 bytes にする
+      const name = 'a'.repeat(0xffff - 1);
+      await zip.addDirectory(name);
+      await zip.close();
+      expect(mock.closed).toBe(true);
+    });
+
+    test('addDirectory: 付与される末尾 "/" を含めて 65535 + 1 bytes の名前は拒否され、ストリームが abort される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      // "/" (1 byte) を足すとちょうど 65536 bytes になる
+      const name = 'a'.repeat(0xffff);
+      await expect(zip.addDirectory(name)).rejects.toThrow();
+      expect(mock.aborted).toBe(true);
+      expect(mock.closed).toBe(false);
+    });
+  });
+
+  // ----------------------------------------------------------
+  // addFile の末尾 "/" 拒否 (Issue #17 フォローアップ)
+  // assertValidZipEntryName が末尾 "/" を無条件に取り除くと、addFile("dir/", data) のように
+  // 名前上はディレクトリなのにデータ本体を持ち directory attribute を持たない矛盾したエントリができてしまう。
+  // ----------------------------------------------------------
+  describe('addFile の末尾 "/" 拒否 (Issue #17 フォローアップ)', () => {
+    test('addFile("dir/") が例外を投げ、ストリームが abort される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await expect(zip.addFile('dir/', encoder.encode('x'))).rejects.toThrow();
+      expect(mock.aborted).toBe(true);
+      expect(mock.closed).toBe(false);
+    });
+
+    test('addFile("a/b/") (複数セグメントの末尾 "/") も例外を投げる', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await expect(zip.addFile('a/b/', encoder.encode('x'))).rejects.toThrow();
+    });
+  });
+
+  // ----------------------------------------------------------
+  // 失敗後は使用不能になる (terminal 状態、Issue #17 フォローアップ)
+  // aborted フラグが単に abort の重複防止にしか使われておらず、失敗後の addFile / addDirectory / close の
+  // 呼び出しを禁止していなかった問題の修正。特に abort() 自体が失敗するケースで、
+  // まだ生きているストリームへの書き込みや close() が通り部分的な ZIP がコミットされうる問題を防ぐ。
+  // ----------------------------------------------------------
+  describe('失敗後は使用不能になる (Issue #17 フォローアップ)', () => {
+    test('addFile が失敗した後、addFile の再呼び出しが拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await expect(zip.addFile('..', encoder.encode('x'))).rejects.toThrow();
+      await expect(zip.addFile('valid.txt', encoder.encode('x'))).rejects.toThrow();
+    });
+
+    test('addFile が失敗した後、addDirectory の呼び出しが拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await expect(zip.addFile('..', encoder.encode('x'))).rejects.toThrow();
+      await expect(zip.addDirectory('valid')).rejects.toThrow();
+    });
+
+    test('addFile が失敗した後、close の呼び出しが拒否され、writable.close は呼ばれない', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await expect(zip.addFile('..', encoder.encode('x'))).rejects.toThrow();
+      await expect(zip.close()).rejects.toThrow();
+      expect(mock.closed).toBe(false);
+    });
+
+    test('abort() 自体が失敗した後でも、以後の addFile / close は拒否され続ける', async () => {
+      const mock = new MockWritableStream();
+      mock.abort = async () => {
+        throw new Error('abort also failed');
+      };
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await expect(zip.addFile('..', encoder.encode('x'))).rejects.toThrow();
+
+      // abort() が失敗しても、その後の addFile / close がまだ生きているストリームに書き込んで
+      // 成功してしまってはならない
+      await expect(zip.addFile('valid.txt', encoder.encode('x'))).rejects.toThrow();
+      await expect(zip.close()).rejects.toThrow();
+      expect(mock.closed).toBe(false);
+    });
+
+    test('close が失敗した後、close の再呼び出しも拒否される', async () => {
+      const mock = new MockWritableStream();
+      const zip = new ZipWriter(mock as unknown as FileSystemWritableFileStream);
+      await zip.addFile('test.txt', encoder.encode('x'));
+      const closeError = new Error('close failed');
+      mock.close = async () => {
+        throw closeError;
+      };
+      await expect(zip.close()).rejects.toThrow(closeError);
+      await expect(zip.close()).rejects.toThrow();
     });
   });
 });

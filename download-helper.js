@@ -433,15 +433,17 @@ export class ZipWriter {
   offset = 0;
   entries = [];
   encoder = new TextEncoder;
-  aborted = false;
+  failed = false;
   constructor(writable) {
     this.writable = writable;
   }
   async addFile(name, data, date) {
+    this.assertNotFailed("addFile");
     try {
       assertValidZipEntryName(name, "addFile");
       const bytes = data.buffer instanceof ArrayBuffer ? data : new Uint8Array(data);
       const nameBytes = this.encoder.encode(name);
+      assertValidZipEntryNameByteLength(nameBytes, name, "addFile");
       const fileCrc = crc32(bytes);
       const localHeaderOffset = this.offset;
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
@@ -479,10 +481,12 @@ export class ZipWriter {
     }
   }
   async addDirectory(name, date) {
+    this.assertNotFailed("addDirectory");
     try {
       const dirName = name.endsWith("/") ? name : `${name}/`;
       assertValidZipEntryName(dirName, "addDirectory");
       const nameBytes = this.encoder.encode(dirName);
+      assertValidZipEntryNameByteLength(nameBytes, dirName, "addDirectory");
       const localHeaderOffset = this.offset;
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
       const header = new ArrayBuffer(30);
@@ -518,6 +522,7 @@ export class ZipWriter {
     }
   }
   async close() {
+    this.assertNotFailed("close");
     try {
       const cdOffset = this.offset;
       for (const entry of this.entries) {
@@ -567,10 +572,13 @@ export class ZipWriter {
     await this.writable.write(data);
     this.offset += data.length;
   }
+  assertNotFailed(method) {
+    if (this.failed) {
+      throw new Error(`ZipWriter.${method}: 以前の失敗により使用不可です`);
+    }
+  }
   async abortOnFailure(reason) {
-    if (this.aborted)
-      return;
-    this.aborted = true;
+    this.failed = true;
     try {
       await this.writable.abort(reason);
     } catch {}
@@ -580,11 +588,16 @@ function isValidPathSegment(value) {
   return typeof value === "string" && value.length > 0 && value !== "." && value !== ".." && !/[/\\:]/.test(value);
 }
 function assertValidZipEntryName(name, method) {
-  const withoutTrailingSlash = name.endsWith("/") ? name.slice(0, -1) : name;
-  for (const segment of withoutTrailingSlash.split("/")) {
+  const segmentsSource = method === "addDirectory" && name.endsWith("/") ? name.slice(0, -1) : name;
+  for (const segment of segmentsSource.split("/")) {
     if (!isValidPathSegment(segment)) {
       throw new Error(`ZipWriter.${method}: 不正な ZIP エントリ名です (${JSON.stringify(name)})`);
     }
+  }
+}
+function assertValidZipEntryNameByteLength(nameBytes, name, method) {
+  if (nameBytes.length > 65535) {
+    throw new Error(`ZipWriter.${method}: エントリ名が長すぎます (UTF-8 ${nameBytes.length} bytes, 上限 65535 bytes): ${JSON.stringify(name)}`);
   }
 }
 function pad2(n) {
