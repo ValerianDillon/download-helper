@@ -1125,8 +1125,37 @@ export type DownloadZipOptions = {
   handle?: FileSystemFileHandle;
   /** 中断用。投稿ループ / ファイルループの先頭で aborted を確認する */
   signal?: AbortSignal;
-  /** ファイル取得処理の差し替え (未指定時は DownloadUtils.fetchWithLimit を使う) */
-  fetchFile?: (url: string, name: string) => Promise<Blob | null>;
+  /**
+   * ファイル取得処理の差し替え (未指定時は DownloadUtils.fetchWithLimit を使う)。
+   * 第 3 引数の context.kind で、取得対象がカバー画像 (`cover`) か投稿内添付ファイル (`file`) かを
+   * 呼び出し側に伝える (Issue #13)。ファイル名からの推測はカバー画像と同名の添付ファイルがあり得るため
+   * 安定しないので、downloadZip 側から明示的に渡す。
+   * 引数が 2 つの既存関数もそのまま代入できる (TypeScript では引数の少ない関数は代入可能なため後方互換)。
+   */
+  fetchFile?: (url: string, name: string, context: { kind: 'cover' | 'file' }) => Promise<Blob | null>;
+};
+
+/**
+ * downloadZip の処理結果 (Issue #13)。
+ * 各件数の定義:
+ * - completedPostCount: 投稿ディレクトリ配下の処理 (HTML + カバー + 添付) をすべて終えた投稿数。
+ *   中断で途中打ち切りになった投稿は含めない
+ * - totalPostCount: downloadObj.posts の総数
+ * - writtenFileCount: ZIP に書き込んだ「取得系ファイル」数 = カバー + 添付の成功数。
+ *   HTML / info テキストなど生成ファイルは含めない (取得の成否という関心事に合わせる)
+ * - failedFileCount: 取得を試みて最終的に失敗した数 = カバー + 添付の失敗数。
+ *   中断によって取得しなかった/中止したものは含めない (fetchFile が null を返した直後に signal.aborted を
+ *   確認し、中断由来の null はここに数えない)
+ * - aborted: 実際に中断分岐 (投稿ループ / カバー取得後 / ファイルループの各 signal チェック) で
+ *   打ち切ったかどうか。全データを書き終えたあと、zip.close() の実行中に signal.aborted になった場合は
+ *   ここには反映されない (書けているものを誤って「中断」と報告しないため) ため false のままになる
+ */
+export type DownloadZipResult = {
+  completedPostCount: number;
+  totalPostCount: number;
+  writtenFileCount: number;
+  failedFileCount: number;
+  aborted: boolean;
 };
 
 /**
@@ -1378,6 +1407,7 @@ export class DownloadHelper {
    * @param log ログ出力関数 (同期)
    * @param remainTime 終了予測出力関数 (同期)
    * @param options handle/signal/fetchFile を差し替えるためのオプション (省略時は従来どおりの挙動)
+   * @returns 処理結果 (Issue #13)。各件数の定義は DownloadZipResult のコメントを参照
    */
   async downloadZip(
     downloadObj: unknown,
@@ -1385,7 +1415,7 @@ export class DownloadHelper {
     log: (s: string) => void,
     remainTime: (r: string) => void,
     options?: DownloadZipOptions,
-  ) {
+  ): Promise<DownloadZipResult> {
     if (!this.isDownloadJsonObj(downloadObj)) throw new Error('ダウンロード対象オブジェクトの型が不正');
     const utils = this.utils;
     const encodedId = utils.encodeFileName(downloadObj.id);
@@ -1423,7 +1453,11 @@ export class DownloadHelper {
     // (toUint8Array 内の Blob.arrayBuffer も同様に投げうる)。zip.addFile 等が投げた場合は ZipWriter が内部で
     // 既に abort 済み (terminal) のため、ここでの zip.abort は no-op になる。
     try {
-      const fetchFile = options?.fetchFile ?? ((url: string, name: string) => utils.fetchWithLimit({ url, name }, 1));
+      // 既定 fetchFile も 3 引数の型に揃えておく (options?.fetchFile との ?? の結果が 3 引数の型で
+      // 確定するようにするため。2 引数の関数リテラルのままだと fetchFile(url, name, context) の
+      // 呼び出しで型検査上の引数過多になる)
+      const fetchFile: NonNullable<DownloadZipOptions['fetchFile']> =
+        options?.fetchFile ?? ((url: string, name: string) => utils.fetchWithLimit({ url, name }, 1));
 
       const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
         await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
@@ -1437,7 +1471,10 @@ export class DownloadHelper {
 
       const startTime = Math.floor(Date.now() / 1000);
       let count = 0;
-      let failedCount = 0;
+      let writtenFileCount = 0;
+      let failedFileCount = 0;
+      let completedPostCount = 0;
+      let aborted = false;
 
       log(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
       // ルートディレクトリ (日時は有効な publishedDatetime の最大値。有効な値が 1 件も無ければ date なし)
@@ -1451,10 +1488,10 @@ export class DownloadHelper {
       await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html');
       // 投稿処理
       let postCount = 0;
-      for (const post of downloadObj.posts) {
+      postLoop: for (const post of downloadObj.posts) {
         if (options?.signal?.aborted) {
-          await zip.close();
-          return;
+          aborted = true;
+          break;
         }
         log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
         const postDate = parsePublishedDate(post.publishedDatetime);
@@ -1475,24 +1512,39 @@ export class DownloadHelper {
         // カバー画像
         if (post.cover) {
           log(`download ${post.cover.name}`);
-          const blob = await fetchFile(post.cover.url, post.cover.name);
+          const blob = await fetchFile(post.cover.url, post.cover.name, { kind: 'cover' });
           if (blob) {
             await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
+            writtenFileCount++;
+          } else if (options?.signal?.aborted) {
+            // 中断による null は通信失敗ではないので failedFileCount に数えない。
+            // この投稿はカバーを書き終えていないので completedPostCount にも含めない
+            aborted = true;
+            break;
+          } else {
+            failedFileCount++;
+            console.error(`${post.cover.name}(${post.cover.url})のダウンロードに失敗、読み飛ばすよ`);
+            log(`${post.cover.name}のダウンロードに失敗`);
           }
         }
         // ファイル処理
         let fileCount = 0;
         for (const file of post.files) {
           if (options?.signal?.aborted) {
-            await zip.close();
-            return;
+            aborted = true;
+            break postLoop;
           }
           log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-          const blob = await fetchFile(file.url, file.encodedName);
+          const blob = await fetchFile(file.url, file.encodedName, { kind: 'file' });
           if (blob) {
             await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
+            writtenFileCount++;
+          } else if (options?.signal?.aborted) {
+            // 中断による null は通信失敗ではないので failedFileCount に数えない
+            aborted = true;
+            break postLoop;
           } else {
-            failedCount++;
+            failedFileCount++;
             console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
             log(`${file.encodedName}のダウンロードに失敗`);
           }
@@ -1503,13 +1555,24 @@ export class DownloadHelper {
           progress(((count * 100) / downloadObj.fileCount) | 0);
           await utils.sleep(100);
         }
+        // HTML + カバー + 添付すべてを打ち切りなく処理し終えた投稿のみ完了として数える
+        completedPostCount++;
       }
-      if (failedCount > 0) {
-        log(`完了 (${failedCount}件のダウンロードに失敗)`);
-      } else {
-        log('完了');
+      if (!aborted) {
+        if (failedFileCount > 0) {
+          log(`完了 (${failedFileCount}件のダウンロードに失敗)`);
+        } else {
+          log('完了');
+        }
       }
       await zip.close();
+      return {
+        completedPostCount,
+        totalPostCount: downloadObj.posts.length,
+        writtenFileCount,
+        failedFileCount,
+        aborted,
+      };
     } catch (e) {
       await zip.abort(e);
       throw e;

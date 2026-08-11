@@ -51,7 +51,13 @@ tsconfig.json
 `DownloadHelper.downloadZip` は第 5 引数 `options?: DownloadZipOptions` で以下を差し替え可能（省略時は従来どおりの挙動）:
 - `handle` — 指定時は `showSaveFilePicker` を呼ばずこのハンドルに書き込む
 - `signal` — 指定時、投稿ループ / ファイルループの先頭で `aborted` を確認して中断する
-- `fetchFile` — ファイル取得処理の差し替え（拡張は service worker 経由の CORS 回避プロキシを注入する）
+- `fetchFile` — ファイル取得処理の差し替え（拡張は service worker 経由の CORS 回避プロキシを注入する）。第 3 引数
+  `context.kind`（`'cover' | 'file'`）でカバー画像か投稿内添付ファイルかを呼び出し側に伝える（Issue #13）。
+  引数が 2 つの既存関数もそのまま代入できる（TypeScript の関数型の部分型付けにより後方互換）
+
+`downloadZip` は `DownloadZipResult`（`completedPostCount` / `totalPostCount` / `writtenFileCount` /
+`failedFileCount` / `aborted`）を返す（Issue #13）。各件数の定義は `DownloadZipResult` の JSDoc を参照。
+既存呼び出し元（`createDownloadUI` のブックマークレット向け UI）は戻り値を無視しており、そのままコンパイルできる。
 
 `fanbox-collector.ts` は FANBOX API の型定義、`DownloadManage`（収集時の状態管理）、`addByPostInfo` /
 `convertImageMap` / `convertFileMap` / `convertEmbedMap` / `convertUrlEmbedMap`（postInfo → DownloadObject 変換）
