@@ -3,7 +3,9 @@
   "version": "4.3.0",
   "description": "ブックマークレットとかで使うUI",
   "scripts": {
-    "build": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle && bun build ./fanbox-collector.ts --outfile ./fanbox-collector.js --format esm --target browser --no-bundle",
+    "build": "bun run build:js && bun run build:types",
+    "build:js": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle && bun build ./fanbox-collector.ts --outfile ./fanbox-collector.js --format esm --target browser --no-bundle",
+    "build:types": "rm -rf dist/types && tsc -p tsconfig.declaration.json",
     "lint": "biome check --write .",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
@@ -15,12 +17,25 @@
   "author": "ValerianDillon",
   "license": "MIT",
   "main": "download-helper.js",
-  "types": "download-helper.ts",
+  "types": "dist/types/download-helper.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/download-helper.d.ts",
+      "default": "./download-helper.js"
+    },
+    "./download-helper": {
+      "types": "./dist/types/download-helper.d.ts",
+      "default": "./download-helper.js"
+    },
+    "./fanbox-collector": {
+      "types": "./dist/types/fanbox-collector.d.ts",
+      "default": "./fanbox-collector.js"
+    }
+  },
   "files": [
     "download-helper.js",
-    "download-helper.ts",
     "fanbox-collector.js",
-    "fanbox-collector.ts"
+    "dist/types"
   ],
   "bugs": {
     "url": "https://github.com/ValerianDillon/download-helper/issues"
