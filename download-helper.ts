@@ -241,6 +241,22 @@ export class DownloadUtils {
 }
 
 /**
+ * 投稿名 / 添付ファイル名をキーにした辞書オブジェクトを作る。
+ *
+ * 通常の `{}` だと、キーが "__proto__" のとき (Object.prototype の accessor と衝突する)
+ * `obj[key] = value` が実際にはプロトタイプを差し替えるだけで own property を作らず、
+ * "constructor" のような他の Object.prototype 由来のキーでも `obj[key] === undefined` が
+ * false になって初期化の分岐がスキップされる。結果、直後の `obj[key].push(...)` が
+ * 継承したメソッドを持たない値 (Object.prototype 自身や Object コンストラクタ関数) に
+ * 対して呼ばれ例外になる。投稿名・添付ファイル名は FANBOX API のレスポンスに由来する
+ * 外部入力であり、このキーを回避できないため、プロトタイプを持たないオブジェクトにして
+ * 経路ごと塞ぐ。
+ */
+function createNameKeyedDictionary<T>(): Record<string, T> {
+  return Object.create(null);
+}
+
+/**
  * ダウンロード用のオブジェクトラッパークラス
  */
 export class DownloadObject {
@@ -251,7 +267,7 @@ export class DownloadObject {
   private tags: string[] | undefined;
 
   constructor(id: string, utils: DownloadUtils) {
-    this.downloadObj = { posts: {}, id };
+    this.downloadObj = { posts: createNameKeyedDictionary(), id };
     this.utils = utils;
   }
 
@@ -280,7 +296,7 @@ export class DownloadObject {
     if (this.downloadObj.posts[encodedName] === undefined) {
       this.downloadObj.posts[encodedName] = [];
     }
-    const postObj: PostObj = { name, info: '', files: {}, html: '', tags: [] };
+    const postObj: PostObj = { name, info: '', files: createNameKeyedDictionary(), html: '', tags: [] };
     this.downloadObj.posts[encodedName].push(postObj);
     const postObject = new PostObject(postObj, this.utils);
     this.orderedPosts.push(postObject);

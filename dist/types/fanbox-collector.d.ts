@@ -227,18 +227,43 @@ export declare class DownloadManage {
 }
 /**
  * addByPostInfo の処理結果
- * 呼び出し側が「意図した除外」と「取れなかった投稿」を区別できるようにするための戻り値。
- * 一括して読み飛ばすと、本文の在り処が変わったときに全投稿が無言で消えても気付けない。
+ * 呼び出し側が「意図した除外」と「取れなかった投稿」、および取れなかった理由を
+ * 区別できるようにするための判別可能な戻り値。文字列 1 個への集約だと、呼び出し側が
+ * 理由ごとに別対応 (継続 / 中断 / 表示の出し分け) をしたくても情報が足りない。
  */
 export type AddPostResult = 
 /** 取り込んだ */
-'added'
+{
+    status: 'added';
+}
 /** isIgnoreFree の設定により意図的に除外した */
- | 'ignored'
-/** 本文が無い (支援額が足りない、または本文の在り処が変わった) */
- | 'unavailable'
-/** 本文の形式が想定と違う */
- | 'invalid';
+ | {
+    status: 'ignored';
+}
+/** 本文を取り込めなかった。reason で理由を区別する */
+ | {
+    status: 'unavailable';
+    /**
+     * 'restricted': 一覧時点で isRestricted だった (支援額不足など、正常系でも起こりうる)
+     * 'missing-body': isRestricted ではないのに本文が無い、または postInfo 自体が取得できなかった。
+     *   一覧で unrestricted だった投稿の本文欠落は構造的な不一致の疑いがあるが、
+     *   ここでは isRestricted の有無以上の判別材料を持たないため 'missing-body' に丸める
+     */
+    reason: 'restricted' | 'missing-body';
+}
+/** 既知の投稿タイプだが、本文の必要フィールドが揃っていない (構造的な不一致) */
+ | {
+    status: 'invalid';
+    postId: string;
+    type: string;
+    missing: string[];
+}
+/** 未知の投稿タイプ。本文を読めないので取り込めないが、収集全体は中断しない */
+ | {
+    status: 'unsupported';
+    postId: string;
+    type: string;
+};
 /**
  * postInfoオブジェクトからURLリストに追加する
  * @param downloadManage ダウンロード設定

@@ -233,28 +233,49 @@ describe('addByPostInfo - 取り込み結果', () => {
 
   const postCount = (m: DownloadManage) => JSON.parse(m.downloadObject.stringify()).posts.length;
 
-  test('取り込めたら added を返す', () => {
+  test('取り込めたら { status: "added" } を返す', () => {
     const m = createManage();
-    expect(addByPostInfo(m, basePost())).toBe('added');
+    expect(addByPostInfo(m, basePost())).toEqual({ status: 'added' });
     expect(postCount(m)).toBe(1);
   });
 
-  test('isIgnoreFree による無料投稿の除外は ignored を返す', () => {
+  test('isIgnoreFree による無料投稿の除外は { status: "ignored" } を返す', () => {
     const m = createManage();
     m.isIgnoreFree = true;
-    expect(addByPostInfo(m, basePost({ feeRequired: 0 }))).toBe('ignored');
+    expect(addByPostInfo(m, basePost({ feeRequired: 0 }))).toEqual({ status: 'ignored' });
     expect(postCount(m)).toBe(0);
   });
 
-  test('本文が無ければ unavailable を返す', () => {
+  test('postInfo が無ければ unavailable / missing-body を返す (isRestricted が分からないため)', () => {
     const m = createManage();
-    expect(addByPostInfo(m, basePost({ body: undefined } as Partial<PostInfo>))).toBe('unavailable');
+    expect(addByPostInfo(m, undefined)).toEqual({ status: 'unavailable', reason: 'missing-body' });
     expect(postCount(m)).toBe(0);
   });
 
-  test('閲覧できない投稿は unavailable を返す', () => {
+  test('本文が無ければ unavailable / missing-body を返す', () => {
     const m = createManage();
-    expect(addByPostInfo(m, basePost({ isRestricted: true }))).toBe('unavailable');
+    expect(addByPostInfo(m, basePost({ body: undefined } as Partial<PostInfo>))).toEqual({
+      status: 'unavailable',
+      reason: 'missing-body',
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('閲覧できない投稿は unavailable / restricted を返す (本文があっても isRestricted を優先する)', () => {
+    const m = createManage();
+    expect(addByPostInfo(m, basePost({ isRestricted: true }))).toEqual({
+      status: 'unavailable',
+      reason: 'restricted',
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('isRestricted かつ本文も無い場合も restricted を返す (missing-body に落ちない)', () => {
+    const m = createManage();
+    expect(addByPostInfo(m, basePost({ isRestricted: true, body: undefined } as Partial<PostInfo>))).toEqual({
+      status: 'unavailable',
+      reason: 'restricted',
+    });
     expect(postCount(m)).toBe(0);
   });
 
@@ -262,8 +283,184 @@ describe('addByPostInfo - 取り込み結果', () => {
     const m = createManage();
     // image タイプなのに images が無い: 従来は登録後に TypeError となり空の投稿が残っていた
     const broken = basePost({ type: 'image', body: { text: 'hello' } } as Partial<PostInfo>);
-    expect(addByPostInfo(m, broken)).toBe('invalid');
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'image',
+      missing: ['body.images'],
+    });
     expect(postCount(m)).toBe(0);
+  });
+
+  test('invalid の missing は欠けているフィールドを列挙する (text も無い場合)', () => {
+    const m = createManage();
+    const broken = basePost({ type: 'image', body: {} } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'image',
+      missing: ['body.images', 'body.text'],
+    });
+  });
+
+  test('images の要素に originalUrl / extension が無ければ invalid を返す', () => {
+    const m = createManage();
+    const broken = basePost({
+      type: 'image',
+      body: { text: 'hello', images: [{ originalUrl: 'url' }] },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'image',
+      missing: ['body.images'],
+    });
+  });
+
+  test('tags が配列でなければ invalid を返す (スプレッドで例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({ tags: undefined } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'text',
+      missing: ['tags'],
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('coverImageUrl が truthy な非文字列なら invalid を返す (.split で例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({ coverImageUrl: 12345 } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'text',
+      missing: ['coverImageUrl'],
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('coverImageUrl が null / undefined なら許容する (falsy 分岐で split を呼ばないため)', () => {
+    const m = createManage();
+    expect(addByPostInfo(m, basePost({ coverImageUrl: null }))).toEqual({ status: 'added' });
+    expect(addByPostInfo(m, basePost({ coverImageUrl: undefined } as Partial<PostInfo>))).toEqual({
+      status: 'added',
+    });
+  });
+
+  test('title が非文字列なら invalid を返す (encodeFileName / escapeHtml で例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({ title: 123 } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'text',
+      missing: ['title'],
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('本文外フィールドが壊れていても取得件数上限を消費しない', () => {
+    const m = createManage();
+    m.setLimitAvailable(true);
+    m.setLimit(1);
+    addByPostInfo(m, basePost({ tags: undefined } as unknown as Partial<PostInfo>));
+    expect(m.isLimitValid()).toBe(true);
+  });
+
+  test('article タイプは blocks / imageMap / fileMap / embedMap / urlEmbedMap を個別に検査する', () => {
+    const m = createManage();
+    const broken = basePost({
+      type: 'article',
+      body: { blocks: [], imageMap: {}, fileMap: {}, embedMap: [], urlEmbedMap: {} }, // embedMap が配列 (Record ではない)
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'article',
+      missing: ['body.embedMap'],
+    });
+  });
+
+  test('article の p ブロックに text が無ければ invalid を返す (escapeHtml が非文字列で例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({
+      type: 'article',
+      body: { blocks: [{ type: 'p' }], imageMap: {}, fileMap: {}, embedMap: {}, urlEmbedMap: {} },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'article',
+      missing: ['body.blocks'],
+    });
+  });
+
+  test('urlEmbedMap の要素が null なら invalid を返す (type 参照で例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({
+      type: 'article',
+      body: { blocks: [], imageMap: {}, fileMap: {}, embedMap: {}, urlEmbedMap: { u1: null } },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'article',
+      missing: ['body.urlEmbedMap'],
+    });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('urlEmbedMap の html 要素で html が null なら invalid を返す (String.prototype.match が無く例外になるため)', () => {
+    const m = createManage();
+    const broken = basePost({
+      type: 'article',
+      body: {
+        blocks: [],
+        imageMap: {},
+        fileMap: {},
+        embedMap: {},
+        urlEmbedMap: { u1: { id: 'u1', type: 'html', html: null } },
+      },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, broken)).toEqual({
+      status: 'invalid',
+      postId: 'post-1',
+      type: 'article',
+      missing: ['body.urlEmbedMap'],
+    });
+  });
+
+  test('urlEmbedMap の未知 type は消費側が JSON.stringify で吸収するため検証を通す', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'article',
+      body: {
+        blocks: [],
+        imageMap: {},
+        fileMap: {},
+        embedMap: {},
+        urlEmbedMap: { u1: { id: 'u1', type: 'oembed', anything: 'goes' } },
+      },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+  });
+
+  test('urlEmbedMap が正常な既知 type (default) のみなら取り込める', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'article',
+      body: {
+        blocks: [],
+        imageMap: {},
+        fileMap: {},
+        embedMap: {},
+        urlEmbedMap: { u1: { id: 'u1', type: 'default', url: 'https://example.com', host: 'example.com' } },
+      },
+    } as unknown as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    expect(postCount(m)).toBe(1);
   });
 
   test('本文が壊れていても取得件数上限を消費しない', () => {
@@ -274,11 +471,89 @@ describe('addByPostInfo - 取り込み結果', () => {
     expect(m.isLimitValid()).toBe(true);
   });
 
-  test('未知タイプは本文を触らないので取り込む', () => {
+  test('未知タイプは unsupported を返し、本文を触らず登録もしない', () => {
     const m = createManage();
     const unknown = basePost({ type: 'image-v2', body: { whatever: true } } as unknown as Partial<PostInfo>);
-    expect(addByPostInfo(m, unknown)).toBe('added');
-    expect(postCount(m)).toBe(1);
+    expect(addByPostInfo(m, unknown)).toEqual({ status: 'unsupported', postId: 'post-1', type: 'image-v2' });
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('未知タイプは取得件数上限を消費しない', () => {
+    const m = createManage();
+    m.setLimitAvailable(true);
+    m.setLimit(1);
+    const unknown = basePost({ type: 'image-v2', body: { whatever: true } } as unknown as Partial<PostInfo>);
+    addByPostInfo(m, unknown);
+    expect(m.isLimitValid()).toBe(true);
+  });
+
+  // DownloadObject.posts / PostObject.files は encodeFileName(name) をキーにした辞書に
+  // name/extension を登録する。通常の {} だとキーが "__proto__" / "constructor" のとき
+  // 初期化チェック (obj[key] === undefined) が Object.prototype 由来の値を拾って false になり、
+  // 直後の obj[key].push(...) が例外になっていた (download-helper.ts の createNameKeyedDictionary で修正済み)。
+  // 投稿タイトル・添付ファイル名は FANBOX API のレスポンスに由来する外部入力なのでここを回避できない。
+  test('投稿タイトルが "__proto__" でも例外にならず登録できる', () => {
+    const m = createManage();
+    const post = basePost({ title: '__proto__' });
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].originalName).toBe('__proto__');
+  });
+
+  test('投稿タイトルが "constructor" でも例外にならず登録できる', () => {
+    const m = createManage();
+    const post = basePost({ title: 'constructor' });
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].originalName).toBe('constructor');
+  });
+
+  test('添付ファイル名が "__proto__" でも例外にならず格納される', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'file',
+      body: {
+        text: 'hello',
+        files: [{ name: '__proto__', extension: 'txt', url: 'https://example.com/proto.txt' }],
+      },
+    } as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].files).toHaveLength(1);
+    expect(parsed.posts[0].files[0].originalName).toBe('__proto__');
+    expect(parsed.posts[0].files[0].url).toBe('https://example.com/proto.txt');
+  });
+
+  test('添付ファイル名が "constructor" でも例外にならず格納される', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'file',
+      body: {
+        text: 'hello',
+        files: [{ name: 'constructor', extension: 'txt', url: 'https://example.com/ctor.txt' }],
+      },
+    } as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].files).toHaveLength(1);
+    expect(parsed.posts[0].files[0].originalName).toBe('constructor');
+  });
+
+  test('同一投稿内に "__proto__" という名前の添付が複数あっても全件蓄積される', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'file',
+      body: {
+        text: 'hello',
+        files: [
+          { name: '__proto__', extension: 'txt', url: 'https://example.com/1' },
+          { name: '__proto__', extension: 'txt', url: 'https://example.com/2' },
+        ],
+      },
+    } as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].files).toHaveLength(2);
   });
 });
 

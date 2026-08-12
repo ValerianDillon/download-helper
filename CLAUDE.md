@@ -72,6 +72,15 @@ tsconfig.declaration.json   # dist/types/ 生成専用 (declaration: true, entry
 をまとめたもの。fanbox-downloader（ブックマークレット）と fanbox-downloader-extension の両方から参照される。
 投稿一覧の取得・ページネーション・レート制限などの API 呼び出し自体は含めず、各利用側に委ねる。
 
+`addByPostInfo` は判別可能な `AddPostResult` を返す（Issue #14、破壊的変更）。
+`{ status: 'added' }` は取り込み成功、`{ status: 'ignored' }` は `isIgnoreFree` による意図的な除外で、いずれも利用側は数えない想定である。
+`{ status: 'unavailable'; reason: 'restricted' | 'missing-body' }` は本文を取り込めなかった投稿で、`reason` は `postInfo.isRestricted` が真なら `'restricted'`、それ以外（`postInfo` 自体が無い、または `body` が無い）なら `'missing-body'` になる。
+`{ status: 'invalid'; postId; type; missing }` は既知の投稿タイプなのに `addByPostInfo` が実際に読み取るフィールドが欠けている構造的な不一致で、`missing` に欠けたフィールドのパス（例: `'body.images'`）を列挙する。
+`{ status: 'unsupported'; postId; type }` は未知の投稿タイプで、本文を読めないため取り込まないが、収集全体は中断しない。
+呼び出し側が中断すべきかどうかを判断できるよう、`unavailable` / `unsupported` は投稿単位の欠落として続行してよい失敗、`invalid` は本文形式の前提が崩れている（＝新しい API 仕様に追随が必要な）失敗として区別できる設計にしている。
+旧版（v4.4.0 以前）は `AddPostResult` が `'added' | 'ignored' | 'unavailable' | 'invalid'` という文字列そのものだった。
+旧文字列と新 `status` の対応は `'added'` → `{ status: 'added' }`、`'ignored'` → `{ status: 'ignored' }`、`'unavailable'` → `{ status: 'unavailable'; reason: ... }`、`'invalid'` → `{ status: 'invalid'; postId; type; missing }` であり、加えて新設の `'unsupported'` は旧版では `'added'` として登録されていた未知タイプの投稿に対応する。
+
 ## コーディング規約
 
 - Biome (recommended ルールセット) で強制。設定は `biome.json` に記載
