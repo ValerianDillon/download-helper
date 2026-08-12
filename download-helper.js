@@ -862,7 +862,7 @@ export class DownloadHelper {
         return max === undefined || d.getTime() > max.getTime() ? d : max;
       }, undefined);
       await zip.addDirectory(`${encodedId}/`, rootDate);
-      await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html");
+      await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html", rootDate);
       let postCount = 0;
       postLoop:
         for (const post of downloadObj.posts) {
