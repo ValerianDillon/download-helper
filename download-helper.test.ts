@@ -2410,6 +2410,17 @@ describe('DownloadHelper.downloadZip', () => {
       expect(rootEntry?.dosDate).toBe(expected.dosDate);
     });
 
+    test('ルート index.html の日時がルートディレクトリと同じ rootDate (有効な publishedDatetime の最大値) と一致する', async () => {
+      const buf = await runDownloadZip(createValidObj());
+      const cd = parseCentralDirectory(buf);
+      const rootHtmlEntry = cd.byName.get('creator-id/index.html');
+      expect(rootHtmlEntry).toBeDefined();
+      // posts の publishedDatetime は 2024-01-01 と 2024-06-15 → 最大値は 2024-06-15
+      const expected = toDosTimeDate(clampToZipRange(new Date('2024-06-15T00:00:00Z')));
+      expect(rootHtmlEntry?.dosTime).toBe(expected.time);
+      expect(rootHtmlEntry?.dosDate).toBe(expected.dosDate);
+    });
+
     test('publishedDatetime が有効 / 未指定 / 不正値の 3 ケースで、投稿ディレクトリの日時が期待どおりになる', async () => {
       const obj = createValidObj();
       obj.posts[0].publishedDatetime = '2024-03-01T00:00:00Z';
@@ -2441,6 +2452,16 @@ describe('DownloadHelper.downloadZip', () => {
       const cd = parseCentralDirectory(buf);
       expect(cd.byName.get('creator-id/')?.dosTime).toBe(0);
       expect(cd.byName.get('creator-id/')?.dosDate).toBe(0);
+    });
+
+    test('全投稿の publishedDatetime が無効な場合、ルート index.html も date なしになる (rootDate が undefined)', async () => {
+      const obj = createValidObj();
+      obj.posts[0].publishedDatetime = undefined;
+      obj.posts[1].publishedDatetime = 'not-a-date';
+      const buf = await runDownloadZip(obj);
+      const cd = parseCentralDirectory(buf);
+      expect(cd.byName.get('creator-id/index.html')?.dosTime).toBe(0);
+      expect(cd.byName.get('creator-id/index.html')?.dosDate).toBe(0);
     });
 
     test('EOCD のエントリ数が「実際に書かれた非ディレクトリエントリ数 + posts.length + 1」と一致する', async () => {

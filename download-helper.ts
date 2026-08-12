@@ -1610,8 +1610,9 @@ export class DownloadHelper {
         return max === undefined || d.getTime() > max.getTime() ? d : max;
       }, undefined);
       await zip.addDirectory(`${encodedId}/`, rootDate);
-      // ルートhtml (post に紐づかないので date は付与しない)
-      await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html');
+      // ルートhtml もルートディレクトリと同じ rootDate を与える (date 省略時は DOS date 0 となり、
+      // 展開時に 1980-01-01 より前の不正な日時になるため)
+      await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html', rootDate);
       // 投稿処理
       let postCount = 0;
       postLoop: for (const post of downloadObj.posts) {
