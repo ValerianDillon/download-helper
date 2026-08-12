@@ -486,6 +486,75 @@ describe('addByPostInfo - 取り込み結果', () => {
     addByPostInfo(m, unknown);
     expect(m.isLimitValid()).toBe(true);
   });
+
+  // DownloadObject.posts / PostObject.files は encodeFileName(name) をキーにした辞書に
+  // name/extension を登録する。通常の {} だとキーが "__proto__" / "constructor" のとき
+  // 初期化チェック (obj[key] === undefined) が Object.prototype 由来の値を拾って false になり、
+  // 直後の obj[key].push(...) が例外になっていた (download-helper.ts の createNameKeyedDictionary で修正済み)。
+  // 投稿タイトル・添付ファイル名は FANBOX API のレスポンスに由来する外部入力なのでここを回避できない。
+  test('投稿タイトルが "__proto__" でも例外にならず登録できる', () => {
+    const m = createManage();
+    const post = basePost({ title: '__proto__' });
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].originalName).toBe('__proto__');
+  });
+
+  test('投稿タイトルが "constructor" でも例外にならず登録できる', () => {
+    const m = createManage();
+    const post = basePost({ title: 'constructor' });
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].originalName).toBe('constructor');
+  });
+
+  test('添付ファイル名が "__proto__" でも例外にならず格納される', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'file',
+      body: {
+        text: 'hello',
+        files: [{ name: '__proto__', extension: 'txt', url: 'https://example.com/proto.txt' }],
+      },
+    } as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].files).toHaveLength(1);
+    expect(parsed.posts[0].files[0].originalName).toBe('__proto__');
+    expect(parsed.posts[0].files[0].url).toBe('https://example.com/proto.txt');
+  });
+
+  test('添付ファイル名が "constructor" でも例外にならず格納される', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'file',
+      body: {
+        text: 'hello',
+        files: [{ name: 'constructor', extension: 'txt', url: 'https://example.com/ctor.txt' }],
+      },
+    } as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].files).toHaveLength(1);
+    expect(parsed.posts[0].files[0].originalName).toBe('constructor');
+  });
+
+  test('同一投稿内に "__proto__" という名前の添付が複数あっても全件蓄積される', () => {
+    const m = createManage();
+    const post = basePost({
+      type: 'file',
+      body: {
+        text: 'hello',
+        files: [
+          { name: '__proto__', extension: 'txt', url: 'https://example.com/1' },
+          { name: '__proto__', extension: 'txt', url: 'https://example.com/2' },
+        ],
+      },
+    } as Partial<PostInfo>);
+    expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
+    const parsed = JSON.parse(m.downloadObject.stringify());
+    expect(parsed.posts[0].files).toHaveLength(2);
+  });
 });
 
 describe('DownloadManage', () => {

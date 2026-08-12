@@ -86,6 +86,9 @@ export class DownloadUtils {
     return Promise.race([scriptPromise, timeout]);
   }
 }
+function createNameKeyedDictionary() {
+  return Object.create(null);
+}
 
 export class DownloadObject {
   downloadObj;
@@ -94,7 +97,7 @@ export class DownloadObject {
   url = "#main";
   tags;
   constructor(id, utils) {
-    this.downloadObj = { posts: {}, id };
+    this.downloadObj = { posts: createNameKeyedDictionary(), id };
     this.utils = utils;
   }
   stringify() {
@@ -119,7 +122,7 @@ export class DownloadObject {
     if (this.downloadObj.posts[encodedName] === undefined) {
       this.downloadObj.posts[encodedName] = [];
     }
-    const postObj = { name, info: "", files: {}, html: "", tags: [] };
+    const postObj = { name, info: "", files: createNameKeyedDictionary(), html: "", tags: [] };
     this.downloadObj.posts[encodedName].push(postObj);
     const postObject = new PostObject(postObj, this.utils);
     this.orderedPosts.push(postObject);
