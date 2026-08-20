@@ -89,6 +89,9 @@ tsconfig.declaration.json   # dist/types/ 生成専用 (declaration: true, entry
 - `lineWidth: 120`
 - JSDoc 形式のドキュメントコメント（日本語）
 - クラス: PascalCase、メソッド/変数: camelCase
+- 交差型の `}` と `& (` の間にコメントを置かない。Biome が実行のたびに行順を並べ替えるため
+  `bun run lint` が冪等でなくなり、CI の「lint / build 後に作業ツリーが汚れていないこと」の検査が必ず落ちる。
+  型そのものについての説明は宣言の上の JSDoc に書く
 
 ## Git運用
 

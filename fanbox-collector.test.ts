@@ -252,9 +252,10 @@ describe('addByPostInfo - 取り込み結果', () => {
     expect(postCount(m)).toBe(0);
   });
 
-  test('本文が無ければ unavailable / missing-body を返す', () => {
+  // 実レスポンスでは body はプロパティごと欠けるのではなく値が null になる (Issue #9)
+  test('本文が null なら unavailable / missing-body を返す', () => {
     const m = createManage();
-    expect(addByPostInfo(m, basePost({ body: undefined } as Partial<PostInfo>))).toEqual({
+    expect(addByPostInfo(m, basePost({ body: null }))).toEqual({
       status: 'unavailable',
       reason: 'missing-body',
     });
@@ -270,9 +271,9 @@ describe('addByPostInfo - 取り込み結果', () => {
     expect(postCount(m)).toBe(0);
   });
 
-  test('isRestricted かつ本文も無い場合も restricted を返す (missing-body に落ちない)', () => {
+  test('isRestricted かつ本文が null の場合も restricted を返す (missing-body に落ちない)', () => {
     const m = createManage();
-    expect(addByPostInfo(m, basePost({ isRestricted: true, body: undefined } as Partial<PostInfo>))).toEqual({
+    expect(addByPostInfo(m, basePost({ isRestricted: true, body: null }))).toEqual({
       status: 'unavailable',
       reason: 'restricted',
     });
