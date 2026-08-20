@@ -96,6 +96,12 @@ export type PostInfoResponse = {
 /**
  * 投稿詳細の型
  * 一覧 (post.listCreator) の要素はこの形状ではない。PostListItem を使うこと。
+ *
+ * 閲覧できない投稿でも post.info は 200 で投稿オブジェクトを返し、body はプロパティごと
+ * 欠けるのではなく値が null になる (type / isRestricted / coverImageUrl は通常どおり入る)。
+ * isRestricted を discriminant にして restricted variant を分ける案は採らない: 逆向きの
+ * 「isRestricted: false なら body は非 null」まで型で保証することになるが、そちらは未観測で、
+ * 保証できない相関を型に昇格させることになる。
  * @see https://api.fanbox.cc/post.info?postId=${postId}
  */
 export type PostInfo = {
@@ -116,13 +122,13 @@ export type PostInfo = {
     body: {
         text: string;
         images: ImageInfo[];
-    };
+    } | null;
 } | {
     type: 'file';
     body: {
         text: string;
         files: FileInfo[];
-    };
+    } | null;
 } | {
     type: 'article';
     body: {
@@ -131,12 +137,12 @@ export type PostInfo = {
         embedMap: Record<string, EmbedInfo>;
         urlEmbedMap: Record<string, UrlEmbedInfo>;
         blocks: Block[];
-    };
+    } | null;
 } | {
     type: 'text';
     body: {
         text: string;
-    };
+    } | null;
 } | {
     type: 'unknown';
     body: unknown;
