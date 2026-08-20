@@ -10,7 +10,16 @@ import {
   type EmbedInfo,
   type FileInfo,
   type ImageInfo,
+  type PaginatedPosts,
+  type Plans,
+  type PlansResponse,
   type PostInfo,
+  type PostList,
+  type PostListItem,
+  type PostListResponse,
+  type PostPaginationResponse,
+  type Tags,
+  type TagsResponse,
   type UrlEmbedInfo,
 } from './fanbox-collector';
 
@@ -661,5 +670,67 @@ describe('DownloadManage', () => {
       // fees は昇順ソート (100, 500) → ["ファン", "サポーター"] + 残りのタグ
       expect(json.tags).toEqual(['ファン', 'サポーター', 'タグA', 'タグB']);
     });
+  });
+});
+
+describe('API レスポンス型の構造と命名', () => {
+  test('旧名は新名の別名のままで、相互に代入できる (非破壊のリネーム)', () => {
+    const plans: Plans = { body: { plans: [] } };
+    const plansResponse: PlansResponse = plans;
+    const tags: Tags = { body: { featuredTags: [] } };
+    const tagsResponse: TagsResponse = tags;
+    const paginated: PaginatedPosts = { body: { pageUrls: ['https://example.invalid/1'] } };
+    const pagination: PostPaginationResponse = paginated;
+    const list: PostList = { body: { posts: [] } };
+    const listResponse: PostListResponse = list;
+
+    expect(plansResponse).toBe(plans);
+    expect(tagsResponse).toBe(tags);
+    expect(pagination).toBe(paginated);
+    expect(listResponse).toBe(list);
+  });
+
+  test('一覧の要素は追加 5 項目を必須で持つ', () => {
+    const item: PostListItem = {
+      id: 'p1',
+      title: 'タイトル',
+      feeRequired: 0,
+      creatorId: 'creator',
+      excerpt: '',
+      isRestricted: false,
+      tags: [],
+      publishedDatetime: '2024-05-01T12:34:56Z',
+      updatedDatetime: '2024-05-02T00:00:00Z',
+      likeCount: 0,
+      commentCount: 0,
+      user: { userId: 'u1', name: 'name', iconUrl: null },
+      isLiked: false,
+      isPinned: false,
+      isCommentingRestricted: false,
+      hasAdultContent: false,
+      cover: null,
+    };
+    expect(item.user.userId).toBe('u1');
+  });
+
+  test('投稿詳細は追加 5 項目が無くても成立する (必ず返るとは確認できていないため)', () => {
+    // 5 項目を省いても型エラーにならないことが、この test の主眼
+    const info: PostInfo = {
+      id: 'p1',
+      title: 'タイトル',
+      feeRequired: 0,
+      creatorId: 'creator',
+      excerpt: '',
+      isRestricted: false,
+      tags: [],
+      publishedDatetime: '2024-05-01T12:34:56Z',
+      updatedDatetime: '2024-05-02T00:00:00Z',
+      likeCount: 0,
+      commentCount: 0,
+      coverImageUrl: null,
+      type: 'text',
+      body: { text: 'hello' },
+    };
+    expect(info.isPinned).toBeUndefined();
   });
 });

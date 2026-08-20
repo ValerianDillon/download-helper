@@ -9,11 +9,14 @@ import { DownloadObject, DownloadUtils } from './download-helper';
  * プランAPIの型
  * @see https://api.fanbox.cc/plan.listCreator?creatorId=${creatorId}
  */
-export type Plans = {
+export type PlansResponse = {
   body?: {
     plans: PlanInfo[];
   };
 };
+
+/** @deprecated PlansResponse を使うこと */
+export type Plans = PlansResponse;
 
 export type PlanInfo = {
   id: string;
@@ -27,11 +30,14 @@ export type PlanInfo = {
  * タグAPIの型
  * @see https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}
  */
-export type Tags = {
+export type TagsResponse = {
   body?: {
     featuredTags: TagInfo[];
   };
 };
+
+/** @deprecated TagsResponse を使うこと */
+export type Tags = TagsResponse;
 
 export type TagInfo = {
   tag: string;
@@ -43,20 +49,59 @@ export type TagInfo = {
  * 投稿一覧のページURL APIの型
  * @see https://api.fanbox.cc/post.paginateCreator?creatorId=${creatorId}
  */
-export type PaginatedPosts = {
+export type PostPaginationResponse = {
   body?: {
     pageUrls: string[];
   };
 };
 
+/** @deprecated PostPaginationResponse を使うこと。返るのは投稿ではなくページ URL である */
+export type PaginatedPosts = PostPaginationResponse;
+
 /**
  * 投稿一覧APIの型
  * @see https://api.fanbox.cc/post.listCreator?creatorId=${creatorId}
  */
-export type PostList = {
+export type PostListResponse = {
   body?: {
     posts: PostListItem[];
   };
+};
+
+/** @deprecated PostListResponse を使うこと */
+export type PostList = PostListResponse;
+
+/**
+ * 投稿一覧と投稿詳細のどちらのレスポンスにも入る共通フィールド。
+ * 片方だけ直すと乖離するため、両者はこれを共有する。
+ */
+export type PostBase = {
+  id: string;
+  title: string;
+  feeRequired: number;
+  creatorId: string;
+  excerpt: string;
+  isRestricted: boolean;
+  tags: string[];
+  // DateはJSON.parseで文字列扱い
+  publishedDatetime: string;
+  updatedDatetime: string;
+  likeCount: number;
+  commentCount: number;
+};
+
+/**
+ * 一覧 (post.listCreator) では必ず返るフィールド。
+ * 詳細 (post.info) のレスポンスにも 2026-07 の観測では入っていたが、それは存在の確認に
+ * とどまり、全投稿タイプ・全状態で必ず返ることまでは示していない。そのため PostInfo 側は
+ * これを Partial で持つ。
+ */
+export type PostAdditionalFields = {
+  user: UserInfo;
+  isLiked: boolean;
+  isPinned: boolean;
+  isCommentingRestricted: boolean;
+  hasAdultContent: boolean;
 };
 
 /**
@@ -64,26 +109,11 @@ export type PostList = {
  * 詳細 (PostInfo) と違って type / body を持たず、カバー画像も cover.url に入る。
  * 本文を得るには post.info を別途叩く必要がある。
  */
-export type PostListItem = {
-  id: string;
-  title: string;
-  feeRequired: number;
-  creatorId: string;
-  user: UserInfo;
-  excerpt: string;
-  isRestricted: boolean;
-  isLiked: boolean;
-  isPinned: boolean;
-  isCommentingRestricted: boolean;
-  hasAdultContent: boolean;
-  tags: string[];
-  publishedDatetime: string;
-  updatedDatetime: string;
-  likeCount: number;
-  commentCount: number;
-  // 観測できた type は 'cover_image' のみだが、他の値がありうるので絞り込まない
-  cover: { type: string; url: string } | null;
-};
+export type PostListItem = PostBase &
+  PostAdditionalFields & {
+    // 観測できた type は 'cover_image' のみだが、他の値がありうるので絞り込まない
+    cover: { type: string; url: string } | null;
+  };
 
 export type UserInfo = {
   userId: string;
@@ -112,48 +142,37 @@ export type PostInfoResponse = {
  * 保証できない相関を型に昇格させることになる。
  * @see https://api.fanbox.cc/post.info?postId=${postId}
  */
-export type PostInfo = {
-  title: string;
-  feeRequired: number;
-  id: string;
-  creatorId: string;
-  coverImageUrl: string | null;
-  excerpt: string;
-  isRestricted: boolean;
-  tags: string[];
-  // DateはJSON.parseで文字列扱い
-  publishedDatetime: string;
-  updatedDatetime: string;
-  likeCount: number;
-  commentCount: number;
-} & (
-  | {
-      type: 'image';
-      body: { text: string; images: ImageInfo[] } | null;
-    }
-  | {
-      type: 'file';
-      body: { text: string; files: FileInfo[] } | null;
-    }
-  | {
-      type: 'article';
-      body: {
-        imageMap: Record<string, ImageInfo>;
-        fileMap: Record<string, FileInfo>;
-        embedMap: Record<string, EmbedInfo>; // TODO embedMapの対応
-        urlEmbedMap: Record<string, UrlEmbedInfo>;
-        blocks: Block[];
-      } | null;
-    }
-  | {
-      type: 'text';
-      body: { text: string } | null;
-    }
-  | {
-      type: 'unknown';
-      body: unknown;
-    }
-);
+export type PostInfo = PostBase &
+  Partial<PostAdditionalFields> & {
+    coverImageUrl: string | null;
+  } & (
+    | {
+        type: 'image';
+        body: { text: string; images: ImageInfo[] } | null;
+      }
+    | {
+        type: 'file';
+        body: { text: string; files: FileInfo[] } | null;
+      }
+    | {
+        type: 'article';
+        body: {
+          imageMap: Record<string, ImageInfo>;
+          fileMap: Record<string, FileInfo>;
+          embedMap: Record<string, EmbedInfo>; // TODO embedMapの対応
+          urlEmbedMap: Record<string, UrlEmbedInfo>;
+          blocks: Block[];
+        } | null;
+      }
+    | {
+        type: 'text';
+        body: { text: string } | null;
+      }
+    | {
+        type: 'unknown';
+        body: unknown;
+      }
+  );
 
 // articleタイプのマップ型に対する値の型
 export type ImageInfo = { originalUrl: string; extension: string };
