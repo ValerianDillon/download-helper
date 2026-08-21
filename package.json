@@ -1,6 +1,6 @@
 {
   "name": "download-helper",
-  "version": "5.2.0",
+  "version": "6.0.0",
   "description": "ブックマークレットとかで使うUI",
   "scripts": {
     "build": "bun run build:js && bun run build:types",
