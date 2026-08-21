@@ -154,6 +154,22 @@ export declare class DownloadUtils {
     embedScript(url: string, integrity?: string): Promise<unknown>;
 }
 /**
+ * 外部入力 (FANBOX API のレスポンス) 由来のキーで引く辞書オブジェクトを作る。
+ *
+ * 通常の `{}` だと、キーが "__proto__" のとき (Object.prototype の accessor と衝突する)
+ * `obj[key] = value` が実際にはプロトタイプを差し替えるだけで own property を作らず、
+ * "constructor" のような他の Object.prototype 由来のキーでも `obj[key] === undefined` が
+ * false になって初期化の分岐がスキップされる。結果、直後の `obj[key].push(...)` が
+ * 継承したメソッドを持たない値 (Object.prototype 自身や Object コンストラクタ関数) に
+ * 対して呼ばれ例外になる。投稿名・添付ファイル名は FANBOX API のレスポンスに由来する
+ * 外部入力であり、このキーを回避できないため、プロトタイプを持たないオブジェクトにして
+ * 経路ごと塞ぐ。
+ *
+ * 同じ理由の対策が必要な箇所は投稿名・添付ファイル名に限らない (API のマップ型は
+ * どれもキーが外部入力である) ため、fanbox-collector からも使えるように export する。
+ */
+export declare function createNameKeyedDictionary<T>(): Record<string, T>;
+/**
  * ダウンロード用のオブジェクトラッパークラス
  */
 export declare class DownloadObject {

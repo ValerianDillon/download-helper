@@ -86,7 +86,7 @@ export class DownloadUtils {
     return Promise.race([scriptPromise, timeout]);
   }
 }
-function createNameKeyedDictionary() {
+export function createNameKeyedDictionary() {
   return Object.create(null);
 }
 
