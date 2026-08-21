@@ -6,5 +6,5 @@
     "emitDeclarationOnly": true,
     "outDir": "dist/types"
   },
-  "include": ["download-helper.ts", "fanbox-collector.ts"]
+  "include": ["download-helper.ts", "fanbox-collector.ts", "api-session.ts"]
 }

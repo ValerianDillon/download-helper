@@ -4,7 +4,7 @@
   "description": "ブックマークレットとかで使うUI",
   "scripts": {
     "build": "bun run build:js && bun run build:types",
-    "build:js": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle && bun build ./fanbox-collector.ts --outfile ./fanbox-collector.js --format esm --target browser --no-bundle",
+    "build:js": "bun build ./download-helper.ts --outfile ./download-helper.js --format esm --target browser --no-bundle && bun build ./fanbox-collector.ts --outfile ./fanbox-collector.js --format esm --target browser --no-bundle && bun build ./api-session.ts --outfile ./api-session.js --format esm --target browser --no-bundle",
     "build:types": "rm -rf dist/types && tsc -p tsconfig.declaration.json",
     "lint": "biome check --write .",
     "typecheck": "tsc --noEmit",
@@ -30,11 +30,16 @@
     "./fanbox-collector": {
       "types": "./dist/types/fanbox-collector.d.ts",
       "default": "./fanbox-collector.js"
+    },
+    "./api-session": {
+      "types": "./dist/types/api-session.d.ts",
+      "default": "./api-session.js"
     }
   },
   "files": [
     "download-helper.js",
     "fanbox-collector.js",
+    "api-session.js",
     "dist/types"
   ],
   "bugs": {
