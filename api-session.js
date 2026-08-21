@@ -1,3 +1,10 @@
+function resolveIssuedAt(calledAt, returnedAt, reported) {
+  if (reported === undefined)
+    return calledAt;
+  const upperBound = Math.max(calledAt, returnedAt);
+  return reported >= calledAt && reported <= returnedAt ? reported : upperBound;
+}
+
 export class ResponseParseError extends Error {
   url;
   constructor(url) {
@@ -168,8 +175,9 @@ export class ApiSession {
       throwIfAborted(signal);
       await this.gate(signal);
       throwIfAborted(signal);
-      const issuedAt = this.deps.now();
+      const calledAt = this.deps.now();
       const result = await this.transport(url, signal);
+      const returnedAt = this.deps.now();
       throwIfAborted(signal);
       if (result.kind === "deferred") {
         if (deferrals >= MAX_DEFERRALS)
@@ -178,7 +186,7 @@ export class ApiSession {
         await waitAbortable(this.deps.sleep, Math.max(0, result.until - this.deps.now()), signal);
         continue;
       }
-      this.lastRequestAt = issuedAt;
+      this.lastRequestAt = resolveIssuedAt(calledAt, returnedAt, result.issuedAt);
       if (result.kind === "unobservable-failure") {
         this.onFailure();
         if (transportAttempt >= TRANSPORT_BACKOFF_MS.length)

@@ -9,9 +9,23 @@
  * プロキシなど、実行環境ごとの差は Transport 側に閉じる。
  */
 /**
+ * 実際に I/O を発行した時刻 (epoch ms)。プロセスをまたぐ transport だけが報告する。
+ *
+ * セッションは transport を呼ぶ直前の時刻を発行時刻として記録するが、拡張の service worker
+ * プロキシのように実 I/O が別プロセスで起きる transport では、配送の遅れぶん記録と実発行が
+ * ずれる。ずれた記録を基準にすると次のゲートがその遅延ぶん早く明け、実 I/O の間隔が
+ * 発行間隔を下回りうる (ValerianDillon/fanbox-downloader-extension#46)。
+ * 報告があればセッションはそちらを発行時刻として採る。
+ *
+ * 同一プロセスで発行する transport は報告しなくてよい (省略時は呼び出し直前の時刻を使う)。
+ */
+type IssuedAt = {
+    issuedAt?: number;
+};
+/**
  * 取得できた応答。status が読めたという事実だけを表す。
  */
-export type TransportResponse = {
+export type TransportResponse = IssuedAt & {
     kind: 'response';
     status: number;
     body: string;
@@ -20,8 +34,11 @@ export type TransportResponse = {
 /**
  * 応答を得られなかった失敗。CORS・DNS・オフライン・TLS などが該当する。
  * status を推測しない: 非可視の 429 かもしれないが、それは観測ではなく推測である。
+ *
+ * I/O を発行した後の失敗なら issuedAt を報告できる (発行そのものは起きているため、
+ * 次の発行はその時刻から間隔を空ける)。発行前に失敗したなら報告しない。
  */
-export type TransportFailure = {
+export type TransportFailure = IssuedAt & {
     kind: 'unobservable-failure';
     cause?: unknown;
 };
