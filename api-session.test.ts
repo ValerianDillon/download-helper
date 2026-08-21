@@ -6,6 +6,8 @@ import {
   RateLimitExhaustedError,
   ResponseParseError,
   TransportExhaustedError,
+  type TransportFailure,
+  type TransportResponse,
   type TransportResult,
 } from './api-session';
 
@@ -422,5 +424,120 @@ describe('ApiSession - deferred (transport が I/O を発行しなかった場�
     const h = createHarness([deferred(0), ok()], 500);
     await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
     expect(h.waits.filter((w) => w > 0)).toHaveLength(0);
+  });
+});
+
+describe('ApiSession - 実発行時刻の報告 (プロセスをまたぐ transport)', () => {
+  const URL = 'https://example.invalid/x';
+  const START = 1_000_000;
+
+  type Step = {
+    result: TransportResponse | TransportFailure;
+    /** transport が呼ばれてから実 I/O が始まるまで (配送遅延) */
+    deliveryMs?: number;
+    /** 実 I/O の開始から応答が返るまで */
+    roundTripMs?: number;
+    /** 報告する実発行時刻を実際の値からどれだけずらすか。null なら報告しない */
+    reportOffsetMs?: number | null;
+  };
+
+  /**
+   * 実 I/O が別プロセスで起きる transport を模す。
+   * transport が呼ばれた時刻ではなく、実 I/O を発行した時刻を issues に記録するので、
+   * 保ちたい不変条件 (実発行の間隔が発行間隔以上) をそのまま検査できる。
+   */
+  const createHarness = (steps: Step[], baseInterval = 500) => {
+    let clock = START;
+    const waits: number[] = [];
+    /** 実 I/O を発行した時刻 */
+    const issues: number[] = [];
+    const queue = [...steps];
+    const transport = async (): Promise<TransportResult> => {
+      const step = queue.shift();
+      if (!step) throw new Error('transport の応答が足りない');
+      clock += step.deliveryMs ?? 0;
+      const issuedAt = clock;
+      issues.push(issuedAt);
+      clock += step.roundTripMs ?? 0;
+      if (step.reportOffsetMs === null) return step.result;
+      return { ...step.result, issuedAt: issuedAt + (step.reportOffsetMs ?? 0) };
+    };
+    const session = new ApiSession(baseInterval, transport, {
+      sleep: async (ms) => {
+        waits.push(ms);
+        clock += ms;
+      },
+      now: () => clock,
+    });
+    return { session, waits, issues };
+  };
+
+  const ok = (): TransportResponse => ({ kind: 'response', status: 200, body: '{}', retryAfter: null });
+  const failure = (): TransportFailure => ({ kind: 'unobservable-failure' });
+
+  test('配送が遅れても、実発行の間隔は発行間隔を下回らない', async () => {
+    // 1 件目だけ配送が 800ms 遅れる。報告が無いと 2 件目の実発行は 50ms 後になる
+    const h = createHarness([{ result: ok(), deliveryMs: 800, roundTripMs: 50 }, { result: ok() }], 500);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    expect(h.issues[1] - h.issues[0]).toBe(500);
+  });
+
+  test('報告が無ければ呼び出し直前の時刻を発行時刻にする (同一プロセスの transport)', async () => {
+    const h = createHarness(
+      [
+        { result: ok(), deliveryMs: 800, roundTripMs: 50, reportOffsetMs: null },
+        { result: ok(), reportOffsetMs: null },
+      ],
+      500,
+    );
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    // 呼び出し直前 (START) から 500ms 後にはもう到達しているので待たない
+    expect(h.issues[1] - h.issues[0]).toBe(50);
+  });
+
+  test('呼び出し直前より早い報告は応答が返った時刻へ倒す', async () => {
+    // 配送が遅れているときに呼び出し直前へ倒すと、実発行より前の時刻を記録してしまい
+    // 2 件目のゲートが早く明ける (実発行の間隔が 50ms になる)
+    const h = createHarness(
+      [{ result: ok(), deliveryMs: 800, roundTripMs: 50, reportOffsetMs: -5_000 }, { result: ok() }],
+      500,
+    );
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    // 実発行 (+800) の 50ms 後に応答が返り、そこから 500ms 空ける
+    expect(h.issues[1] - h.issues[0]).toBe(550);
+  });
+
+  test('応答が返った時刻より遅い報告は応答が返った時刻へ丸める', async () => {
+    const h = createHarness([{ result: ok(), roundTripMs: 100, reportOffsetMs: 10_000 }, { result: ok() }], 500);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    // 丸めないと 10 秒後を発行時刻とみなし、次の発行が不要に遅れる
+    expect(h.issues[1] - h.issues[0]).toBe(600);
+    expect(h.waits).toEqual([500]);
+  });
+
+  test('数でない報告も応答が返った時刻へ倒す', async () => {
+    const h = createHarness(
+      [
+        { result: { ...ok(), issuedAt: Number.NaN }, deliveryMs: 800, roundTripMs: 50, reportOffsetMs: null },
+        { result: ok(), reportOffsetMs: null },
+      ],
+      500,
+    );
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    // NaN をそのまま発行時刻にすると gate の比較が NaN になり、以後すべての待機が消える。
+    // 呼び出し直前へ倒すのも配送遅延ぶん早く明けるので、ここでも上端に倒す
+    expect(h.issues[1] - h.issues[0]).toBe(550);
+  });
+
+  test('観測できない失敗の報告も発行時刻に採る', async () => {
+    // 再試行の待機 (5 秒) より発行間隔を長くして、ゲートの効き方の差を見る
+    const h = createHarness([{ result: failure(), deliveryMs: 800, roundTripMs: 50 }, { result: ok() }], 20_000);
+    await h.session.fetchJson<unknown, unknown>(URL, (j) => j);
+    expect(h.issues[1] - h.issues[0]).toBe(20_000);
   });
 });

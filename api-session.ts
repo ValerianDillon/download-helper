@@ -10,15 +10,36 @@
  */
 
 /**
+ * 実際に I/O を発行した時刻 (epoch ms)。プロセスをまたぐ transport だけが報告する。
+ *
+ * セッションは transport を呼ぶ直前の時刻を発行時刻として記録するが、拡張の service worker
+ * プロキシのように実 I/O が別プロセスで起きる transport では、配送の遅れぶん記録と実発行が
+ * ずれる。ずれた記録を基準にすると次のゲートがその遅延ぶん早く明け、実 I/O の間隔が
+ * 発行間隔を下回りうる (ValerianDillon/fanbox-downloader-extension#46)。
+ * 報告があればセッションはそちらを発行時刻として採る。
+ *
+ * 同一プロセスで発行する transport は報告しなくてよい (省略時は呼び出し直前の時刻を使う)。
+ */
+type IssuedAt = { issuedAt?: number };
+
+/**
  * 取得できた応答。status が読めたという事実だけを表す。
  */
-export type TransportResponse = { kind: 'response'; status: number; body: string; retryAfter: string | null };
+export type TransportResponse = IssuedAt & {
+  kind: 'response';
+  status: number;
+  body: string;
+  retryAfter: string | null;
+};
 
 /**
  * 応答を得られなかった失敗。CORS・DNS・オフライン・TLS などが該当する。
  * status を推測しない: 非可視の 429 かもしれないが、それは観測ではなく推測である。
+ *
+ * I/O を発行した後の失敗なら issuedAt を報告できる (発行そのものは起きているため、
+ * 次の発行はその時刻から間隔を空ける)。発行前に失敗したなら報告しない。
  */
-export type TransportFailure = { kind: 'unobservable-failure'; cause?: unknown };
+export type TransportFailure = IssuedAt & { kind: 'unobservable-failure'; cause?: unknown };
 
 /**
  * 外部の制約により transport が I/O を発行しなかったことを表す。until までは発行できない。
@@ -31,6 +52,25 @@ export type TransportFailure = { kind: 'unobservable-failure'; cause?: unknown }
 export type TransportDeferred = { kind: 'deferred'; until: number };
 
 export type TransportResult = TransportResponse | TransportFailure | TransportDeferred;
+
+/**
+ * 発行時刻を決める。実際の発行は区間 [transport 呼び出し直前, 応答が返った時刻] の中で起きるので、
+ * 報告値がその区間に収まっていればそれを採り、外れていれば区間の上端に倒す。
+ *
+ * 上端に倒すのは、区間内のどこで発行されたか分からない以上、真の発行時刻以降であることが
+ * 確実な値がそれしかないため。下端 (呼び出し直前) に倒すと、配送が遅れていた場合に
+ * 実発行より前の時刻を発行時刻として記録することになり、次のゲートが早く明けてしまう。
+ *
+ * 報告そのものが無い場合だけは下端を使う。同一プロセスで発行する transport は
+ * 呼び出し直前と実発行がほぼ同時で、ずれを補正する余地がそもそもない (従来の挙動)。
+ */
+function resolveIssuedAt(calledAt: number, returnedAt: number, reported: number | undefined): number {
+  if (reported === undefined) return calledAt;
+  // 時計が巻き戻ると returnedAt < calledAt になりうるので、上端も下回らないようにする
+  const upperBound = Math.max(calledAt, returnedAt);
+  // NaN はどちらの比較も false になるのでここで上端に落ちる
+  return reported >= calledAt && reported <= returnedAt ? reported : upperBound;
+}
 
 export type Transport = (url: string, signal?: AbortSignal) => Promise<TransportResult>;
 
@@ -272,8 +312,9 @@ export class ApiSession {
       throwIfAborted(signal);
       await this.gate(signal);
       throwIfAborted(signal);
-      const issuedAt = this.deps.now();
+      const calledAt = this.deps.now();
       const result = await this.transport(url, signal);
+      const returnedAt = this.deps.now();
       // 発行中に中断された場合、応答が返っていても成功として数えない
       throwIfAborted(signal);
       if (result.kind === 'deferred') {
@@ -284,7 +325,7 @@ export class ApiSession {
         continue;
       }
       // ここまで来たら実際に発行されている
-      this.lastRequestAt = issuedAt;
+      this.lastRequestAt = resolveIssuedAt(calledAt, returnedAt, result.issuedAt);
       if (result.kind === 'unobservable-failure') {
         // 観測できない失敗では間隔を上げない。通信障害をレート制限として学習しないため
         this.onFailure();
