@@ -11,7 +11,7 @@ import { DownloadObject, DownloadUtils } from './download-helper';
  */
 export type PlansResponse = {
   body?: {
-    plans: PlanInfo[];
+    plans?: unknown;
   };
 };
 
@@ -32,7 +32,7 @@ export type PlanInfo = {
  */
 export type TagsResponse = {
   body?: {
-    featuredTags: TagInfo[];
+    featuredTags?: unknown;
   };
 };
 
@@ -51,7 +51,7 @@ export type TagInfo = {
  */
 export type PostPaginationResponse = {
   body?: {
-    pageUrls: string[];
+    pageUrls?: unknown;
   };
 };
 
@@ -64,7 +64,7 @@ export type PaginatedPosts = PostPaginationResponse;
  */
 export type PostListResponse = {
   body?: {
-    posts: PostListItem[];
+    posts?: unknown;
   };
 };
 
@@ -72,53 +72,18 @@ export type PostListResponse = {
 export type PostList = PostListResponse;
 
 /**
- * 投稿一覧と投稿詳細のどちらのレスポンスにも入る共通フィールド。
- * 片方だけ直すと乖離するため、両者はこれを共有する。
+ * 投稿一覧 (post.listCreator) の要素の未検証入力型。
+ *
+ * 一覧の要素として観測される形状すべてではなく、利用側が実際に検証し、収集の分岐に使う
+ * 3 つだけを保証する。id は post.info の URL 組み立てに、isRestricted は投稿を飛ばすかの
+ * 判断に、feeRequired は「無料を省く」指定の判断に使う。
+ * 残りのフィールドは未検証なので型に出さない (index signature も付けない。付けると
+ * 利用側の typo が unknown として通ってしまう)。
  */
-export type PostBase = {
+export type PostListItemCandidate = {
   id: string;
-  title: string;
-  feeRequired: number;
-  creatorId: string;
-  excerpt: string;
   isRestricted: boolean;
-  tags: string[];
-  // DateはJSON.parseで文字列扱い
-  publishedDatetime: string;
-  updatedDatetime: string;
-  likeCount: number;
-  commentCount: number;
-};
-
-/**
- * 一覧 (post.listCreator) では必ず返るフィールド。
- * 詳細 (post.info) のレスポンスにも 2026-07 の観測では入っていたが、それは存在の確認に
- * とどまり、全投稿タイプ・全状態で必ず返ることまでは示していない。そのため PostInfo 側は
- * これを Partial で持つ。
- */
-export type PostAdditionalFields = {
-  user: UserInfo;
-  isLiked: boolean;
-  isPinned: boolean;
-  isCommentingRestricted: boolean;
-  hasAdultContent: boolean;
-};
-
-/**
- * 投稿一覧の要素の型
- * 詳細 (PostInfo) と違って type / body を持たず、カバー画像も cover.url に入る。
- * 本文を得るには post.info を別途叩く必要がある。
- */
-export type PostListItem = PostBase &
-  PostAdditionalFields & {
-    // 観測できた type は 'cover_image' のみだが、他の値がありうるので絞り込まない
-    cover: { type: string; url: string } | null;
-  };
-
-export type UserInfo = {
-  userId: string;
-  name: string;
-  iconUrl: string | null;
+  feeRequired: number;
 };
 
 /**
@@ -127,76 +92,124 @@ export type UserInfo = {
  */
 export type PostInfoResponse = {
   body?: {
-    post: PostInfo;
+    post?: unknown;
   };
 };
 
 /**
- * 投稿詳細の型
- * 一覧 (post.listCreator) の要素はこの形状ではない。PostListItem を使うこと。
+ * 投稿詳細 (post.info) の投稿オブジェクトの未検証入力型。
  *
- * 閲覧できない投稿でも post.info は 200 で投稿オブジェクトを返し、body はプロパティごと
- * 欠けるのではなく値が null になる (type / isRestricted / coverImageUrl は通常どおり入る)。
- * isRestricted を discriminant にして restricted variant を分ける案は採らない: 逆向きの
- * 「isRestricted: false なら body は非 null」まで型で保証することになるが、そちらは未観測で、
- * 保証できない相関を型に昇格させることになる。
- * @see https://api.fanbox.cc/post.info?postId=${postId}
+ * 利用側 (拡張版 fetchPostInfo / ブックマークレット版 getPostInfoById) が実際に検証している
+ * 3 つだけを保証する。本文をはじめとする残りのフィールドは未検証なので型に出さない。
+ * 検証は addByPostInfo の入口で行い、収集が読むフィールドだけを厳密に確かめる。
+ *
+ * 値は JSON.parse 由来であること (循環参照や BigInt を含まないこと) を契約とする。
+ * 情報 JSON への書き出しや未知値の文字列化で JSON.stringify を使うため。
  */
-export type PostInfo = PostBase &
-  Partial<PostAdditionalFields> & {
-    coverImageUrl: string | null;
-  } & (
-    | {
-        type: 'image';
-        body: { text: string; images: ImageInfo[] } | null;
-      }
-    | {
-        type: 'file';
-        body: { text: string; files: FileInfo[] } | null;
-      }
-    | {
-        type: 'article';
-        body: {
-          imageMap: Record<string, ImageInfo>;
-          fileMap: Record<string, FileInfo>;
-          embedMap: Record<string, EmbedInfo>; // TODO embedMapの対応
-          urlEmbedMap: Record<string, UrlEmbedInfo>;
-          blocks: Block[];
-        } | null;
-      }
-    | {
-        type: 'text';
-        body: { text: string } | null;
-      }
-    | {
-        type: 'unknown';
-        body: unknown;
-      }
-  );
+export type PostInfoCandidate = {
+  id: string;
+  type: string;
+  isRestricted: boolean;
+};
 
-// articleタイプのマップ型に対する値の型
-export type ImageInfo = { originalUrl: string; extension: string };
-export type FileInfo = { url: string; name: string; extension: string };
-export type EmbedInfo = unknown; // FIXME
-export type UrlEmbedInfo = { id: string } & (
+/*
+ * ここから下の本文まわりの型は、すべて decoder (decodeCollectablePost) が生成する検証済みの
+ * 内部表現である。未検証の入力を表すのは PostInfoCandidate / PostListItemCandidate だけで、
+ * 両者を同じ型で表すと「検証していない保証」を型で主張することになるため公開もしない。
+ */
+
+/** articleタイプのマップ型に対する値の型 */
+type ImageInfo = { originalUrl: string; extension: string };
+type FileInfo = { url: string; name: string; extension: string };
+
+/**
+ * embedMap の値。消費側は中身を解釈せず JSON 文字列として出すだけなので、
+ * decode 時に文字列化まで済ませる (描画中に JSON.stringify が失敗すると、投稿を登録した後に
+ * 本文生成で落ちて空の投稿が出力に残るため)。
+ */
+type EmbedValue = { rawJson: string };
+
+/**
+ * urlEmbedMap の値。未知の type は捨てずに sentinel へ正規化する。
+ *
+ * リテラル 'unknown' の variant だけでは実際に返る未知の値 (例: 'video') を表現できず、
+ * かといって union に `{ type: string }` を混ぜると既知 case の絞り込みが壊れる。
+ * そこで decoder が未知値を sentinel に畳み、元の type 名を originalType に、
+ * 描画に使う JSON 文字列を rawJson に持たせる。
+ */
+type UrlEmbedInfo =
   | { type: 'default'; url: string; host: string }
   | { type: 'html'; html: string }
   | { type: 'html.card'; html: string }
   | {
       type: 'fanbox.post';
-      postInfo: { id: string; title: string; creatorId: string; coverImageUrl?: string };
+      // title は escapeHtml に渡る。id / creatorId はリンク URL を組み立てる材料で、
+      // 欠けるとリンク先が壊れる (この variant の取り込み内容そのものがリンクである) ため必須
+      postInfo: { title: string; id: string; creatorId: string };
     }
-  | { type: 'unknown'; [key: string]: unknown }
-); // 他の型がありそうなので入れてる
+  | { type: 'unknown'; originalType: string; rawJson: string };
 
-// articleタイプのBlock構成要素
-export type ImageBlock = { type: 'image'; imageId: string };
-export type FileBlock = { type: 'file'; fileId: string };
-export type TextBlock = { type: 'p' | 'header'; text: string };
-export type EmbedBlock = { type: 'embed'; embedId: string };
-export type UrlEmbedBlock = { type: 'url_embed'; urlEmbedId: string };
-export type UnknownBlock = { type: 'unknown' }; // 他の型がありそうなので入れてる default句で使ってるのでコンパイルすると型が消えて他のを除いた全部に対応する
-export type Block = ImageBlock | FileBlock | TextBlock | EmbedBlock | UrlEmbedBlock | UnknownBlock;
+/** articleタイプのBlock構成要素。*Id は decode 時に文字列を必須にしている */
+type ImageBlock = { type: 'image'; imageId: string };
+type FileBlock = { type: 'file'; fileId: string };
+type TextBlock = { type: 'p' | 'header'; text: string };
+type EmbedBlock = { type: 'embed'; embedId: string };
+type UrlEmbedBlock = { type: 'url_embed'; urlEmbedId: string };
+/**
+ * 未知の block type。UrlEmbedInfo と同じ理由で sentinel に正規化する。
+ * 消費側は現行どおり HTML に何も出さず、ログに originalType を使う
+ * (正規化でログが 'unknown' に劣化しないようにするため)。
+ */
+type UnknownBlock = { type: 'unknown'; originalType: string };
+type Block = ImageBlock | FileBlock | TextBlock | EmbedBlock | UrlEmbedBlock | UnknownBlock;
+
+/** blocks の *Id は該当マップの並べ替えに使う。描画は並べ替えた結果を block の位置で消費する */
+type ArticleBody = {
+  imageMap: Record<string, ImageInfo>;
+  fileMap: Record<string, FileInfo>;
+  embedMap: Record<string, EmbedValue>;
+  urlEmbedMap: Record<string, UrlEmbedInfo>;
+  blocks: Block[];
+};
+
+/**
+ * 情報 JSON にそのまま書き出す付随メタデータ。
+ *
+ * 型は検証しない。これらは収集結果の成立に関与せず、型が変わっても取り込む内容は欠けないため、
+ * 中断 (invalid) の理由にしない。decode 時にシリアライズ可能なことだけ確認する。
+ * publishedDatetime だけは「文字列かつ非空なら ZIP の mtime に使う」ので、読む側で型を見る。
+ */
+type PostMetadata = {
+  creatorId?: unknown;
+  publishedDatetime?: unknown;
+  updatedDatetime?: unknown;
+  likeCount?: unknown;
+  commentCount?: unknown;
+};
+
+/**
+ * decoder の出力。addByPostInfo が実際に読むフィールドだけを保証する検証済み型であり、
+ * post.info が返す投稿オブジェクト全体の schema ではない。
+ *
+ * 検証範囲を「収集が読むフィールド」に限るのは、検証に落ちた投稿が invalid として
+ * 収集全体を止めるためである。読まないフィールドの型変化で全件中断させるのは、
+ * fail-closed の適用先を誤ることになる。
+ *
+ * body は非 null (null / undefined は decode より前に missing-body として分類済み)。
+ */
+type CollectablePostInfo = {
+  id: string;
+  title: string;
+  tags: string[];
+  feeRequired: number;
+  coverImageUrl: string | null | undefined;
+  metadata: PostMetadata;
+} & (
+  | { type: 'image'; body: { text: string; images: ImageInfo[] } }
+  | { type: 'file'; body: { text: string; files: FileInfo[] } }
+  | { type: 'article'; body: ArticleBody }
+  | { type: 'text'; body: { text: string } }
+);
 
 /**
  * ダウンローダーの管理クラス
@@ -291,7 +304,11 @@ export type AddPostResult =
        */
       reason: 'restricted' | 'missing-body';
     }
-  /** 既知の投稿タイプだが、本文の必要フィールドが揃っていない (構造的な不一致) */
+  /**
+   * 既知の投稿タイプだが、収集に必要なフィールドが揃っていない (構造的な不一致)。
+   * missing には欠落している、または期待した型と異なるフィールドのパスが入る
+   * (本文だけでなく feeRequired / title / tags / coverImageUrl / 付随メタデータも対象)
+   */
   | { status: 'invalid'; postId: string; type: string; missing: string[] }
   /** 未知の投稿タイプ。本文を読めないので取り込めないが、収集全体は中断しない */
   | { status: 'unsupported'; postId: string; type: string };
@@ -304,230 +321,373 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isImageInfo(value: unknown): value is ImageInfo {
-  return (
-    isRecord(value) &&
-    typeof (value as { originalUrl?: unknown }).originalUrl === 'string' &&
-    typeof (value as { extension?: unknown }).extension === 'string'
-  );
-}
-
-function isFileInfo(value: unknown): value is FileInfo {
-  return (
-    isRecord(value) &&
-    typeof (value as { url?: unknown }).url === 'string' &&
-    typeof (value as { name?: unknown }).name === 'string' &&
-    typeof (value as { extension?: unknown }).extension === 'string'
-  );
-}
-
 /**
- * article の block を検証する。type だけが全 block 共通で参照されるフィールドで、
- * 'p' / 'header' はさらに text を DownloadUtils.escapeHtml に直接渡すため
- * (非文字列を渡すと String.prototype.replace が無く例外になる)、その 2 種のみ text も見る。
- * embed / url_embed / 未知の block type は該当データが無ければ JSON.stringify や
- * デフォルト分岐で吸収され例外にならないため、ここでは検証しない。
- */
-function isValidBlock(value: unknown): boolean {
-  if (!isRecord(value) || typeof value.type !== 'string') return false;
-  if (value.type === 'p' || value.type === 'header') {
-    return typeof (value as { text?: unknown }).text === 'string';
-  }
-  return true;
-}
-
-/**
- * urlEmbedMap の要素を検証する。
+ * JSON 文字列にする。できなければ undefined を返す。
  *
- * embedMap の要素と違い、消費側 (addByPostInfo 内の 'url_embed' 分岐) は
- * `urlEmbedInfo.type` を直接読む。要素が null や配列などの非 record だとそこで即座に
- * 例外になるため、まず record であることを必須にする。
- * 既知の type ('default' / 'html' / 'html.card' / 'fanbox.post') はさらに、消費側が
- * 文字列メソッド (escapeHtml の String.prototype.replace、html.match) を直接呼ぶ
- * フィールドだけを検証する。未知の type は消費側が JSON.stringify + escapeHtml で
- * 吸収し例外にならないため、record であること以上は検証しない。
+ * candidate は JSON.parse 由来である契約なので通常は失敗しないが、契約に反する値
+ * (循環参照、BigInt、例外を投げる toJSON) を渡されたときに、描画中ではなく decode 時に
+ * 弾けるようにする。描画中に落ちると、投稿を登録した後で本文生成に失敗し、
+ * 空の投稿が出力に残る。
  */
-function isValidUrlEmbedInfo(value: unknown): boolean {
-  if (!isRecord(value)) return false;
+function serialize(value: unknown): string | undefined {
+  try {
+    const json = JSON.stringify(value);
+    return typeof json === 'string' ? json : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeImageInfo(value: unknown): ImageInfo | undefined {
+  if (!isRecord(value) || typeof value.originalUrl !== 'string' || typeof value.extension !== 'string')
+    return undefined;
+  return { originalUrl: value.originalUrl, extension: value.extension };
+}
+
+function decodeFileInfo(value: unknown): FileInfo | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.url !== 'string' ||
+    typeof value.name !== 'string' ||
+    typeof value.extension !== 'string'
+  ) {
+    return undefined;
+  }
+  return { url: value.url, name: value.name, extension: value.extension };
+}
+
+/** embedMap の値。消費側は中身を解釈せず JSON 文字列にするだけなので、ここで文字列化まで済ませる */
+function decodeEmbedValue(value: unknown): EmbedValue | undefined {
+  const rawJson = serialize(value);
+  return rawJson === undefined ? undefined : { rawJson };
+}
+
+/**
+ * article の block を decode する。
+ *
+ * 既知 type の *Id は文字列を必須にする。描画は「block の並びで数えた位置」で該当マップの
+ * 並べ替え結果を消費するため、1 つでも id が読めないと以降の block が別の要素を描画してしまう
+ * (欠落ではなく取り違えになる)。'p' / 'header' の text も escapeHtml に直接渡るので必須。
+ * 未知の type は sentinel へ畳み、元の type 名を残す。
+ */
+function decodeBlock(value: unknown): Block | undefined {
+  if (!isRecord(value) || typeof value.type !== 'string') return undefined;
+  const id = (key: string): string | undefined => (typeof value[key] === 'string' ? (value[key] as string) : undefined);
   switch (value.type) {
-    case 'default':
-      return (
-        typeof (value as { url?: unknown }).url === 'string' && typeof (value as { host?: unknown }).host === 'string'
-      );
-    case 'html':
-    case 'html.card':
-      return typeof (value as { html?: unknown }).html === 'string';
-    case 'fanbox.post': {
-      const postInfo = (value as { postInfo?: unknown }).postInfo;
-      // creatorId / id はテンプレートリテラルに埋め込まれるだけで未定義でも例外にならないが、
-      // title は escapeHtml に渡るため文字列を必須にする
-      return isRecord(postInfo) && typeof (postInfo as { title?: unknown }).title === 'string';
+    case 'p':
+    case 'header':
+      return typeof value.text === 'string' ? { type: value.type, text: value.text } : undefined;
+    case 'image': {
+      const imageId = id('imageId');
+      return imageId === undefined ? undefined : { type: 'image', imageId };
+    }
+    case 'file': {
+      const fileId = id('fileId');
+      return fileId === undefined ? undefined : { type: 'file', fileId };
+    }
+    case 'embed': {
+      const embedId = id('embedId');
+      return embedId === undefined ? undefined : { type: 'embed', embedId };
+    }
+    case 'url_embed': {
+      const urlEmbedId = id('urlEmbedId');
+      return urlEmbedId === undefined ? undefined : { type: 'url_embed', urlEmbedId };
     }
     default:
-      return true;
+      return { type: 'unknown', originalType: value.type };
   }
 }
 
 /**
- * 投稿タイプによらず addByPostInfo が本文外 (postInfo 直下) で参照するフィールドを検査する。
+ * urlEmbedMap の値を decode する。
  *
- * - title: addPost(postName) の内部で DownloadUtils.encodeFileName が String.prototype.replace を
- *   直接呼ぶほか、header 生成でも escapeHtml(postName) に渡る。いずれも非文字列だと例外になる
- * - tags: `[...postInfo.tags]` で 2 箇所 (setTags 呼び出し、addTags 呼び出し) スプレッドしており、
- *   配列 (正確には iterable) でないとその場で例外になる。要素自体は Set への格納や
- *   JSON.stringify にしか使われず文字列メソッドを直接呼ばれないため、要素の型までは検証しない
- * - coverImageUrl: truthy なら header 生成で `.split('.')` を直接呼ぶため、文字列でない truthy 値
- *   だと例外になる。null / undefined は falsy 分岐に流れるだけなので許容する
+ * 既知 type は、その variant の取り込み内容を成立させるフィールドを必須にする
+ * (default の url / host、html の html、fanbox.post の title / id / creatorId)。
+ * 未知 type は sentinel へ畳み、描画に使う JSON 文字列を持たせる。
  */
-function checkCommonFields(postInfo: PostInfo): string[] {
-  const missing: string[] = [];
-  if (typeof postInfo.title !== 'string') missing.push('title');
-  if (!Array.isArray(postInfo.tags)) missing.push('tags');
-  if (
-    postInfo.coverImageUrl !== null &&
-    postInfo.coverImageUrl !== undefined &&
-    typeof postInfo.coverImageUrl !== 'string'
-  ) {
-    missing.push('coverImageUrl');
+function decodeUrlEmbedInfo(value: unknown): UrlEmbedInfo | undefined {
+  if (!isRecord(value) || typeof value.type !== 'string') return undefined;
+  switch (value.type) {
+    case 'default':
+      return typeof value.url === 'string' && typeof value.host === 'string'
+        ? { type: 'default', url: value.url, host: value.host }
+        : undefined;
+    case 'html':
+    case 'html.card':
+      return typeof value.html === 'string' ? { type: value.type, html: value.html } : undefined;
+    case 'fanbox.post': {
+      const postInfo = value.postInfo;
+      if (
+        !isRecord(postInfo) ||
+        typeof postInfo.title !== 'string' ||
+        typeof postInfo.id !== 'string' ||
+        typeof postInfo.creatorId !== 'string'
+      ) {
+        return undefined;
+      }
+      return {
+        type: 'fanbox.post',
+        postInfo: { title: postInfo.title, id: postInfo.id, creatorId: postInfo.creatorId },
+      };
+    }
+    default: {
+      const rawJson = serialize(value);
+      return rawJson === undefined ? undefined : { type: 'unknown', originalType: value.type, rawJson };
+    }
   }
-  return missing;
 }
 
+/** Record の各値を decode する。1 つでも decode できなければ undefined (= その投稿は invalid) */
+function decodeRecordOf<T>(
+  value: unknown,
+  decodeValue: (item: unknown) => T | undefined,
+): Record<string, T> | undefined {
+  if (!isRecord(value)) return undefined;
+  // 通常の {} だとキーが '__proto__' のときプロトタイプへの代入になり、own property が作られず
+  // その要素が黙って消える (JSON.parse は own property として作るので入力には現れうる)
+  const decoded = Object.create(null) as Record<string, T>;
+  for (const [key, item] of Object.entries(value)) {
+    const result = decodeValue(item);
+    if (result === undefined) return undefined;
+    decoded[key] = result;
+  }
+  return decoded;
+}
+
+/** 配列の各要素を decode する。1 つでも decode できなければ undefined */
+function decodeArrayOf<T>(value: unknown, decodeValue: (item: unknown) => T | undefined): T[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const decoded: T[] = [];
+  for (const item of value) {
+    const result = decodeValue(item);
+    if (result === undefined) return undefined;
+    decoded.push(result);
+  }
+  return decoded;
+}
+
+/** decode 済みの本文。type と body を組にして返し、CollectablePostInfo の union をそのまま満たす */
+type DecodedBody =
+  | { type: 'image'; body: { text: string; images: ImageInfo[] } }
+  | { type: 'file'; body: { text: string; files: FileInfo[] } }
+  | { type: 'article'; body: ArticleBody }
+  | { type: 'text'; body: { text: string } };
+
 /**
- * 投稿タイプごとに、本文の取り込みで実際に触るフィールドを検査し、欠けているものを返す。
- *
- * addByPostInfo は投稿を downloadObject に登録してから本文を触るため、途中で例外になると
- * 空の投稿が出力に残り、取得件数上限の減算も飛ばされる。登録前にここで弾いて
- * その状態を作らせない。呼び出し側は addByPostInfo が既知タイプと確認した後にのみ呼ぶため、
- * 未知タイプはここに来ない。本文外の共通フィールドは checkCommonFields が別途検査する。
+ * 投稿タイプごとに、本文の取り込みで実際に触るフィールドを decode する。
+ * 欠けている、または期待した型と異なるフィールドのパスを missing に積む。
  */
-function checkBody(postInfo: PostInfo & { type: KnownPostType }): string[] {
-  const body = postInfo.body as Record<string, unknown>;
+function decodeBody(type: KnownPostType, body: Record<string, unknown>, missing: string[]): DecodedBody | undefined {
+  const text = typeof body.text === 'string' ? body.text : undefined;
+  switch (type) {
+    case 'image': {
+      const images = decodeArrayOf(body.images, decodeImageInfo);
+      if (!images) missing.push('body.images');
+      if (text === undefined) missing.push('body.text');
+      return images && text !== undefined ? { type: 'image', body: { text, images } } : undefined;
+    }
+    case 'file': {
+      const files = decodeArrayOf(body.files, decodeFileInfo);
+      if (!files) missing.push('body.files');
+      if (text === undefined) missing.push('body.text');
+      return files && text !== undefined ? { type: 'file', body: { text, files } } : undefined;
+    }
+    case 'text': {
+      if (text === undefined) missing.push('body.text');
+      return text === undefined ? undefined : { type: 'text', body: { text } };
+    }
+    case 'article': {
+      const blocks = decodeArrayOf(body.blocks, decodeBlock);
+      if (!blocks) missing.push('body.blocks');
+      const imageMap = decodeRecordOf(body.imageMap, decodeImageInfo);
+      if (!imageMap) missing.push('body.imageMap');
+      const fileMap = decodeRecordOf(body.fileMap, decodeFileInfo);
+      if (!fileMap) missing.push('body.fileMap');
+      const embedMap = decodeRecordOf(body.embedMap, decodeEmbedValue);
+      if (!embedMap) missing.push('body.embedMap');
+      const urlEmbedMap = decodeRecordOf(body.urlEmbedMap, decodeUrlEmbedInfo);
+      if (!urlEmbedMap) missing.push('body.urlEmbedMap');
+      return blocks && imageMap && fileMap && embedMap && urlEmbedMap
+        ? { type: 'article', body: { blocks, imageMap, fileMap, embedMap, urlEmbedMap } }
+        : undefined;
+    }
+  }
+}
+
+type DecodeResult = { ok: true; post: CollectablePostInfo } | { ok: false; missing: string[] };
+
+/**
+ * candidate を検証済みの CollectablePostInfo にする。
+ *
+ * 検証するのは addByPostInfo が実際に読むフィールドだけで、情報 JSON に写すだけの
+ * 付随メタデータは型を見ない (型が変わっても取り込む内容は欠けないため、収集を止める
+ * 理由にしない)。ただしシリアライズできることは確認する。
+ *
+ * @param candidate 既知タイプであることまで判定済みの投稿
+ * @param raw candidate と同じオブジェクト。未検証のフィールドを読むために Record として扱う
+ * @param body null / undefined ではないことを判定済みの本文
+ */
+function decodeCollectablePost(
+  candidate: PostInfoCandidate & { type: KnownPostType },
+  raw: Record<string, unknown>,
+  body: unknown,
+): DecodeResult {
   const missing: string[] = [];
-  switch (postInfo.type) {
+  const title = typeof raw.title === 'string' ? raw.title : undefined;
+  if (title === undefined) missing.push('title');
+  const tags =
+    Array.isArray(raw.tags) && raw.tags.every((tag) => typeof tag === 'string') ? (raw.tags as string[]) : undefined;
+  if (!tags) missing.push('tags');
+  const cover = raw.coverImageUrl;
+  const coverImageUrl = cover === null || cover === undefined || typeof cover === 'string' ? cover : undefined;
+  if (coverImageUrl === undefined && cover !== undefined) missing.push('coverImageUrl');
+  const feeRequired = typeof raw.feeRequired === 'number' ? raw.feeRequired : undefined;
+  // feeRequired は addByPostInfo が手前で検証済み (無料除外の判断に使うため)。ここに来た時点で number
+  const metadata: PostMetadata = {
+    creatorId: raw.creatorId,
+    publishedDatetime: raw.publishedDatetime,
+    updatedDatetime: raw.updatedDatetime,
+    likeCount: raw.likeCount,
+    commentCount: raw.commentCount,
+  };
+  if (serialize(metadata) === undefined) missing.push('metadata');
+  const decodedBody = isRecord(body) ? decodeBody(candidate.type, body, missing) : undefined;
+  if (!isRecord(body)) missing.push('body');
+
+  if (missing.length > 0 || title === undefined || !tags || feeRequired === undefined || !decodedBody) {
+    return { ok: false, missing: missing.length > 0 ? missing : ['body'] };
+  }
+  const base = { id: candidate.id, title, tags, feeRequired, coverImageUrl, metadata };
+  switch (decodedBody.type) {
     case 'image':
-      if (!Array.isArray(body.images) || !body.images.every(isImageInfo)) missing.push('body.images');
-      if (typeof body.text !== 'string') missing.push('body.text');
-      break;
+      return { ok: true, post: { ...base, type: 'image', body: decodedBody.body } };
     case 'file':
-      if (!Array.isArray(body.files) || !body.files.every(isFileInfo)) missing.push('body.files');
-      if (typeof body.text !== 'string') missing.push('body.text');
-      break;
+      return { ok: true, post: { ...base, type: 'file', body: decodedBody.body } };
     case 'article':
-      if (!Array.isArray(body.blocks) || !body.blocks.every(isValidBlock)) missing.push('body.blocks');
-      if (!isRecord(body.imageMap) || !Object.values(body.imageMap).every(isImageInfo)) missing.push('body.imageMap');
-      if (!isRecord(body.fileMap) || !Object.values(body.fileMap).every(isFileInfo)) missing.push('body.fileMap');
-      // embedMap の要素は消費側で JSON.stringify に渡すだけ (JSON.parse 由来の値である限り
-      // null を含め常に文字列化できる) なので、コンテナが record であること以上は検証しない
-      if (!isRecord(body.embedMap)) missing.push('body.embedMap');
-      if (!isRecord(body.urlEmbedMap) || !Object.values(body.urlEmbedMap).every(isValidUrlEmbedInfo))
-        missing.push('body.urlEmbedMap');
-      break;
+      return { ok: true, post: { ...base, type: 'article', body: decodedBody.body } };
     case 'text':
-      if (typeof body.text !== 'string') missing.push('body.text');
-      break;
+      return { ok: true, post: { ...base, type: 'text', body: decodedBody.body } };
   }
-  return missing;
+}
+
+function isKnownPostType(type: string): type is KnownPostType {
+  return type === 'image' || type === 'file' || type === 'article' || type === 'text';
 }
 
 /**
- * postInfoオブジェクトからURLリストに追加する
+ * 未検証の投稿オブジェクトを検証して URL リストに追加する
+ *
+ * 分類の順序には理由がある。
+ * 1. postInfo が無い → 本文の有無以前に何も分からないので missing-body に丸める
+ * 2. feeRequired が number でない → 無料除外の判断と支援額タグの両方が壊れるので invalid
+ * 3. 無料除外の指定に該当 → 以降を見ずに ignored。invalid は収集全体を止めるので、
+ *    利用者が除外を指定した投稿の本文が壊れていることを理由に全体を止めない
+ *    (結果として、無料かつ未知タイプ / 無料かつ閲覧不可の投稿も ignored になる)
+ * 4. isRestricted → 本文が無いことの正常系の説明なので、本文の有無より先に判定する
+ * 5. 未知タイプ → 本文の有無より先に判定する。後にすると未知タイプかつ body が null の投稿が
+ *    missing-body に丸められ、「未知のタイプだった」情報が失われる
+ * 6. body が null / undefined → missing-body。'' や 0 はここでは弾かず、decode で invalid になる
+ * 7. decode 失敗 → invalid
+ *
  * @param downloadManage ダウンロード設定
- * @param postInfo 投稿情報オブジェクト
+ * @param postInfo 未検証の投稿オブジェクト (JSON.parse 由来であること)
  * @returns 取り込んだか、取り込まなかった場合はその理由
  */
-export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | undefined): AddPostResult {
+export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfoCandidate | undefined): AddPostResult {
   if (!postInfo) {
     // postInfo 自体が無い場合は isRestricted も分からないため missing-body に丸める
     return { status: 'unavailable', reason: 'missing-body' };
   }
-  if (downloadManage.isIgnoreFree && postInfo.feeRequired === 0) {
+  // candidate が保証するのは id / type / isRestricted だけなので、残りは未検証の値として読む
+  const raw = postInfo as unknown as Record<string, unknown>;
+  const feeRequired = raw.feeRequired;
+  if (typeof feeRequired !== 'number') {
+    console.error(`支援額が読めないため取り込みませんでした\n${postInfo.type}@${postInfo.id}`);
+    return { status: 'invalid', postId: postInfo.id, type: postInfo.type, missing: ['feeRequired'] };
+  }
+  if (downloadManage.isIgnoreFree && feeRequired === 0) {
     return { status: 'ignored' };
   }
   if (postInfo.isRestricted) {
     // isRestricted は一覧/詳細どちらの API も返す既知のフィールドなので、reason として確定できる
-    console.log(`取得できませんでした(支援がたりない？)\nfeeRequired: ${postInfo.feeRequired}@${postInfo.id}`);
+    console.log(`取得できませんでした(支援がたりない？)\nfeeRequired: ${feeRequired}@${postInfo.id}`);
     return { status: 'unavailable', reason: 'restricted' };
   }
-  if (!postInfo.body) {
-    console.log(`本文がありませんでした\nfeeRequired: ${postInfo.feeRequired}@${postInfo.id}`);
+  const postType = postInfo.type;
+  if (!isKnownPostType(postType)) {
+    console.error(`未知の投稿タイプのため取り込みませんでした\n${postType}@${postInfo.id}`);
+    return { status: 'unsupported', postId: postInfo.id, type: postType };
+  }
+  const body = raw.body;
+  if (body === null || body === undefined) {
+    console.log(`本文がありませんでした\nfeeRequired: ${feeRequired}@${postInfo.id}`);
     return { status: 'unavailable', reason: 'missing-body' };
   }
-  // switch の discriminant として type を直接比較することで、以降のコードで
-  // postInfo.type が KnownPostType (image/file/article/text) に絞り込まれた状態を
-  // TypeScript に伝える (ヘルパー関数越しの判定では絞り込みが postInfo 全体に伝播しない)
-  switch (postInfo.type) {
-    case 'image':
-    case 'file':
-    case 'article':
-    case 'text':
-      break;
-    default:
-      console.error(`未知の投稿タイプのため取り込みませんでした\n${postInfo.type}@${postInfo.id}`);
-      return { status: 'unsupported', postId: postInfo.id, type: postInfo.type };
-  }
-  const missing = [...checkCommonFields(postInfo), ...checkBody(postInfo)];
-  if (missing.length > 0) {
+  // 登録より前に decode を終える。addByPostInfo は投稿を downloadObject に登録してから本文を
+  // 触るため、途中で例外になると空の投稿が出力に残り、取得件数上限の減算も飛ばされる
+  const decoded = decodeCollectablePost({ ...postInfo, type: postType }, raw, body);
+  if (!decoded.ok) {
     console.error(
-      `投稿データの形式が想定と違うため取り込みませんでした\n${postInfo.type}@${postInfo.id} missing: ${missing.join(', ')}`,
+      `投稿データの形式が想定と違うため取り込みませんでした\n${postType}@${postInfo.id} missing: ${decoded.missing.join(', ')}`,
     );
-    return { status: 'invalid', postId: postInfo.id, type: postInfo.type, missing };
+    return { status: 'invalid', postId: postInfo.id, type: postType, missing: decoded.missing };
   }
-  const postName = postInfo.title;
+  const post = decoded.post;
+  const postName = post.title;
   const postObject = downloadManage.downloadObject.addPost(postName);
-  const publishedDatetime = (postInfo as { publishedDatetime?: unknown }).publishedDatetime;
+  const publishedDatetime = post.metadata.publishedDatetime;
   if (typeof publishedDatetime === 'string' && publishedDatetime.length > 0) {
     postObject.setPublishedDatetime(publishedDatetime);
   }
-  postObject.setTags([downloadManage.getTagByFee(postInfo.feeRequired), ...postInfo.tags]);
-  downloadManage.addFee(postInfo.feeRequired);
-  downloadManage.addTags(...postInfo.tags);
-  const header: string = ((url: string | null) => {
+  postObject.setTags([downloadManage.getTagByFee(post.feeRequired), ...post.tags]);
+  downloadManage.addFee(post.feeRequired);
+  downloadManage.addTags(...post.tags);
+  const header: string = ((url: string | null | undefined) => {
     if (url) {
       const ext = url.split('.').pop() ?? '';
       return `${postObject.getImageLinkTag(postObject.setCover('cover', ext, url))}<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>\n`;
     }
     return `<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>\n<br>\n`;
-  })(postInfo.coverImageUrl);
+  })(post.coverImageUrl);
 
   let parsedText: string;
-  switch (postInfo.type) {
+  switch (post.type) {
     case 'image': {
-      const images = postInfo.body.images.map((it) => postObject.addFile(postName, it.extension, it.originalUrl));
+      const images = post.body.images.map((it) => postObject.addFile(postName, it.extension, it.originalUrl));
       const imageTags = images.map((it) => postObject.getImageLinkTag(it)).join('<br>\n');
-      const text = postInfo.body.text
+      const text = post.body.text
         .split('\n')
         .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
       postObject.setHtml(`${header + imageTags}<br>\n${text}`);
-      parsedText = `${postInfo.body.text}\n`;
+      parsedText = `${post.body.text}\n`;
       break;
     }
     case 'file': {
-      const files = postInfo.body.files.map((it) => postObject.addFile(it.name, it.extension, it.url));
+      const files = post.body.files.map((it) => postObject.addFile(it.name, it.extension, it.url));
       const fileTags = files.map((it) => postObject.getAutoAssignedLinkTag(it)).join('<br>\n');
-      const text = postInfo.body.text
+      const text = post.body.text
         .split('\n')
         .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
       postObject.setHtml(`${header + fileTags}<br>\n${text}`);
-      parsedText = `${postInfo.body.text}\n`;
+      parsedText = `${post.body.text}\n`;
       break;
     }
     case 'article': {
-      const images = convertImageMap(postInfo.body.imageMap, postInfo.body.blocks).map((it) =>
+      const images = convertImageMap(post.body.imageMap, post.body.blocks).map((it) =>
         postObject.addFile(postName, it.extension, it.originalUrl),
       );
-      const files = convertFileMap(postInfo.body.fileMap, postInfo.body.blocks).map((it) =>
+      const files = convertFileMap(post.body.fileMap, post.body.blocks).map((it) =>
         postObject.addFile(it.name, it.extension, it.url),
       );
-      const embeds = convertEmbedMap(postInfo.body.embedMap, postInfo.body.blocks);
-      const urlEmbeds = convertUrlEmbedMap(postInfo.body.urlEmbedMap, postInfo.body.blocks);
+      const embeds = convertEmbedMap(post.body.embedMap, post.body.blocks);
+      const urlEmbeds = convertUrlEmbedMap(post.body.urlEmbedMap, post.body.blocks);
       let cntImg = 0,
         cntFile = 0,
         cntEmbed = 0,
         cntUrlEmbed = 0;
-      const body = postInfo.body.blocks
+      const body = post.body.blocks
         .map((it) => {
           switch (it.type) {
             case 'p':
@@ -544,8 +704,8 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
             }
             case 'embed': {
               if (cntEmbed >= embeds.length) return '';
-              // FIXME 型が分からないのでJSON化して中身だけ出す
-              return `<span>${DownloadManage.utils.escapeHtml(JSON.stringify(embeds[cntEmbed++]))}</span>`;
+              // 中身の型が分からないので JSON 文字列のまま出す (decode 時に文字列化済み)
+              return `<span>${DownloadManage.utils.escapeHtml(embeds[cntEmbed++].rawJson)}</span>`;
             }
             case 'url_embed': {
               if (cntUrlEmbed >= urlEmbeds.length) return '';
@@ -564,46 +724,54 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
                   const url = `https://www.fanbox.cc/@${urlEmbedInfo.postInfo.creatorId}/posts/${urlEmbedInfo.postInfo.id}`;
                   return postObject.getLinkTag(url, urlEmbedInfo.postInfo.title);
                 }
-                default:
-                  // FIXME 型が分からないのでJSON化して中身だけ出す
-                  return `<span>${DownloadManage.utils.escapeHtml(JSON.stringify(urlEmbedInfo))}</span>`;
+                case 'unknown':
+                  // 中身の型が分からないので JSON 文字列のまま出す (decode 時に文字列化済み)
+                  return `<span>${DownloadManage.utils.escapeHtml(urlEmbedInfo.rawJson)}</span>`;
+                default: {
+                  // 既知 variant を追加したときの処理漏れをコンパイル時に検出する
+                  const exhaustive: never = urlEmbedInfo;
+                  return `${exhaustive}`;
+                }
               }
             }
-            default:
-              return console.error(`unknown block type: ${it.type}`);
+            case 'unknown':
+              // 正規化前の type 名でログを出す (sentinel に畳んだせいで診断が劣化しないように)
+              return console.error(`unknown block type: ${it.originalType}`);
+            default: {
+              const exhaustive: never = it;
+              return `${exhaustive}`;
+            }
           }
         })
         .join('<br>\n');
       postObject.setHtml(header + body);
-      parsedText = `${postInfo.body.blocks
+      parsedText = `${post.body.blocks
         .filter((it): it is TextBlock => it.type === 'p' || it.type === 'header')
         .map((it) => it.text)
         .join('\n')}\n`;
       break;
     }
     case 'text': {
-      const body = postInfo.body.text
+      const body = post.body.text
         .split('\n')
         .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
-      parsedText = postInfo.body.text;
+      parsedText = post.body.text;
       postObject.setHtml(header + body);
       break;
     }
-    // 未知タイプは手前の switch で既に unsupported として返しているため、
-    // ここに来た時点で postInfo.type は KnownPostType の 4 種のいずれかに絞り込まれている
   }
 
   const informationObject = {
-    postId: postInfo.id,
-    title: postInfo.title,
-    creatorId: postInfo.creatorId,
-    fee: postInfo.feeRequired,
-    publishedDatetime: postInfo.publishedDatetime,
-    updatedDatetime: postInfo.updatedDatetime,
-    tags: postInfo.tags,
-    likeCount: postInfo.likeCount,
-    commentCount: postInfo.commentCount,
+    postId: post.id,
+    title: post.title,
+    creatorId: post.metadata.creatorId,
+    fee: post.feeRequired,
+    publishedDatetime: post.metadata.publishedDatetime,
+    updatedDatetime: post.metadata.updatedDatetime,
+    tags: post.tags,
+    likeCount: post.metadata.likeCount,
+    commentCount: post.metadata.commentCount,
   };
   if (DownloadManage.isExportJson) {
     postObject.setInfo(JSON.stringify({ ...informationObject, parsedText }));
@@ -617,7 +785,13 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
   return { status: 'added' };
 }
 
-export function convertImageMap(imageMap: Record<string, ImageInfo>, blocks: Block[]): ImageInfo[] {
+/*
+ * 以下の convert*Map は decode 済みの内部表現を並べ替えるだけの実装詳細なので公開しない。
+ * 公開すると「raw を受けるのか正規化済みを受けるのか」「呼び出し側にも decoder が要るのか」
+ * という新しい契約が生じる。並び順の検証は addByPostInfo 経由の結合テストで行う。
+ */
+
+function convertImageMap(imageMap: Record<string, ImageInfo>, blocks: Block[]): ImageInfo[] {
   const imageOrder = blocks.filter((it): it is ImageBlock => it.type === 'image').map((it) => it.imageId);
   const imageKeyOrder = (s: string) => {
     const idx = imageOrder.indexOf(s);
@@ -628,7 +802,7 @@ export function convertImageMap(imageMap: Record<string, ImageInfo>, blocks: Blo
     .map((it) => imageMap[it]);
 }
 
-export function convertFileMap(fileMap: Record<string, FileInfo>, blocks: Block[]): FileInfo[] {
+function convertFileMap(fileMap: Record<string, FileInfo>, blocks: Block[]): FileInfo[] {
   const fileOrder = blocks.filter((it): it is FileBlock => it.type === 'file').map((it) => it.fileId);
   const fileKeyOrder = (s: string) => {
     const idx = fileOrder.indexOf(s);
@@ -639,7 +813,7 @@ export function convertFileMap(fileMap: Record<string, FileInfo>, blocks: Block[
     .map((it) => fileMap[it]);
 }
 
-export function convertEmbedMap(embedMap: Record<string, EmbedInfo>, blocks: Block[]): EmbedInfo[] {
+function convertEmbedMap(embedMap: Record<string, EmbedValue>, blocks: Block[]): EmbedValue[] {
   const embedOrder = blocks.filter((it): it is EmbedBlock => it.type === 'embed').map((it) => it.embedId);
   const embedKeyOrder = (s: string) => {
     const idx = embedOrder.indexOf(s);
@@ -650,7 +824,7 @@ export function convertEmbedMap(embedMap: Record<string, EmbedInfo>, blocks: Blo
     .map((it) => embedMap[it]);
 }
 
-export function convertUrlEmbedMap(urlEmbedMap: Record<string, UrlEmbedInfo>, blocks: Block[]): UrlEmbedInfo[] {
+function convertUrlEmbedMap(urlEmbedMap: Record<string, UrlEmbedInfo>, blocks: Block[]): UrlEmbedInfo[] {
   const urlEmbedOrder = blocks.filter((it): it is UrlEmbedBlock => it.type === 'url_embed').map((it) => it.urlEmbedId);
   const urlEmbedKeyOrder = (s: string) => {
     const idx = urlEmbedOrder.indexOf(s);
