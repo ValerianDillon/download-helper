@@ -10,7 +10,7 @@ import { DownloadObject, DownloadUtils } from './download-helper';
  */
 export type PlansResponse = {
     body?: {
-        plans: PlanInfo[];
+        plans?: unknown;
     };
 };
 /** @deprecated PlansResponse を使うこと */
@@ -28,7 +28,7 @@ export type PlanInfo = {
  */
 export type TagsResponse = {
     body?: {
-        featuredTags: TagInfo[];
+        featuredTags?: unknown;
     };
 };
 /** @deprecated TagsResponse を使うこと */
@@ -44,7 +44,7 @@ export type TagInfo = {
  */
 export type PostPaginationResponse = {
     body?: {
-        pageUrls: string[];
+        pageUrls?: unknown;
     };
 };
 /** @deprecated PostPaginationResponse を使うこと。返るのは投稿ではなくページ URL である */
@@ -55,56 +55,24 @@ export type PaginatedPosts = PostPaginationResponse;
  */
 export type PostListResponse = {
     body?: {
-        posts: PostListItem[];
+        posts?: unknown;
     };
 };
 /** @deprecated PostListResponse を使うこと */
 export type PostList = PostListResponse;
 /**
- * 投稿一覧と投稿詳細のどちらのレスポンスにも入る共通フィールド。
- * 片方だけ直すと乖離するため、両者はこれを共有する。
+ * 投稿一覧 (post.listCreator) の要素の未検証入力型。
+ *
+ * 一覧の要素として観測される形状すべてではなく、利用側が実際に検証し、収集の分岐に使う
+ * 3 つだけを保証する。id は post.info の URL 組み立てに、isRestricted は投稿を飛ばすかの
+ * 判断に、feeRequired は「無料を省く」指定の判断に使う。
+ * 残りのフィールドは未検証なので型に出さない (index signature も付けない。付けると
+ * 利用側の typo が unknown として通ってしまう)。
  */
-export type PostBase = {
+export type PostListItemCandidate = {
     id: string;
-    title: string;
-    feeRequired: number;
-    creatorId: string;
-    excerpt: string;
     isRestricted: boolean;
-    tags: string[];
-    publishedDatetime: string;
-    updatedDatetime: string;
-    likeCount: number;
-    commentCount: number;
-};
-/**
- * 一覧 (post.listCreator) では必ず返るフィールド。
- * 詳細 (post.info) のレスポンスにも 2026-07 の観測では入っていたが、それは存在の確認に
- * とどまり、全投稿タイプ・全状態で必ず返ることまでは示していない。そのため PostInfo 側は
- * これを Partial で持つ。
- */
-export type PostAdditionalFields = {
-    user: UserInfo;
-    isLiked: boolean;
-    isPinned: boolean;
-    isCommentingRestricted: boolean;
-    hasAdultContent: boolean;
-};
-/**
- * 投稿一覧の要素の型
- * 詳細 (PostInfo) と違って type / body を持たず、カバー画像も cover.url に入る。
- * 本文を得るには post.info を別途叩く必要がある。
- */
-export type PostListItem = PostBase & PostAdditionalFields & {
-    cover: {
-        type: string;
-        url: string;
-    } | null;
-};
-export type UserInfo = {
-    userId: string;
-    name: string;
-    iconUrl: string | null;
+    feeRequired: number;
 };
 /**
  * 投稿詳細APIの型
@@ -112,110 +80,24 @@ export type UserInfo = {
  */
 export type PostInfoResponse = {
     body?: {
-        post: PostInfo;
+        post?: unknown;
     };
 };
 /**
- * 投稿詳細の型
- * 一覧 (post.listCreator) の要素はこの形状ではない。PostListItem を使うこと。
+ * 投稿詳細 (post.info) の投稿オブジェクトの未検証入力型。
  *
- * 閲覧できない投稿でも post.info は 200 で投稿オブジェクトを返し、body はプロパティごと
- * 欠けるのではなく値が null になる (type / isRestricted / coverImageUrl は通常どおり入る)。
- * isRestricted を discriminant にして restricted variant を分ける案は採らない: 逆向きの
- * 「isRestricted: false なら body は非 null」まで型で保証することになるが、そちらは未観測で、
- * 保証できない相関を型に昇格させることになる。
- * @see https://api.fanbox.cc/post.info?postId=${postId}
+ * 利用側 (拡張版 fetchPostInfo / ブックマークレット版 getPostInfoById) が実際に検証している
+ * 3 つだけを保証する。本文をはじめとする残りのフィールドは未検証なので型に出さない。
+ * 検証は addByPostInfo の入口で行い、収集が読むフィールドだけを厳密に確かめる。
+ *
+ * 値は JSON.parse 由来であること (循環参照や BigInt を含まないこと) を契約とする。
+ * 情報 JSON への書き出しや未知値の文字列化で JSON.stringify を使うため。
  */
-export type PostInfo = PostBase & Partial<PostAdditionalFields> & {
-    coverImageUrl: string | null;
-} & ({
-    type: 'image';
-    body: {
-        text: string;
-        images: ImageInfo[];
-    } | null;
-} | {
-    type: 'file';
-    body: {
-        text: string;
-        files: FileInfo[];
-    } | null;
-} | {
-    type: 'article';
-    body: {
-        imageMap: Record<string, ImageInfo>;
-        fileMap: Record<string, FileInfo>;
-        embedMap: Record<string, EmbedInfo>;
-        urlEmbedMap: Record<string, UrlEmbedInfo>;
-        blocks: Block[];
-    } | null;
-} | {
-    type: 'text';
-    body: {
-        text: string;
-    } | null;
-} | {
-    type: 'unknown';
-    body: unknown;
-});
-export type ImageInfo = {
-    originalUrl: string;
-    extension: string;
-};
-export type FileInfo = {
-    url: string;
-    name: string;
-    extension: string;
-};
-export type EmbedInfo = unknown;
-export type UrlEmbedInfo = {
+export type PostInfoCandidate = {
     id: string;
-} & ({
-    type: 'default';
-    url: string;
-    host: string;
-} | {
-    type: 'html';
-    html: string;
-} | {
-    type: 'html.card';
-    html: string;
-} | {
-    type: 'fanbox.post';
-    postInfo: {
-        id: string;
-        title: string;
-        creatorId: string;
-        coverImageUrl?: string;
-    };
-} | {
-    type: 'unknown';
-    [key: string]: unknown;
-});
-export type ImageBlock = {
-    type: 'image';
-    imageId: string;
+    type: string;
+    isRestricted: boolean;
 };
-export type FileBlock = {
-    type: 'file';
-    fileId: string;
-};
-export type TextBlock = {
-    type: 'p' | 'header';
-    text: string;
-};
-export type EmbedBlock = {
-    type: 'embed';
-    embedId: string;
-};
-export type UrlEmbedBlock = {
-    type: 'url_embed';
-    urlEmbedId: string;
-};
-export type UnknownBlock = {
-    type: 'unknown';
-};
-export type Block = ImageBlock | FileBlock | TextBlock | EmbedBlock | UrlEmbedBlock | UnknownBlock;
 /**
  * ダウンローダーの管理クラス
  */
@@ -268,7 +150,11 @@ export type AddPostResult =
      */
     reason: 'restricted' | 'missing-body';
 }
-/** 既知の投稿タイプだが、本文の必要フィールドが揃っていない (構造的な不一致) */
+/**
+ * 既知の投稿タイプだが、収集に必要なフィールドが揃っていない (構造的な不一致)。
+ * missing には欠落している、または期待した型と異なるフィールドのパスが入る
+ * (本文だけでなく feeRequired / title / tags / coverImageUrl / 付随メタデータも対象)
+ */
  | {
     status: 'invalid';
     postId: string;
@@ -282,13 +168,22 @@ export type AddPostResult =
     type: string;
 };
 /**
- * postInfoオブジェクトからURLリストに追加する
+ * 未検証の投稿オブジェクトを検証して URL リストに追加する
+ *
+ * 分類の順序には理由がある。
+ * 1. postInfo が無い → 本文の有無以前に何も分からないので missing-body に丸める
+ * 2. feeRequired が number でない → 無料除外の判断と支援額タグの両方が壊れるので invalid
+ * 3. 無料除外の指定に該当 → 以降を見ずに ignored。invalid は収集全体を止めるので、
+ *    利用者が除外を指定した投稿の本文が壊れていることを理由に全体を止めない
+ *    (結果として、無料かつ未知タイプ / 無料かつ閲覧不可の投稿も ignored になる)
+ * 4. isRestricted → 本文が無いことの正常系の説明なので、本文の有無より先に判定する
+ * 5. 未知タイプ → 本文の有無より先に判定する。後にすると未知タイプかつ body が null の投稿が
+ *    missing-body に丸められ、「未知のタイプだった」情報が失われる
+ * 6. body が null / undefined → missing-body。'' や 0 はここでは弾かず、decode で invalid になる
+ * 7. decode 失敗 → invalid
+ *
  * @param downloadManage ダウンロード設定
- * @param postInfo 投稿情報オブジェクト
+ * @param postInfo 未検証の投稿オブジェクト (JSON.parse 由来であること)
  * @returns 取り込んだか、取り込まなかった場合はその理由
  */
-export declare function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo | undefined): AddPostResult;
-export declare function convertImageMap(imageMap: Record<string, ImageInfo>, blocks: Block[]): ImageInfo[];
-export declare function convertFileMap(fileMap: Record<string, FileInfo>, blocks: Block[]): FileInfo[];
-export declare function convertEmbedMap(embedMap: Record<string, EmbedInfo>, blocks: Block[]): EmbedInfo[];
-export declare function convertUrlEmbedMap(urlEmbedMap: Record<string, UrlEmbedInfo>, blocks: Block[]): UrlEmbedInfo[];
+export declare function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfoCandidate | undefined): AddPostResult;
