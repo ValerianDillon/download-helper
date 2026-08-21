@@ -1,4 +1,4 @@
-import { DownloadObject, DownloadUtils } from "./download-helper";
+import { createNameKeyedDictionary, DownloadObject, DownloadUtils } from "./download-helper";
 
 export class DownloadManage {
   userId;
@@ -133,7 +133,7 @@ function decodeUrlEmbedInfo(value) {
 function decodeRecordOf(value, decodeValue) {
   if (!isRecord(value))
     return;
-  const decoded = Object.create(null);
+  const decoded = createNameKeyedDictionary();
   for (const [key, item] of Object.entries(value)) {
     const result = decodeValue(item);
     if (result === undefined)

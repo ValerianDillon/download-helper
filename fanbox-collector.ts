@@ -3,7 +3,7 @@
  * pixiv FANBOX の API レスポンス型、DownloadManage (収集時の状態管理)、
  * postInfo → DownloadObject への変換処理をまとめる。
  */
-import { DownloadObject, DownloadUtils } from './download-helper';
+import { createNameKeyedDictionary, DownloadObject, DownloadUtils } from './download-helper';
 
 /**
  * プランAPIの型
@@ -443,9 +443,9 @@ function decodeRecordOf<T>(
   decodeValue: (item: unknown) => T | undefined,
 ): Record<string, T> | undefined {
   if (!isRecord(value)) return undefined;
-  // 通常の {} だとキーが '__proto__' のときプロトタイプへの代入になり、own property が作られず
-  // その要素が黙って消える (JSON.parse は own property として作るので入力には現れうる)
-  const decoded = Object.create(null) as Record<string, T>;
+  // キーは外部入力なので '__proto__' がありうる。通常の {} だとプロトタイプへの代入になり、
+  // own property が作られずその要素が黙って消える (JSON.parse は own property として作る)
+  const decoded = createNameKeyedDictionary<T>();
   for (const [key, item] of Object.entries(value)) {
     const result = decodeValue(item);
     if (result === undefined) return undefined;

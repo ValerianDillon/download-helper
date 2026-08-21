@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.4.2/schema.json",
   "files": {
-    "includes": ["**", "!download-helper.js", "!fanbox-collector.js", "!dist/types"]
+    "includes": ["**", "!download-helper.js", "!fanbox-collector.js", "!api-session.js", "!dist/types"]
   },
   "formatter": {
     "indentStyle": "space",

@@ -241,7 +241,7 @@ export class DownloadUtils {
 }
 
 /**
- * 投稿名 / 添付ファイル名をキーにした辞書オブジェクトを作る。
+ * 外部入力 (FANBOX API のレスポンス) 由来のキーで引く辞書オブジェクトを作る。
  *
  * 通常の `{}` だと、キーが "__proto__" のとき (Object.prototype の accessor と衝突する)
  * `obj[key] = value` が実際にはプロトタイプを差し替えるだけで own property を作らず、
@@ -251,8 +251,11 @@ export class DownloadUtils {
  * 対して呼ばれ例外になる。投稿名・添付ファイル名は FANBOX API のレスポンスに由来する
  * 外部入力であり、このキーを回避できないため、プロトタイプを持たないオブジェクトにして
  * 経路ごと塞ぐ。
+ *
+ * 同じ理由の対策が必要な箇所は投稿名・添付ファイル名に限らない (API のマップ型は
+ * どれもキーが外部入力である) ため、fanbox-collector からも使えるように export する。
  */
-function createNameKeyedDictionary<T>(): Record<string, T> {
+export function createNameKeyedDictionary<T>(): Record<string, T> {
   return Object.create(null);
 }
 
