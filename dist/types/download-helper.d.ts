@@ -17,6 +17,13 @@ export type DownloadObj = {
  * それ以前に文字列として埋め込むと採番の変化に追従できないため)。
  */
 export type PostObj = {
+    /**
+     * FANBOX の postId。`Selection` が投稿を指すキーになる。
+     *
+     * 一意性は検証しない。同じ postId の投稿が 2 件登録された場合、選択は両方に同時に効く。
+     * 一覧ページの重複などで同じ投稿が 2 回来ても収集を止めないことを優先する
+     */
+    postId: string;
     name: string;
     info: string;
     files: BodyFileObj[];
@@ -103,13 +110,131 @@ export type AssetInput = {
     metadata?: AssetMetadata;
 };
 /**
+ * アセット 1 件を表すカード全体の断片
+ *
+ * 選択条件で除外されたアセットは、カードごとプレースホルダーに差し替える。
+ * 画像・動画・音声のカードは `src` でもアセットを参照するので、リンクを無効化するだけでは
+ * 実在しないファイルを読みに行くカードが残る。
+ *
+ * `body` の中の `assetRef` はこのカードの `key` を指す。カードを丸ごと差し替えれば
+ * 参照も一緒に消えるので、除外時に `body` を走査する必要はない。
+ */
+export type AssetCardFragment = {
+    readonly key: AssetKey;
+    readonly body: readonly CardBodyFragment[];
+};
+/**
+ * カードの中身の断片
+ *
+ * `assetRef` はアセットへの参照で、finalize 時に allocator が割り当てた archive path へ解決する。
+ * 参照はカードの中にしか置けない。カードの外に置けると、カードごとプレースホルダーへ差し替えても
+ * 参照だけが残り、除外したはずのアセットを指す `src` / `href` が出力に出てしまう。
+ * 参照先はそのカードの `key` に限る (`setHtml` が検証する)。
+ */
+export type CardBodyFragment = string | {
+    readonly assetRef: AssetKey;
+};
+/**
  * 投稿 HTML の断片
  *
- * 文字列はそのまま出力する。{ assetRef } はアセットへの参照で、finalize 時に
- * allocator が割り当てた archive path へ解決する。
+ * 文字列はそのまま出力する。`assetCard` はアセット 1 件のカード全体で、
+ * 選択条件で除外されたときにプレースホルダーへ差し替える単位になる。
  */
 export type HtmlFragment = string | {
-    readonly assetRef: AssetKey;
+    readonly assetCard: AssetCardFragment;
+};
+/**
+ * 選択条件
+ *
+ * 投稿の集合 / 拡張子の集合 / カバーを含めるか、の 3 つの単純な積 (AND) である。
+ * カバーは「投稿が選択済み AND `includeCover`」で、拡張子の選択はカバーには適用しない
+ * (カバーは投稿の付随物であって添付の一種ではないため)。
+ */
+export type Selection = {
+    /** 選択された投稿の postId */
+    readonly postIds: ReadonlySet<string>;
+    /** 選択された拡張子。`normalizeExtension` を通した形 (小文字、先頭ドット付き、無しは空文字列) */
+    readonly extensions: ReadonlySet<string>;
+    /** カバーを含めるか */
+    readonly includeCover: boolean;
+};
+/**
+ * 拡張子を `Selection` と突き合わせられる形に正規化する。
+ * FANBOX は同じ形式でも大文字と小文字が混ざるため、比較は小文字で行う
+ * @param extension `FileObj.extension` (先頭ドット付き、または空文字列)
+ */
+export declare function normalizeExtension(extension: string): string;
+/**
+ * `download-manifest.json` に書き出すアセットの記述
+ *
+ * `assetId` はカバー以外に付く (カバーは投稿に高々 1 つで id を持たない)。
+ * `kind` と併せてアセットを投稿内で一意に指す
+ */
+export type ManifestAsset = {
+    readonly originalName: string;
+    readonly extension: string;
+} & ({
+    readonly kind: 'cover';
+} | {
+    readonly kind: BodyAssetKind;
+    readonly assetId: string;
+});
+/**
+ * 含めたアセットの記述。ZIP に入るので archive 名を持つ
+ */
+export type IncludedManifestAsset = ManifestAsset & {
+    readonly archiveName: string;
+};
+/**
+ * manifest に記録する投稿 1 件分
+ *
+ * アセットは投稿にネストする。postId の一意性を保証しない以上、アセットを平坦に並べると
+ * 同じ postId の投稿が 2 件あったときにどちらのものか分からなくなる
+ */
+export type ManifestPost = {
+    readonly postId: string;
+    readonly archiveDirectory: string;
+    readonly included: readonly IncludedManifestAsset[];
+    /** 除外したアセットは ZIP に存在しないので archive 名を持たない */
+    readonly excluded: readonly ManifestAsset[];
+};
+/**
+ * ZIP ルートに書き出す `download-manifest.json` の内容
+ *
+ * この段階で主張するのは「plan に含めた」「選択条件で除外した」までで、「実際に書けた」とは
+ * 主張しない。実行結果を対象単位で扱えるようになってから written / failed / aborted を足す。
+ * URL は持たない (必要になれば post.info を取り直せば得られるし、保存量も減る)。
+ *
+ * `isDownloadJsonObj` が突き合わせられるのは、`DownloadJsonObj` 側にも現れる値だけである。
+ * 次のものは対応する相手が無いので検証できない。
+ *
+ * - `postId` / `kind` / `assetId` / `extension` が実際の投稿・アセットに結び付いていること
+ *   (投稿間で `postId` を入れ替えても、`assetId` を書き換えても通る)
+ * - `excludedPosts` と各投稿の `excluded` の網羅性と実在性。除外された対象は ZIP にも JSON にも
+ *   現れないので、消しても架空の対象を足しても通る
+ * - 除外アセットと included なカバーの `originalName` (JSON 側のカバーは `url` と archive 名しか持たない)
+ *
+ * 突き合わせのためだけに identity を JSON 側へ写す設計は採らない。同じ値を 2 箇所に置いて
+ * 一致を確かめる形になり、ずれたときにどちらが正しいのかを決められないため。
+ * したがって manifest は「projection がこう記録した」ことを表すのであって、その記録が
+ * 実際の収集結果と一致することを ZIP の受け手が検証できるわけではない。
+ */
+export type DownloadManifest = {
+    readonly schemaVersion: 1;
+    readonly creatorId: string;
+    /** 生成日時 (ISO 8601) */
+    readonly generatedAt: string;
+    readonly selection: {
+        readonly postIds: readonly string[];
+        readonly extensions: readonly string[];
+        readonly includeCover: boolean;
+    };
+    /** 選択された投稿。収集順。含めた / 除外したアセットをこの下に持つ */
+    readonly posts: readonly ManifestPost[];
+    /** 投稿ごと除外された投稿。アセットは個別に載せない (投稿単位で除外と分かる) */
+    readonly excludedPosts: readonly {
+        readonly postId: string;
+    }[];
 };
 /**
  * 断片列を区切り文字で連結する。
@@ -120,6 +245,12 @@ export type HtmlFragment = string | {
 export declare function joinHtmlFragments(parts: readonly HtmlFragment[][], separator: string): HtmlFragment[];
 /**
  * ダウンロード用JSON元オブジェクト
+ *
+ * 値は `DownloadObject.project()` の出力か、それを `JSON.parse` した結果であることを契約とする。
+ * したがって getter・`Array` の派生クラス・独自の `Symbol.iterator`・`toJSON` は含まれない。
+ * 検証と書き出しはそれでも読み出しを 1 回に畳んで素の値に写すが (`snapshotManifest`)、
+ * これは「検証したものと書き出すものを同一にする」ためであって、任意のオブジェクトを
+ * 安全に扱えることを主張するものではない。
  */
 export type DownloadJsonObj = {
     posts: {
@@ -144,6 +275,18 @@ export type DownloadJsonObj = {
     tags: string[];
     fileCount: number;
     postCount: number;
+    /**
+     * projection が付ける。これが無い入力は downloadZip が受け付けない
+     * (絞り込みを経ていないオブジェクトを ZIP にすると、HTML の参照と中身がずれうる)
+     */
+    manifest: DownloadManifest;
+};
+/**
+ * projection の任意指定
+ */
+export type ProjectionOptions = {
+    /** manifest の生成日時 (既定は現在時刻)。テストで固定するために注入できる */
+    readonly now?: Date;
 };
 /**
  * ダウンロード用のUtilityクラス
@@ -270,6 +413,7 @@ export declare function createNameKeyedDictionary<T>(): Record<string, T>;
  * 名前と並び順だけなので、入力側も型で閉じる。
  */
 export type ReadonlyPostObj = {
+    readonly postId: string;
     readonly name: string;
     readonly info: string;
     readonly files: readonly Readonly<BodyFileObj>[];
@@ -367,14 +511,38 @@ export declare class DownloadObject {
      * @param allocator archive path の割り当て器 (省略時は従来の採番規則)
      */
     constructor(id: string, utils: DownloadUtils, allocator?: ArchivePathAllocator);
-    stringify(): string;
+    /**
+     * 全件を選択した `Selection` を返す。
+     * 「絞り込まずに全部落とす」も projection を経た結果として表す (ZIP 入力の経路を 1 本にする)
+     */
+    selectAll(): Selection;
+    /**
+     * 選択条件からダウンロード対象を導出する。
+     *
+     * 入力は変更しない。同じ入力と `Selection` に対して決定的である
+     * (`options.now` を渡せば `generatedAt` も含めて決まる)。
+     * archive path は選択前の全アセットから割り当てるので、間引いても残った対象の名前は変わらない
+     * @param selection 選択条件
+     * @param options 生成日時の注入
+     */
+    project(selection: Selection, options?: ProjectionOptions): DownloadJsonObj;
+    /**
+     * 全件を選択した projection の結果を JSON 文字列にする
+     * @param options 生成日時の注入
+     */
+    stringify(options?: ProjectionOptions): string;
     setUrl(url: string): void;
     setTags(tags: string[]): void;
-    addPost(name: string): PostObject;
-    private countPost;
-    private countFile;
-    private collectTags;
+    addPost(postId: string, name: string): PostObject;
 }
+/**
+ * 1 投稿分の projection 結果
+ */
+export type ProjectedPost = {
+    readonly json: DownloadJsonObj['posts'][number];
+    /** 投稿の全アセット (除外分を含む) の archive 名。manifest の組み立てに使う */
+    readonly archiveNames: ReadonlyMap<string, string>;
+};
 /**
  * 投稿情報オブジェクトラッパークラス
  */
@@ -418,7 +586,28 @@ export declare class PostObject {
      * @param directoryName この投稿に割り当てられたディレクトリ名
      * @param allocator 投稿内アセットの割り当て器
      */
-    toJsonObj(directoryName: string, allocator: ArchivePathAllocator): DownloadJsonObj['posts'][number];
+    /**
+     * 割り当て済みの archive path を使って JSON 出力用のオブジェクトにする。
+     *
+     * archive path は投稿の全アセットから割り当てる。選択で間引いた後の件数で採番し直すと
+     * HTML 内の参照と一致しなくなるため、`includedKeys` は出力に載せるかどうかだけに使う
+     * @param directoryName この投稿に割り当てられたディレクトリ名
+     * @param allocator 投稿内アセットの割り当て器
+     * @param includedKeys 出力に含めるアセット (assetKeyToString)
+     */
+    projectPost(directoryName: string, allocator: ArchivePathAllocator, includedKeys: ReadonlySet<string>): ProjectedPost;
+    /**
+     * allocator にこの投稿のアセットを割り当てさせ、契約を満たしていることを確かめる
+     * @param allocator 投稿内アセットの割り当て器
+     */
+    private allocateAssets;
+    /**
+     * 出力に使わない投稿についても finalize の契約を確かめる。
+     *
+     * 選択された投稿でだけ検査すると、入力の正当性が選択内容に依存してしまう
+     * @param allocator 投稿内アセットの割り当て器
+     */
+    assertFinalizeContract(allocator: ArchivePathAllocator): void;
     /**
      * allocator の結果が投稿のアセットと 1 対 1 に対応していることを確かめる。
      *
@@ -429,11 +618,32 @@ export declare class PostObject {
      */
     private assertAllocationCoversAssets;
     /**
+     * HTML のカードが、投稿が実際に持つアセットだけを参照していることを確かめる。
+     *
+     * 参照先が無いカードを除外扱いにしてプレースホルダーで描くと、「選択条件で外した」のか
+     * 「アセットを登録し忘れた」のか区別できなくなる。後者は実装の誤りなので止める
+     * @param assetByKey 投稿の全アセット (カバーを含む)
+     */
+    private assertHtmlReferencesKnownAssets;
+    /**
      * 断片列を HTML 文字列に解決する。
+     *
+     * 選択条件で除外されたアセットのカードはプレースホルダーに差し替える。カードごと消さないのは、
+     * 後からアーカイブを見たときに元の投稿に何が含まれていたか分からなくなるため。
      * 参照先の archive path が割り当てられていない断片は、壊れたリンクを出力に残さないよう例外にする
-     * @param pathByKey assetKeyToString をキーとする archive path
+     * @param pathByKey assetKeyToString をキーとする archive path (投稿の全アセット)
+     * @param includedKeys 出力に含めるアセット
      */
     private resolveHtml;
+    /**
+     * 選択条件で除外されたアセットのプレースホルダーを描く。
+     *
+     * 「取得に失敗した」とは別の状態なので文言を分ける。URL は残さない。
+     * 種別と名前は登録済みのアセットから取る。カードに持たせると、実在する key に偽の
+     * メタデータを付けたカードで誤った表示ができてしまう
+     * @param asset 除外されたアセット
+     */
+    private renderExcludedAsset;
 }
 /**
  * ファイルオブジェクトラッパークラス

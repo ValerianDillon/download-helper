@@ -80,6 +80,55 @@ finalize では衝突を検出しない。legacy 自身が作れる衝突を例�
 - `body.images` / `body.files` 内で `id` が重複していれば `invalid` にする (`missing` には `body.images[1].id` のように衝突した位置を入れる)
 - `size` / `width` / `height` は非負の安全な整数でなければ欠落として扱う。収集が読まない付随メタデータなので、型が違っても `invalid` にはしない
 
+### 選択条件からダウンロード対象を導出する (Issue #42)
+
+`Selection` は「投稿の集合 (postId) × 拡張子の集合 × カバーを含めるか」の単純な積 (AND) である。カバーは「投稿が選択済み AND `includeCover`」で、拡張子の選択はカバーには適用しない (カバーは投稿の付随物であって添付の一種ではない)。拡張子の比較は `normalizeExtension` を通した形 (小文字、先頭ドット付き、無しは空文字列) で行う。
+
+`DownloadObject.project(selection, options?)` が `DownloadJsonObj` を返す。入力は変更せず、同じ入力と `Selection` に対して決定的である (`options.now` を渡せば `generatedAt` も含めて決まる)。
+
+- **選択で間引いても archive path を再採番しない。** 割り当ては選択前の全アセットから行い、`Selection` は出力に載せるかどうかだけに使う。間引いた後の件数で採番し直すと HTML 内の参照と一致しなくなる
+- finalize の契約検査 (allocator の割り当てと、HTML のカードが投稿の持つアセットだけを参照していること) は選択の可否によらず全投稿に対して行う。選択された投稿でだけ検査すると、入力の正当性が選択内容に依存してしまう
+- `postCount` は選択投稿数、`fileCount` は選択された `post.files` の数 (カバーを含めない。従来の `countFile` と同じ意味論)
+- root の `tags` は選択後の投稿に残っているものだけを出す。`setTags` の並び (支援額タグを先頭に置く) は保つ
+- 「絞り込まずに全部落とす」も projection を経た結果として表す (`selectAll()`)。ZIP 入力の経路を 1 本にするため、`stringify()` は `project(selectAll())` に委譲する
+
+除外されたアセットは HTML 内でプレースホルダーに解決する。カードごと削除しない (後からアーカイブを見たときに元の投稿に何が含まれていたかが失われる)。画像・動画・音声のカードは `src` でも参照するので `<a>` を無効化するだけでは足りず、カード全体を差し替える。これを可能にするため `HtmlFragment` に `assetCard` (アセット 1 件のカード全体) がある。プレースホルダーには元ファイル名 / 拡張子 / 種別と「選択条件により除外しました」を残し、URL は残さない。「取得に失敗した」とは別の状態なので文言を分ける。
+
+**アセットへの参照 (`CardBodyFragment` の `assetRef`) はカードの中にしか置けない。** カードの外に置けると、カードごと差し替えても参照だけが残り、除外したはずのアセットを指す `src` / `href` が出力に出てしまう。参照先はそのカードの `key` に限り、`setHtml` が検証する。投稿が持たないアセットを参照するカードは finalize で例外にする (プレースホルダーで描くと「選択条件で外した」のか「登録し忘れた」のか区別できなくなる)。
+
+ZIP ルートに `download-manifest.json` を書き出す (`schemaVersion` / `creatorId` / 生成日時 / `Selection` / 投稿ごとの含めた・除外したアセット / 投稿ごと除外した投稿)。**アセットは投稿にネストする** — `postId` の一意性を保証しない以上、平坦に並べると同じ postId の投稿が 2 件あったときにどちらのものか分からなくなる。アセットは `kind` と `assetId` で投稿内を一意に指す (カバーは `assetId` を持たない)。この段階で主張するのは「plan に含めた」「選択条件で除外した」までで、「実際に書けた」とは主張しない。選択条件を `informationText` (info JSON) に混ぜない — info JSON は FANBOX の投稿メタデータで、選択条件はダウンロード実行側の情報なので、混ぜると出所が曖昧になる。
+
+`manifest` は projection を経た印でもある。`isDownloadJsonObj` がこれを必須にすることで、絞り込みを経ていないオブジェクトを ZIP 入力として受け付けない。印として働かせるには形だけでは足りないので、各要素の型に加えて次まで検証する (形だけ整えた manifest を付けただけの入力を通さないため)。
+
+- `creatorId` が `id` と一致すること
+- `manifest.posts` が JSON の投稿と件数・`archiveDirectory` で **同じ index に対応する**こと (`manifest.posts` は収集順と定義しているため。集合として含まれるだけでは通さない)
+- 各投稿の `included` が JSON の `files[].encodedName` / `originalName` および `cover.name` と 1 対 1 で対応すること
+- 同じアセットが `included` と `excluded` の両方に無いこと
+- `postCount` / `fileCount` が JSON の実件数と一致すること
+- 記録された `Selection` と内容が矛盾しないこと (出力に載っている投稿が `postIds` に含まれる、`excludedPosts` が `postIds` に含まれない、含めた / 除外したアセットの拡張子が `extensions` と対応する、カバーの扱いが `includeCover` と一致する)
+
+検証できないものがある。いずれも `DownloadJsonObj` 側に対応する値が無いためで、突き合わせのためだけに identity を JSON へ写す設計は採らない (同じ値を 2 箇所に置いて一致を確かめる形になり、ずれたときにどちらが正しいか決められない)。
+
+- `postId` / `kind` / `assetId` / `extension` が実際の投稿・アセットに結び付いていること。これらは manifest にしか無いので、投稿間で `postId` を入れ替えても `assetId` を書き換えても通る
+- `excludedPosts` と各投稿の `excluded` の網羅性・実在性。除外された対象は ZIP にも JSON にも現れないので、消しても架空の対象を足しても通る
+- 除外アセットと included なカバーの `originalName`。JSON 側のカバーは `url` と archive 名しか持たない
+
+つまり manifest は「projection がこう記録した」ことを表すのであって、その記録が実際の収集結果と一致することを ZIP の受け手が検証できるわけではない。検証が担うのは「projection を経ていない入力を弾く」ところまでである。
+
+`isDownloadJsonObj` は `unknown` を受ける型ガードなので、**manifest の検証は投稿の型検証を通してから行う**。先に行うと、壊れた `posts` / `cover` を参照して例外を投げてしまう。
+
+未知のプロパティは拒否しないが、**書き出すのは検証済みのフィールドだけを写した canonical な manifest である**。受け取ったオブジェクトをそのまま直列化すると、URL を持たせた入力がそのまま `download-manifest.json` に残る (getter や `toJSON` も同じ経路で効く)。写すときは入力配列の `map` や iterator を呼ばず index で読む — `Array` の派生クラスで `map` を差し替えられると、写した先に細工を混ぜられるため。
+
+配列は `isDenseArray` で hole が無いことを確かめてから要素を見る。`every` / `some` / `reduce` は hole を飛ばすので、`new Array(3)` のような疎配列はどんな述語でも通ってしまい、書き出すと `[null, null, null]` になる。
+
+`DownloadJsonObj` は `project()` の出力か、それを `JSON.parse` した結果であることを契約とする。getter・`Array` の派生クラス・独自の `Symbol.iterator`・`toJSON` は含まれない前提で、任意のオブジェクトを安全に扱えるとは主張しない。
+
+その上で `downloadZip` は **manifest を一度だけ読んで素の値に写し (`snapshotManifest`)、その写しだけを検証と書き出しに使う**。検証と書き出しで別々に読むと、読むたびに値を変える getter で「検証を通った値」と「書き出される値」を食い違わせられる。検証側も各フィールドを 1 回だけ読み、未信頼の配列に対して `map` / `every` / iterator を呼ばない (index で読む)。
+
+ZIP ルート直下の固定ファイル名 (`index.html` / `download-manifest.json`) と同名の投稿ディレクトリ、および投稿ディレクトリ直下の固定ファイル名 (`index.html` / `info.json` / `info.txt`) と同名のアセットは `downloadZip` が拒否する。比較は大文字小文字を畳み、末尾の空白とピリオドを落としてから行う (Windows と既定の macOS は大文字小文字を区別せず、Windows は末尾の空白とピリオドを取り除いて解釈するため、完全一致だけでは `INDEX.HTML` や `index.html.` がすり抜ける)。同じパスがファイルとディレクトリの両方になり、展開できない ZIP になるため。legacy allocator の名前衝突 (同名グループの採番など) を許容するのとは扱いが違う — あちらは「1 ファイルだけ影に入った ZIP」で済むが、こちらはアーカイブ全体が壊れる。`index.html` の衝突は #42 以前からある欠陥で、ここで併せて塞いだ。
+
+`PostObj.postId` は `Selection` が投稿を指すキーである。一意性は検証しない (一覧ページの重複などで同じ投稿が 2 回来ても収集を止めないことを優先する)。同じ postId の投稿が 2 件あれば選択は両方に同時に効く。
+
 主な機能:
 - ZIP ダウンロード（File System Access API + 自前 ZipWriter）
 - Bootstrap ベースのタグフィルタリング UI

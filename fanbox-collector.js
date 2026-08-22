@@ -346,7 +346,7 @@ ${postType}@${postInfo.id} missing: ${decoded.missing.join(", ")}`);
   }
   const post = decoded.post;
   const postName = post.title;
-  const postObject = downloadManage.downloadObject.addPost(postName);
+  const postObject = downloadManage.downloadObject.addPost(post.id, postName);
   postObject.setPostType(post.type);
   const publishedDatetime = post.metadata.publishedDatetime;
   if (typeof publishedDatetime === "string" && publishedDatetime.length > 0) {
