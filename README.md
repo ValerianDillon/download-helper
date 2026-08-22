@@ -8,8 +8,10 @@ Chrome / Edge (File System Access API を使用)
 
 ## 使い方
 
+[Releases](https://github.com/ValerianDillon/download-helper/releases) から使うタグを選んで固定する。
+
 ```bash
-npm install --save github:ValerianDillon/download-helper#v4.3.0
+npm install --save 'github:ValerianDillon/download-helper#<tag>'
 ```
 
 ## 既知の制限
