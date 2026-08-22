@@ -16,6 +16,7 @@ import {
   createLegacyArchivePathAllocator,
   DownloadHelper,
   type DownloadJsonObj,
+  type DownloadManifest,
   DownloadObject,
   DownloadUtils,
   type DownloadZipOptions,
@@ -26,6 +27,7 @@ import {
   MAX_ZIP_ENTRY_COUNT,
   MAX_ZIP_UINT32_FIELD_VALUE,
   type ReadonlyPostObj,
+  type Selection,
   toDosTimeDate,
   ZipWriter,
 } from './download-helper';
@@ -276,6 +278,16 @@ describe('DownloadUtils', () => {
   });
 });
 
+/** テスト用の最小 manifest (projection が付ける印) */
+const testManifest = (): DownloadManifest => ({
+  schemaVersion: 1,
+  creatorId: 'creator-id',
+  generatedAt: '2026-08-23T00:00:00.000Z',
+  selection: { postIds: [], extensions: [], includeCover: true },
+  included: { posts: [], assets: [] },
+  excluded: { posts: [], assets: [] },
+});
+
 /** テスト用の AssetKey ショートハンド */
 const imageKey = (assetId: string): BodyAssetKey => ({ kind: 'image', assetId });
 
@@ -370,7 +382,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
   describe('legacy allocator の採番規則', () => {
     test('同名ファイルが 1 件なら添字を付けない', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
       });
       expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['a.png']);
@@ -378,7 +390,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
     test('同名ファイルが複数なら昇順に _1 / _2 を付ける', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
         post.addFile({ key: imageKey('i2'), name: 'a', extension: 'png', url: 'u2' });
       });
@@ -387,8 +399,8 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
     test('同名投稿は降順に _2 / _1 を付ける', () => {
       const json = build((d) => {
-        d.addPost('same');
-        d.addPost('same');
+        d.addPost('p:same', 'same');
+        d.addPost('p:same', 'same');
       });
       expect(json.posts.map((it) => it.encodedName)).toEqual(['same_2', 'same_1']);
     });
@@ -397,7 +409,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     // 出力される files の並び順を決めるので、従来の出力を保つために固定する
     test('整数に見える名前のグループが先に、昇順で並ぶ', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         post.addFile({ key: imageKey('i1'), name: '10', extension: 'png', url: 'u1' });
         post.addFile({ key: imageKey('i2'), name: 'alpha', extension: 'png', url: 'u2' });
         post.addFile({ key: imageKey('i3'), name: '2', extension: 'png', url: 'u3' });
@@ -407,7 +419,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
     test('ファイル名は encodeFileName を通す', () => {
       const json = build((d) => {
-        const post = d.addPost('po/st');
+        const post = d.addPost('p:po/st', 'po/st');
         post.addFile({ key: imageKey('i1'), name: 'a/b', extension: 'png', url: 'u1' });
       });
       expect(json.posts[0].encodedName).toBe('po／st');
@@ -418,7 +430,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     // 両者がずれうる入力があった。allocator に集約する際、参照先が実在する側に揃えた
     test('カバーの割り当て名も encodeFileName を通す', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         post.setCover('co/ver', 'jp/g', 'https://example.com/c');
       });
       expect(json.posts[0].cover?.name).toBe('co／ver.jp／g');
@@ -428,7 +440,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
   describe('finalize 後の archive path の不変性', () => {
     test('HTML 内の参照と files の encodedName が一致する', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
         const b = post.addFile({ key: imageKey('i2'), name: 'a', extension: 'png', url: 'u2' });
         post.setHtml([...post.getImageLinkTag(a), ...post.getImageLinkTag(b)]);
@@ -442,7 +454,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
     test('カバーへの参照も割り当て名に解決する', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         const cover = post.setCover('cover', 'png', 'https://example.com/c.png');
         post.setHtml(post.getImageLinkTag(cover));
       });
@@ -452,7 +464,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
     test('stringify を繰り返しても同じ結果になる (割り当てが finalize のたびに変わらない)', () => {
       const downloadObject = new DownloadObject('creator', utils);
-      const post = downloadObject.addPost('post');
+      const post = downloadObject.addPost('p:post', 'post');
       const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
       post.setHtml(post.getImageLinkTag(a));
       expect(downloadObject.stringify()).toBe(downloadObject.stringify());
@@ -468,7 +480,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
         }),
       };
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
         post.setHtml(post.getImageLinkTag(a));
       }, positional);
@@ -479,7 +491,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
     test('setHtml に渡した AssetKey を後から書き換えても解決先は変わらない', () => {
       const downloadObject = new DownloadObject('creator', utils);
-      const post = downloadObject.addPost('post');
+      const post = downloadObject.addPost('p:post', 'post');
       const key = imageKey('i1');
       post.addFile({ key, name: 'a', extension: 'png', url: 'u1' });
       post.setHtml([{ assetRef: key }]);
@@ -490,7 +502,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
     test('割り当てられていない AssetKey を参照する断片は例外にする', () => {
       const downloadObject = new DownloadObject('creator', utils);
-      const post = downloadObject.addPost('post');
+      const post = downloadObject.addPost('p:post', 'post');
       post.setHtml([{ assetRef: imageKey('missing') }]);
       expect(() => downloadObject.stringify()).toThrow('archive path is not allocated: image:missing');
     });
@@ -498,7 +510,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
   test('登録した AssetKey は書き換えられない (identity が後から変わらないこと)', () => {
     const downloadObject = new DownloadObject('creator', utils);
-    const post = downloadObject.addPost('post');
+    const post = downloadObject.addPost('p:post', 'post');
     const key = imageKey('i1');
     const file = post.addFile({ key, name: 'a', extension: 'png', url: 'u1' });
     // 渡した側のオブジェクトを書き換えても、登録済みの identity は動かない
@@ -513,7 +525,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
   test('同じ AssetKey を 2 回追加すると例外になる', () => {
     const downloadObject = new DownloadObject('creator', utils);
-    const post = downloadObject.addPost('post');
+    const post = downloadObject.addPost('p:post', 'post');
     post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
     expect(() => post.addFile({ key: imageKey('i1'), name: 'b', extension: 'png', url: 'u2' })).toThrow(
       'asset key is duplicated: image:i1',
@@ -524,7 +536,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
   // a_1.png に解決し a_2.png は ZIP に入るのに誰からも参照されなかった。AssetKey は両者を区別する
   test('name も url も同じで assetId が異なるアセットは、それぞれの archive path を参照する', () => {
     const json = build((d) => {
-      const post = d.addPost('post');
+      const post = d.addPost('p:post', 'post');
       const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'same' });
       const b = post.addFile({ key: imageKey('i2'), name: 'a', extension: 'png', url: 'same' });
       post.setHtml([...post.getImageLinkTag(a), ...post.getImageLinkTag(b)]);
@@ -538,9 +550,9 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
   // 収集順のほうが説明可能で、fanbox-collector は applyTags() で明示設定するのでこの既定は通らない
   test('setTags が呼ばれていなければタグは収集順に集まる', () => {
     const json = build((d) => {
-      d.addPost('same').setTags(['A']);
-      d.addPost('other').setTags(['B']);
-      d.addPost('same').setTags(['C']);
+      d.addPost('p:same', 'same').setTags(['A']);
+      d.addPost('p:other', 'other').setTags(['B']);
+      d.addPost('p:same', 'same').setTags(['C']);
     });
     expect(json.tags).toEqual(['A', 'B', 'C']);
   });
@@ -555,7 +567,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       }),
     };
     const json = build((d) => {
-      const post = d.addPost('post');
+      const post = d.addPost('p:post', 'post');
       post.addFile({ key: imageKey('i1'), name: 'first', extension: 'png', url: 'url1' });
       post.addFile({ key: imageKey('i2'), name: 'second', extension: 'png', url: 'url2' });
     }, reversed);
@@ -567,7 +579,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
   test('cover の AssetKey を addFile に渡すと例外になる', () => {
     const downloadObject = new DownloadObject('creator', utils);
-    const post = downloadObject.addPost('post');
+    const post = downloadObject.addPost('p:post', 'post');
     // 型では弾いているので、JS からの呼び出し (契約違反) を再現するために cast する
     expect(() =>
       post.addFile({ key: { kind: 'cover' } as unknown as BodyAssetKey, name: 'a', extension: 'png', url: 'u1' }),
@@ -587,7 +599,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     };
 
     const withTwoFiles = (d: DownloadObject) => {
-      const post = d.addPost('post');
+      const post = d.addPost('p:post', 'post');
       post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
       post.addFile({ key: imageKey('i2'), name: 'b', extension: 'png', url: 'u2' });
     };
@@ -617,7 +629,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       };
       expect(() =>
         build((d) => {
-          d.addPost('post');
+          d.addPost('p:post', 'post');
         }, short),
       ).toThrow('allocator が返した投稿ディレクトリ名の数が投稿と一致しません');
     });
@@ -629,7 +641,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       };
       expect(() =>
         build((d) => {
-          d.addPost('post');
+          d.addPost('p:post', 'post');
         }, holed),
       ).toThrow('allocator が返した投稿ディレクトリ名が文字列ではありません');
     });
@@ -650,7 +662,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       };
       expect(() =>
         build((d) => {
-          d.addPost('post');
+          d.addPost('p:post', 'post');
         }, raw),
       ).toThrow('投稿ディレクトリ名 (index 0)が正規化されていません');
     });
@@ -671,7 +683,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       expect(() =>
         build(
           (d) => {
-            d.addPost('post').setCover('cover', 'png', 'u1');
+            d.addPost('p:post', 'post').setCover('cover', 'png', 'u1');
           },
           brokenAllocator((a) => ({ ...a, coverArchiveName: 42 as unknown as string })),
         ),
@@ -682,7 +694,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       expect(() =>
         build(
           (d) => {
-            d.addPost('post').setCover('cover', 'png', 'u1');
+            d.addPost('p:post', 'post').setCover('cover', 'png', 'u1');
           },
           brokenAllocator((a) => ({ ...a, coverArchiveName: undefined })),
         ),
@@ -693,7 +705,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       expect(() =>
         build(
           (d) => {
-            d.addPost('post');
+            d.addPost('p:post', 'post');
           },
           brokenAllocator((a) => ({ ...a, coverArchiveName: 'stray.png' })),
         ),
@@ -708,7 +720,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
   describe('legacy allocator の既知の名前衝突 (この Issue では直さない)', () => {
     test('別グループの採番が既存の名前と衝突する', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
         post.addFile({ key: imageKey('i2'), name: 'a', extension: 'png', url: 'u2' });
         post.addFile({ key: imageKey('i3'), name: 'a_1', extension: 'png', url: 'u3' });
@@ -720,9 +732,9 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     // showSaveFilePicker より前に弾くので、finalize で止めても早期失敗にならない)
     test('投稿ディレクトリ名が衝突する', () => {
       const json = build((d) => {
-        d.addPost('a');
-        d.addPost('a');
-        d.addPost('a_1');
+        d.addPost('p:a', 'a');
+        d.addPost('p:a', 'a');
+        d.addPost('p:a_1', 'a_1');
       });
       expect(json.posts.map((it) => it.encodedName)).toEqual(['a_2', 'a_1', 'a_1']);
     });
@@ -730,7 +742,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     // encodeURI は % 自体を符号化しないため、% を含む名前は HTML の参照が実在しないファイルを指す
     test('% を含む archive 名は HTML の参照がずれる', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         const a = post.addFile({ key: imageKey('i1'), name: '%2F', extension: 'png', url: 'u1' });
         post.setHtml(post.getImageLinkTag(a));
       });
@@ -741,7 +753,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
     test('カバー名と同名の添付が衝突する', () => {
       const json = build((d) => {
-        const post = d.addPost('post');
+        const post = d.addPost('p:post', 'post');
         post.setCover('cover', 'png', 'cu');
         post.addFile({ key: imageKey('i1'), name: 'cover', extension: 'png', url: 'u1' });
       });
@@ -752,14 +764,234 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
 
   test('postCount / fileCount は投稿とアセットの総数になる', () => {
     const json = build((d) => {
-      const p1 = d.addPost('p1');
+      const p1 = d.addPost('p:p1', 'p1');
       p1.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
       p1.setCover('cover', 'png', 'https://example.com/c.png');
-      d.addPost('p2');
+      d.addPost('p:p2', 'p2');
     });
     expect(json.postCount).toBe(2);
     // fileCount はカバーを含めない (従来の countFile と同じ意味論)
     expect(json.fileCount).toBe(1);
+  });
+});
+
+// ============================================================
+// 2-c. projection tests
+// ============================================================
+describe('projection', () => {
+  const utils = new DownloadUtils();
+  const NOW = new Date('2026-08-23T00:00:00.000Z');
+  const fileKey = (assetId: string): BodyAssetKey => ({ kind: 'file', assetId });
+
+  /**
+   * 同名投稿 3 件・同名ファイル 3 件を含む収集結果を作る。
+   *
+   * 同名ファイルは拡張子で区別できるようにしてあるので、Selection の拡張子集合だけで
+   * 先頭 / 中間 / 末尾のどれでも個別に除外できる
+   */
+  const build = (): DownloadObject => {
+    const d = new DownloadObject('creator', utils);
+    const p1 = d.addPost('p1', 'post');
+    p1.setCover('cover', 'png', 'cover-url');
+    p1.setTags(['tagA']);
+    const a = p1.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+    const b = p1.addFile({ key: imageKey('i2'), name: 'a', extension: 'JPG', url: 'u2' });
+    const c = p1.addFile({ key: fileKey('f1'), name: 'a', extension: 'pdf', url: 'u3' });
+    p1.setHtml([...p1.getImageLinkTag(a), ...p1.getImageLinkTag(b), ...p1.getFileLinkTag(c)]);
+    const p2 = d.addPost('p2', 'post');
+    p2.setTags(['tagB']);
+    const e = p2.addFile({ key: imageKey('i3'), name: 'z', extension: 'png', url: 'u4' });
+    p2.setHtml(p2.getImageLinkTag(e));
+    const p3 = d.addPost('p3', 'post');
+    p3.setTags(['tagC']);
+    return d;
+  };
+
+  const project = (d: DownloadObject, selection: Selection) => d.project(selection, { now: NOW });
+  const hrefsOf = (html: string): string[] => [...html.matchAll(/href="\.\/([^"]*)"/g)].map((it) => it[1]);
+  const allPosts = new Set(['p1', 'p2', 'p3']);
+
+  test('selectAll は全投稿・全拡張子・カバーを選ぶ', () => {
+    const selection = build().selectAll();
+    expect([...selection.postIds].sort()).toEqual(['p1', 'p2', 'p3']);
+    // 拡張子は正規化されるので .JPG は .jpg になる
+    expect([...selection.extensions].sort()).toEqual(['.jpg', '.pdf', '.png']);
+    expect(selection.includeCover).toBe(true);
+  });
+
+  test('入力を変更しない', () => {
+    const d = build();
+    const before = d.stringify({ now: NOW });
+    project(d, { postIds: new Set(['p1']), extensions: new Set(['.png']), includeCover: false });
+    expect(d.stringify({ now: NOW })).toBe(before);
+  });
+
+  test('同じ入力と Selection に対して決定的かつ冪等', () => {
+    const d = build();
+    const selection: Selection = { postIds: new Set(['p1']), extensions: new Set(['.png']), includeCover: true };
+    expect(JSON.stringify(project(d, selection))).toBe(JSON.stringify(project(d, selection)));
+  });
+
+  test('全件選択の archive 名は選択前と同じ', () => {
+    const json = project(build(), build().selectAll());
+    expect(json.posts.map((it) => it.encodedName)).toEqual(['post_3', 'post_2', 'post_1']);
+    expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['a_1.png', 'a_2.JPG', 'a_3.pdf']);
+  });
+
+  describe('選択で間引いても archive path を再採番しない', () => {
+    test.each([
+      ['先頭', ['.jpg', '.pdf'], ['a_2.JPG', 'a_3.pdf']],
+      ['中間', ['.png', '.pdf'], ['a_1.png', 'a_3.pdf']],
+      ['末尾', ['.png', '.jpg'], ['a_1.png', 'a_2.JPG']],
+    ] as [
+      string,
+      string[],
+      string[],
+    ][])('同名ファイルの%sを除外しても、残った対象の名前と HTML の参照が変わらない', (_label, extensions, expected) => {
+      const json = project(build(), {
+        postIds: allPosts,
+        extensions: new Set(extensions),
+        includeCover: false,
+      });
+      expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(expected);
+      expect(hrefsOf(json.posts[0].htmlText)).toEqual(expected);
+    });
+
+    test.each([
+      ['先頭', ['p2', 'p3'], ['post_2', 'post_1']],
+      ['中間', ['p1', 'p3'], ['post_3', 'post_1']],
+      ['末尾', ['p1', 'p2'], ['post_3', 'post_2']],
+    ] as [
+      string,
+      string[],
+      string[],
+    ][])('同名投稿の%sを除外しても、残った投稿のディレクトリ名が変わらない', (_label, postIds, expected) => {
+      const json = project(build(), {
+        postIds: new Set(postIds),
+        extensions: new Set(['.png', '.jpg', '.pdf']),
+        includeCover: true,
+      });
+      expect(json.posts.map((it) => it.encodedName)).toEqual(expected);
+    });
+  });
+
+  test('拡張子の比較は大文字小文字を無視する', () => {
+    const json = project(build(), { postIds: allPosts, extensions: new Set(['.jpg']), includeCover: false });
+    // .JPG で登録したアセットも .jpg の選択に含まれる
+    expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['a_2.JPG']);
+  });
+
+  test('拡張子の選択はカバーには適用しない', () => {
+    const json = project(build(), { postIds: allPosts, extensions: new Set(['.pdf']), includeCover: true });
+    expect(json.posts[0].cover?.name).toBe('cover.png');
+  });
+
+  test('カバートグルを切るとカバーが出ない', () => {
+    const json = project(build(), { postIds: allPosts, extensions: new Set(['.pdf']), includeCover: false });
+    expect(json.posts[0].cover).toBeUndefined();
+  });
+
+  test('postCount は選択投稿数、fileCount は選択された post.files の数 (カバーを含めない)', () => {
+    const json = project(build(), { postIds: new Set(['p1']), extensions: new Set(['.pdf']), includeCover: true });
+    expect(json.postCount).toBe(1);
+    expect(json.fileCount).toBe(1);
+  });
+
+  test('root の tags を選択後の投稿から再計算する', () => {
+    const d = build();
+    d.setTags(['tagA', 'tagB', 'tagC']);
+    const json = d.project(
+      { postIds: new Set(['p2']), extensions: new Set(['.png']), includeCover: true },
+      { now: NOW },
+    );
+    expect(json.tags).toEqual(['tagB']);
+  });
+
+  describe('除外されたアセットのプレースホルダー', () => {
+    const excluded = () =>
+      project(build(), { postIds: new Set(['p1']), extensions: new Set(['.png']), includeCover: false });
+
+    test('カードごと置き換わり、除外した対象への参照が残らない', () => {
+      const html = excluded().posts[0].htmlText;
+      expect(html).toContain('選択条件により除外しました');
+      expect(hrefsOf(html)).toEqual(['a_1.png']);
+      // src でも参照しないこと (画像カードは href だけ潰しても src が残る)
+      expect(html).not.toContain('a_3.pdf');
+      expect(html).not.toContain('cover.png');
+    });
+
+    test('元のファイル名と種別を残す', () => {
+      const html = excluded().posts[0].htmlText;
+      expect(html).toContain('画像: a.JPG');
+      expect(html).toContain('添付ファイル: a.pdf');
+    });
+
+    test('「取得に失敗した」とは別の文言にする', () => {
+      expect(excluded().posts[0].htmlText).not.toContain('ダウンロードに失敗');
+    });
+
+    test('残った対象のカードはそのまま描かれる', () => {
+      expect(excluded().posts[0].htmlText).toContain('<img class="card-img-top" src="./a_1.png"');
+    });
+  });
+
+  describe('download-manifest.json', () => {
+    const manifestOf = () =>
+      project(build(), { postIds: new Set(['p1']), extensions: new Set(['.png']), includeCover: false }).manifest;
+
+    test('選択条件と、含めた / 除外した対象を記録する', () => {
+      const m = manifestOf();
+      expect(m.schemaVersion).toBe(1);
+      expect(m.creatorId).toBe('creator');
+      expect(m.generatedAt).toBe('2026-08-23T00:00:00.000Z');
+      expect(m.selection).toEqual({ postIds: ['p1'], extensions: ['.png'], includeCover: false });
+      expect(m.included.posts).toEqual([{ postId: 'p1', archiveDirectory: 'post_3' }]);
+      expect(m.included.assets).toEqual([
+        { postId: 'p1', kind: 'image', originalName: 'a', extension: '.png', archiveName: 'a_1.png' },
+      ]);
+      expect(m.excluded.posts).toEqual([{ postId: 'p2' }, { postId: 'p3' }]);
+      expect(m.excluded.assets.map((it) => `${it.kind}:${it.originalName}${it.extension}`)).toEqual([
+        'image:a.JPG',
+        'file:a.pdf',
+        'cover:cover.png',
+      ]);
+    });
+
+    test('除外したアセットの記述に archiveName は付けない (ZIP に存在しないため)', () => {
+      expect(manifestOf().excluded.assets.every((it) => it.archiveName === undefined)).toBe(true);
+    });
+
+    test('URL は残さない', () => {
+      const m = manifestOf();
+      expect(JSON.stringify(m)).not.toContain('u1');
+      expect(JSON.stringify(m)).not.toContain('cover-url');
+    });
+
+    test('投稿ごと除外した場合、そのアセットは個別に載せない', () => {
+      const m = project(build(), {
+        postIds: new Set(['p1']),
+        extensions: new Set(['.png', '.jpg', '.pdf']),
+        includeCover: true,
+      }).manifest;
+      expect(m.excluded.posts).toEqual([{ postId: 'p2' }, { postId: 'p3' }]);
+      expect(m.excluded.assets).toEqual([]);
+    });
+
+    test('選択条件を informationText に混ぜない', () => {
+      const json = project(build(), {
+        postIds: new Set(['p1']),
+        extensions: new Set(['.png']),
+        includeCover: false,
+      });
+      expect(json.posts[0].informationText).not.toContain('selection');
+    });
+  });
+
+  test('添付もカバーも 0 件になる選択も通す (許否は利用側の UI が決める)', () => {
+    const json = project(build(), { postIds: new Set(['p1']), extensions: new Set(), includeCover: false });
+    expect(json.posts[0].files).toEqual([]);
+    expect(json.posts[0].cover).toBeUndefined();
+    expect(json.fileCount).toBe(0);
   });
 });
 
@@ -805,6 +1037,7 @@ describe('isDownloadJsonObj', () => {
     tags: ['tag1'],
     fileCount: 1,
     postCount: 1,
+    manifest: testManifest(),
   });
 
   test('有効な最小オブジェクト → true', () => {
@@ -862,6 +1095,26 @@ describe('isDownloadJsonObj', () => {
     const obj = createValidObj();
     (obj.posts[0].files[0] as Record<string, unknown>).encodedName = 123;
     expect(helper.isDownloadJsonObj(obj)).toBe(false);
+  });
+
+  describe('manifest (projection を経た印)', () => {
+    test('manifest が無い → false (projection を経ていない入力を ZIP にしない)', () => {
+      const { manifest: _manifest, ...withoutManifest } = createValidObj();
+      expect(helper.isDownloadJsonObj(withoutManifest)).toBe(false);
+    });
+
+    test.each([
+      ['schemaVersion が違う', { schemaVersion: 2 }],
+      ['creatorId が文字列でない', { creatorId: 1 }],
+      ['generatedAt が文字列でない', { generatedAt: 1 }],
+      ['selection が無い', { selection: undefined }],
+      ['selection.includeCover が真偽値でない', { selection: { postIds: [], extensions: [], includeCover: 'yes' } }],
+      ['included が無い', { included: undefined }],
+      ['excluded.assets が配列でない', { excluded: { posts: [], assets: {} } }],
+    ])('%s → false', (_label, override) => {
+      const obj = { ...createValidObj(), manifest: { ...testManifest(), ...override } };
+      expect(helper.isDownloadJsonObj(obj)).toBe(false);
+    });
   });
 
   test('cover が undefined → true (省略可)', () => {
@@ -2574,6 +2827,7 @@ describe('DownloadHelper.downloadZip', () => {
       tags: [],
       fileCount: 2,
       postCount: 2,
+      manifest: testManifest(),
       ...overrides,
     };
   }
@@ -2828,6 +3082,15 @@ describe('DownloadHelper.downloadZip', () => {
       }
     });
 
+    test('download-manifest.json が ZIP ルートに書かれる', async () => {
+      const obj = createValidObj();
+      const buf = await runDownloadZip(obj);
+      const names = parseCentralDirectory(buf).entries.map((e) => e.name);
+      expect(names).toContain('creator-id/download-manifest.json');
+      // 投稿ディレクトリの下ではなくルート直下に置く
+      expect(names.filter((n) => n.endsWith('download-manifest.json'))).toEqual(['creator-id/download-manifest.json']);
+    });
+
     test('ルートディレクトリのエントリがルート index.html より前に配置される', async () => {
       const buf = await runDownloadZip(createValidObj());
       const cd = parseCentralDirectory(buf);
@@ -2988,6 +3251,7 @@ describe('DownloadHelper.downloadZip', () => {
         tags: [],
         fileCount: 2,
         postCount: 2,
+        manifest: testManifest(),
       };
     }
 
@@ -3110,6 +3374,7 @@ describe('DownloadHelper.downloadZip', () => {
         tags: [],
         fileCount: 2,
         postCount: 1,
+        manifest: testManifest(),
       };
       const controller = new AbortController();
       const calledUrls: string[] = [];

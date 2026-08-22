@@ -80,6 +80,25 @@ finalize では衝突を検出しない。legacy 自身が作れる衝突を例�
 - `body.images` / `body.files` 内で `id` が重複していれば `invalid` にする (`missing` には `body.images[1].id` のように衝突した位置を入れる)
 - `size` / `width` / `height` は非負の安全な整数でなければ欠落として扱う。収集が読まない付随メタデータなので、型が違っても `invalid` にはしない
 
+### 選択条件からダウンロード対象を導出する (Issue #42)
+
+`Selection` は「投稿の集合 (postId) × 拡張子の集合 × カバーを含めるか」の単純な積 (AND) である。カバーは「投稿が選択済み AND `includeCover`」で、拡張子の選択はカバーには適用しない (カバーは投稿の付随物であって添付の一種ではない)。拡張子の比較は `normalizeExtension` を通した形 (小文字、先頭ドット付き、無しは空文字列) で行う。
+
+`DownloadObject.project(selection, options?)` が `DownloadJsonObj` を返す。入力は変更せず、同じ入力と `Selection` に対して決定的である (`options.now` を渡せば `generatedAt` も含めて決まる)。
+
+- **選択で間引いても archive path を再採番しない。** 割り当ては選択前の全アセットから行い、`Selection` は出力に載せるかどうかだけに使う。間引いた後の件数で採番し直すと HTML 内の参照と一致しなくなる
+- `postCount` は選択投稿数、`fileCount` は選択された `post.files` の数 (カバーを含めない。従来の `countFile` と同じ意味論)
+- root の `tags` は選択後の投稿に残っているものだけを出す。`setTags` の並び (支援額タグを先頭に置く) は保つ
+- 「絞り込まずに全部落とす」も projection を経た結果として表す (`selectAll()`)。ZIP 入力の経路を 1 本にするため、`stringify()` は `project(selectAll())` に委譲する
+
+除外されたアセットは HTML 内でプレースホルダーに解決する。カードごと削除しない (後からアーカイブを見たときに元の投稿に何が含まれていたかが失われる)。画像・動画・音声のカードは `src` でも参照するので `<a>` を無効化するだけでは足りず、カード全体を差し替える。これを可能にするため `HtmlFragment` に `assetCard` (アセット 1 件のカード全体) がある。プレースホルダーには元ファイル名 / 拡張子 / 種別と「選択条件により除外しました」を残し、URL は残さない。「取得に失敗した」とは別の状態なので文言を分ける。
+
+ZIP ルートに `download-manifest.json` を書き出す (`schemaVersion` / `creatorId` / 生成日時 / `Selection` / 含めた投稿・アセット / 除外した投稿・アセット)。この段階で主張するのは「plan に含めた」「選択条件で除外した」までで、「実際に書けた」とは主張しない。選択条件を `informationText` (info JSON) に混ぜない — info JSON は FANBOX の投稿メタデータで、選択条件はダウンロード実行側の情報なので、混ぜると出所が曖昧になる。
+
+`manifest` は projection を経た印でもある。`isDownloadJsonObj` がこれを必須にすることで、絞り込みを経ていないオブジェクトを ZIP 入力として受け付けない。
+
+`PostObj.postId` は `Selection` が投稿を指すキーである。一意性は検証しない (一覧ページの重複などで同じ投稿が 2 回来ても収集を止めないことを優先する)。同じ postId の投稿が 2 件あれば選択は両方に同時に効く。
+
 主な機能:
 - ZIP ダウンロード（File System Access API + 自前 ZipWriter）
 - Bootstrap ベースのタグフィルタリング UI

@@ -15,6 +15,13 @@ export type DownloadObj = { posts: PostObj[]; id: string };
  * それ以前に文字列として埋め込むと採番の変化に追従できないため)。
  */
 export type PostObj = {
+  /**
+   * FANBOX の postId。`Selection` が投稿を指すキーになる。
+   *
+   * 一意性は検証しない。同じ postId の投稿が 2 件登録された場合、選択は両方に同時に効く。
+   * 一覧ページの重複などで同じ投稿が 2 回来ても収集を止めないことを優先する
+   */
+  postId: string;
   name: string;
   info: string;
   files: BodyFileObj[];
@@ -119,12 +126,95 @@ export type AssetInput = {
 };
 
 /**
+ * アセット 1 件を表すカード全体の断片
+ *
+ * 選択条件で除外されたアセットは、カードごとプレースホルダーに差し替える。
+ * 画像・動画・音声のカードは `src` でもアセットを参照するので、リンクを無効化するだけでは
+ * 実在しないファイルを読みに行くカードが残る。
+ *
+ * `body` の中の `assetRef` はこのカードの `key` を指す。カードを丸ごと差し替えれば
+ * 参照も一緒に消えるので、除外時に `body` を走査する必要はない。
+ */
+export type AssetCardFragment = {
+  readonly key: AssetKey;
+  readonly kind: AssetKind;
+  /** 元のファイル名 (拡張子を含まない)。プレースホルダーに出す */
+  readonly originalName: string;
+  /** 元の拡張子 (先頭ドットを含む、または空文字列)。プレースホルダーに出す */
+  readonly extension: string;
+  readonly body: readonly HtmlFragment[];
+};
+
+/**
  * 投稿 HTML の断片
  *
- * 文字列はそのまま出力する。{ assetRef } はアセットへの参照で、finalize 時に
- * allocator が割り当てた archive path へ解決する。
+ * 文字列はそのまま出力する。`assetRef` はアセットへの参照で、finalize 時に
+ * allocator が割り当てた archive path へ解決する。`assetCard` はアセット 1 件のカード全体で、
+ * 選択条件で除外されたときにプレースホルダーへ差し替える単位になる。
  */
-export type HtmlFragment = string | { readonly assetRef: AssetKey };
+export type HtmlFragment = string | { readonly assetRef: AssetKey } | { readonly assetCard: AssetCardFragment };
+
+/**
+ * 選択条件
+ *
+ * 投稿の集合 / 拡張子の集合 / カバーを含めるか、の 3 つの単純な積 (AND) である。
+ * カバーは「投稿が選択済み AND `includeCover`」で、拡張子の選択はカバーには適用しない
+ * (カバーは投稿の付随物であって添付の一種ではないため)。
+ */
+export type Selection = {
+  /** 選択された投稿の postId */
+  readonly postIds: ReadonlySet<string>;
+  /** 選択された拡張子。`normalizeExtension` を通した形 (小文字、先頭ドット付き、無しは空文字列) */
+  readonly extensions: ReadonlySet<string>;
+  /** カバーを含めるか */
+  readonly includeCover: boolean;
+};
+
+/**
+ * 拡張子を `Selection` と突き合わせられる形に正規化する。
+ * FANBOX は同じ形式でも大文字と小文字が混ざるため、比較は小文字で行う
+ * @param extension `FileObj.extension` (先頭ドット付き、または空文字列)
+ */
+export function normalizeExtension(extension: string): string {
+  return extension.toLowerCase();
+}
+
+/** `download-manifest.json` に書き出すアセットの記述 */
+export type ManifestAsset = {
+  readonly postId: string;
+  readonly kind: AssetKind;
+  readonly originalName: string;
+  readonly extension: string;
+  /** 含めたアセットにだけ付く。除外したアセットは ZIP に存在しないので持たない */
+  readonly archiveName?: string;
+};
+
+/**
+ * ZIP ルートに書き出す `download-manifest.json` の内容
+ *
+ * この段階で主張するのは「plan に含めた」「選択条件で除外した」までで、「実際に書けた」とは
+ * 主張しない。実行結果を対象単位で扱えるようになってから written / failed / aborted を足す。
+ * URL は持たない (必要になれば post.info を取り直せば得られるし、保存量も減る)。
+ */
+export type DownloadManifest = {
+  readonly schemaVersion: 1;
+  readonly creatorId: string;
+  /** 生成日時 (ISO 8601) */
+  readonly generatedAt: string;
+  readonly selection: {
+    readonly postIds: readonly string[];
+    readonly extensions: readonly string[];
+    readonly includeCover: boolean;
+  };
+  readonly included: {
+    readonly posts: readonly { readonly postId: string; readonly archiveDirectory: string }[];
+    readonly assets: readonly ManifestAsset[];
+  };
+  readonly excluded: {
+    readonly posts: readonly { readonly postId: string }[];
+    readonly assets: readonly ManifestAsset[];
+  };
+};
 
 /**
  * 断片列を区切り文字で連結する。
@@ -160,6 +250,19 @@ export type DownloadJsonObj = {
   tags: string[];
   fileCount: number;
   postCount: number;
+  /**
+   * projection が付ける。これが無い入力は downloadZip が受け付けない
+   * (絞り込みを経ていないオブジェクトを ZIP にすると、HTML の参照と中身がずれうる)
+   */
+  manifest: DownloadManifest;
+};
+
+/**
+ * projection の任意指定
+ */
+export type ProjectionOptions = {
+  /** manifest の生成日時 (既定は現在時刻)。テストで固定するために注入できる */
+  readonly now?: Date;
 };
 
 /**
@@ -592,20 +695,125 @@ export class DownloadObject {
     this.allocator = allocator ?? createLegacyArchivePathAllocator(utils);
   }
 
-  stringify(): string {
+  /**
+   * 全件を選択した `Selection` を返す。
+   * 「絞り込まずに全部落とす」も projection を経た結果として表す (ZIP 入力の経路を 1 本にする)
+   */
+  selectAll(): Selection {
+    const postIds = new Set<string>();
+    const extensions = new Set<string>();
+    for (const post of this.downloadObj.posts) {
+      postIds.add(post.postId);
+      for (const file of post.files) {
+        extensions.add(normalizeExtension(file.extension));
+      }
+    }
+    return { postIds, extensions, includeCover: true };
+  }
+
+  /**
+   * 選択条件からダウンロード対象を導出する。
+   *
+   * 入力は変更しない。同じ入力と `Selection` に対して決定的である
+   * (`options.now` を渡せば `generatedAt` も含めて決まる)。
+   * archive path は選択前の全アセットから割り当てるので、間引いても残った対象の名前は変わらない
+   * @param selection 選択条件
+   * @param options 生成日時の注入
+   */
+  project(selection: Selection, options?: ProjectionOptions): DownloadJsonObj {
     // archive path はここ (finalize) で初めて確定する。投稿ディレクトリ名は投稿をまたぐ採番なので
     // 全投稿を渡して一度に割り当てる
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
     assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
+
+    const posts: DownloadJsonObj['posts'] = [];
+    const includedPosts: { postId: string; archiveDirectory: string }[] = [];
+    const excludedPosts: { postId: string }[] = [];
+    const includedAssets: ManifestAsset[] = [];
+    const excludedAssets: ManifestAsset[] = [];
+    const presentTags = new Set<string>();
+    let fileCount = 0;
+
+    this.downloadObj.posts.forEach((postObj, index) => {
+      if (!selection.postIds.has(postObj.postId)) {
+        // 投稿ごと除外された場合、そのアセットは個別に載せない (投稿単位で除外と分かる)
+        excludedPosts.push({ postId: postObj.postId });
+        return;
+      }
+      const includedKeys = new Set<string>();
+      const describe = (file: FileObj): ManifestAsset => ({
+        postId: postObj.postId,
+        kind: file.key.kind,
+        originalName: file.name,
+        extension: file.extension,
+      });
+      for (const file of postObj.files) {
+        // 拡張子の選択は post.files に対するものであり、カバーには適用しない
+        if (selection.extensions.has(normalizeExtension(file.extension))) {
+          includedKeys.add(assetKeyToString(file.key));
+        } else {
+          excludedAssets.push(describe(file));
+        }
+      }
+      if (postObj.cover) {
+        if (selection.includeCover) {
+          includedKeys.add('cover');
+        } else {
+          excludedAssets.push(describe(postObj.cover));
+        }
+      }
+
+      const projected = this.orderedPosts[index].projectPost(directoryNames[index], this.allocator, includedKeys);
+      posts.push(projected.json);
+      includedPosts.push({ postId: postObj.postId, archiveDirectory: directoryNames[index] });
+      for (const tag of postObj.tags) {
+        presentTags.add(tag);
+      }
+      // fileCount は選択された post.files の数。カバーは含めない (従来の countFile と同じ意味論)
+      fileCount += projected.json.files.length;
+      for (const file of postObj.files) {
+        if (includedKeys.has(assetKeyToString(file.key))) {
+          includedAssets.push({
+            ...describe(file),
+            archiveName: projected.archiveNames.get(assetKeyToString(file.key)),
+          });
+        }
+      }
+      if (postObj.cover && includedKeys.has('cover')) {
+        includedAssets.push({ ...describe(postObj.cover), archiveName: projected.archiveNames.get('cover') });
+      }
+    });
+
     const downloadJson: DownloadJsonObj = {
-      posts: this.orderedPosts.map((it, index) => it.toJsonObj(directoryNames[index], this.allocator)),
+      posts,
       id: this.downloadObj.id,
       url: this.url,
-      tags: this.tags ?? this.collectTags(),
-      postCount: this.countPost(),
-      fileCount: this.countFile(),
+      // 選択後の投稿に残っているタグだけを出す。setTags の並び (支援額タグを先頭に置く) は保つ
+      tags: (this.tags ?? [...presentTags]).filter((tag) => presentTags.has(tag)),
+      postCount: posts.length,
+      fileCount,
+      manifest: {
+        schemaVersion: 1,
+        creatorId: this.downloadObj.id,
+        generatedAt: (options?.now ?? new Date()).toISOString(),
+        selection: {
+          postIds: [...selection.postIds].sort(),
+          extensions: [...selection.extensions].sort(),
+          includeCover: selection.includeCover,
+        },
+        included: { posts: includedPosts, assets: includedAssets },
+        excluded: { posts: excludedPosts, assets: excludedAssets },
+      },
     };
-    return JSON.stringify(downloadJson);
+    return downloadJson;
+  }
+
+  /**
+   * 全件を選択した projection の結果を JSON 文字列にする
+   * @param options 生成日時の注入
+   */
+  stringify(options?: ProjectionOptions): string {
+    return JSON.stringify(this.project(this.selectAll(), options));
   }
 
   setUrl(url: string) {
@@ -616,31 +824,63 @@ export class DownloadObject {
     this.tags = tags;
   }
 
-  addPost(name: string): PostObject {
-    const postObj: PostObj = { name, info: '', files: [], html: [], tags: [] };
+  addPost(postId: string, name: string): PostObject {
+    const postObj: PostObj = { postId, name, info: '', files: [], html: [], tags: [] };
     this.downloadObj.posts.push(postObj);
     const postObject = new PostObject(postObj, this.utils);
     this.orderedPosts.push(postObject);
     return postObject;
   }
+}
 
-  private countPost(): number {
-    return this.downloadObj.posts.length;
+/**
+ * 断片を凍結した複製にする。カードは中身も再帰的に凍結する
+ * @param fragment 対象の断片
+ */
+function freezeFragment(fragment: HtmlFragment): HtmlFragment {
+  if (typeof fragment === 'string') return fragment;
+  if ('assetCard' in fragment) {
+    const assetCard = fragment.assetCard;
+    return Object.freeze({
+      assetCard: Object.freeze({
+        key: freezeAssetKey(assetCard.key),
+        kind: assetCard.kind,
+        originalName: assetCard.originalName,
+        extension: assetCard.extension,
+        body: Object.freeze(assetCard.body.map((it) => freezeFragment(it))),
+      }),
+    });
   }
+  return Object.freeze({ assetRef: freezeAssetKey(fragment.assetRef) });
+}
 
-  private countFile(): number {
-    return this.downloadObj.posts.reduce((sum, post) => sum + post.files.length, 0);
-  }
+/**
+ * 1 投稿分の projection 結果
+ */
+export type ProjectedPost = {
+  readonly json: DownloadJsonObj['posts'][number];
+  /** 投稿の全アセット (除外分を含む) の archive 名。manifest の組み立てに使う */
+  readonly archiveNames: ReadonlyMap<string, string>;
+};
 
-  private collectTags(): string[] {
-    const tags = new Set<string>();
-    for (const post of this.downloadObj.posts) {
-      for (const tag of post.tags) {
-        tags.add(tag);
-      }
-    }
-    return [...tags];
-  }
+/**
+ * リンクタグの断片列をアセット 1 件のカードとして包む。
+ * 選択条件で除外されたときに、カード全体をプレースホルダーへ差し替えられるようにする
+ * @param fileObject 対象のアセット
+ * @param body カードの中身
+ */
+function card(fileObject: FileObject, body: HtmlFragment[]): HtmlFragment[] {
+  return [
+    {
+      assetCard: {
+        key: fileObject.getKey(),
+        kind: fileObject.getKey().kind,
+        originalName: fileObject.getOriginalName(),
+        extension: fileObject.getOriginalExtension(),
+        body,
+      },
+    },
+  ];
 }
 
 /**
@@ -667,9 +907,7 @@ export class PostObject {
    * @param html 断片列
    */
   setHtml(html: HtmlFragment[]) {
-    this.postObj.html = html.map((fragment) =>
-      typeof fragment === 'string' ? fragment : Object.freeze({ assetRef: freezeAssetKey(fragment.assetRef) }),
-    );
+    this.postObj.html = html.map((fragment) => freezeFragment(fragment));
   }
 
   setTags(tags: string[]) {
@@ -744,7 +982,7 @@ export class PostObject {
   getAudioLinkTag(fileObject: FileObject): HtmlFragment[] {
     const ref: HtmlFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return [
+    return card(fileObject, [
       `<a class="hl" href="`,
       ref,
       `" download="${escapedDownload}"><div class="post card">\n` +
@@ -752,7 +990,7 @@ export class PostObject {
         `<audio class="card-img-top" src="`,
       ref,
       `" controls/>\n</div></a>`,
-    ];
+    ]);
   }
 
   getLinkTag(url: string, title: string): HtmlFragment[] {
@@ -768,7 +1006,7 @@ export class PostObject {
   getFileLinkTag(fileObject: FileObject): HtmlFragment[] {
     const ref: HtmlFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return [
+    return card(fileObject, [
       `<a class="hl" href="`,
       ref,
       `" download="${escapedDownload}">` +
@@ -777,31 +1015,31 @@ export class PostObject {
         `<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>\n` +
         `<path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/>\n` +
         `</svg> ${this.utils.escapeHtml(fileObject.getOriginalName() + fileObject.getOriginalExtension())}</p></div></a>`,
-    ];
+    ]);
   }
 
   getImageLinkTag(fileObject: FileObject): HtmlFragment[] {
     const ref: HtmlFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return [
+    return card(fileObject, [
       `<a class="hl" href="`,
       ref,
       `" download="${escapedDownload}"><div class="post card">\n<img class="card-img-top" src="`,
       ref,
       `" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>\n</div></a>`,
-    ];
+    ]);
   }
 
   getVideoLinkTag(fileObject: FileObject): HtmlFragment[] {
     const ref: HtmlFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return [
+    return card(fileObject, [
       `<a class="hl" href="`,
       ref,
       `" download="${escapedDownload}"><div class="post card">\n<video class="card-img-top" src="`,
       ref,
       `" controls/>\n</div></a>`,
-    ];
+    ]);
   }
 
   /**
@@ -809,7 +1047,20 @@ export class PostObject {
    * @param directoryName この投稿に割り当てられたディレクトリ名
    * @param allocator 投稿内アセットの割り当て器
    */
-  toJsonObj(directoryName: string, allocator: ArchivePathAllocator): DownloadJsonObj['posts'][number] {
+  /**
+   * 割り当て済みの archive path を使って JSON 出力用のオブジェクトにする。
+   *
+   * archive path は投稿の全アセットから割り当てる。選択で間引いた後の件数で採番し直すと
+   * HTML 内の参照と一致しなくなるため、`includedKeys` は出力に載せるかどうかだけに使う
+   * @param directoryName この投稿に割り当てられたディレクトリ名
+   * @param allocator 投稿内アセットの割り当て器
+   * @param includedKeys 出力に含めるアセット (assetKeyToString)
+   */
+  projectPost(
+    directoryName: string,
+    allocator: ArchivePathAllocator,
+    includedKeys: ReadonlySet<string>,
+  ): ProjectedPost {
     const allocation = allocator.allocateAssetPaths(this.postObj);
     const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it] as const));
     this.assertAllocationCoversAssets(allocation, fileByKey);
@@ -817,26 +1068,32 @@ export class PostObject {
     for (const { key, archiveName } of allocation.files) {
       pathByKey.set(assetKeyToString(key), archiveName);
     }
-    const cover = this.postObj.cover
-      ? { url: this.postObj.cover.url, name: allocation.coverArchiveName as string }
-      : undefined;
-    if (cover) {
-      pathByKey.set('cover', cover.name);
+    if (this.postObj.cover) {
+      pathByKey.set('cover', allocation.coverArchiveName as string);
     }
+    const cover =
+      this.postObj.cover && includedKeys.has('cover')
+        ? { url: this.postObj.cover.url, name: allocation.coverArchiveName as string }
+        : undefined;
     return {
-      originalName: this.postObj.name,
-      encodedName: directoryName,
-      informationText: this.postObj.info,
-      htmlText: this.resolveHtml(pathByKey),
-      // URL と元ファイル名は投稿が持つ値から取る。allocator が決めるのは名前と並び順だけ
-      files: allocation.files.map(({ key, archiveName }) => {
-        // biome-ignore lint/style/noNonNullAssertion: assertAllocationCoversAssets が存在を保証する
-        const file = fileByKey.get(assetKeyToString(key))!;
-        return { url: file.url, originalName: file.name, encodedName: archiveName };
-      }),
-      tags: this.postObj.tags,
-      cover,
-      publishedDatetime: this.postObj.publishedDatetime,
+      json: {
+        originalName: this.postObj.name,
+        encodedName: directoryName,
+        informationText: this.postObj.info,
+        htmlText: this.resolveHtml(pathByKey, includedKeys),
+        // URL と元ファイル名は投稿が持つ値から取る。allocator が決めるのは名前と並び順だけ
+        files: allocation.files
+          .filter(({ key }) => includedKeys.has(assetKeyToString(key)))
+          .map(({ key, archiveName }) => {
+            // biome-ignore lint/style/noNonNullAssertion: assertAllocationCoversAssets が存在を保証する
+            const file = fileByKey.get(assetKeyToString(key))!;
+            return { url: file.url, originalName: file.name, encodedName: archiveName };
+          }),
+        tags: this.postObj.tags,
+        cover,
+        publishedDatetime: this.postObj.publishedDatetime,
+      },
+      archiveNames: pathByKey,
     };
   }
 
@@ -883,20 +1140,47 @@ export class PostObject {
 
   /**
    * 断片列を HTML 文字列に解決する。
+   *
+   * 選択条件で除外されたアセットのカードはプレースホルダーに差し替える。カードごと消さないのは、
+   * 後からアーカイブを見たときに元の投稿に何が含まれていたか分からなくなるため。
    * 参照先の archive path が割り当てられていない断片は、壊れたリンクを出力に残さないよう例外にする
-   * @param pathByKey assetKeyToString をキーとする archive path
+   * @param pathByKey assetKeyToString をキーとする archive path (投稿の全アセット)
+   * @param includedKeys 出力に含めるアセット
    */
-  private resolveHtml(pathByKey: Map<string, string>): string {
-    return this.postObj.html
-      .map((fragment) => {
-        if (typeof fragment === 'string') return fragment;
-        const archiveName = pathByKey.get(assetKeyToString(fragment.assetRef));
-        if (archiveName === undefined) {
-          throw new Error(`archive path is not allocated: ${assetKeyToString(fragment.assetRef)}`);
-        }
-        return this.utils.escapeHtml(`./${this.utils.encodeURI(archiveName)}`);
-      })
-      .join('');
+  private resolveHtml(pathByKey: ReadonlyMap<string, string>, includedKeys: ReadonlySet<string>): string {
+    const render = (fragments: readonly HtmlFragment[]): string =>
+      fragments
+        .map((fragment) => {
+          if (typeof fragment === 'string') return fragment;
+          if ('assetCard' in fragment) {
+            const assetCard = fragment.assetCard;
+            return includedKeys.has(assetKeyToString(assetCard.key))
+              ? render(assetCard.body)
+              : this.renderExcludedAsset(assetCard);
+          }
+          const archiveName = pathByKey.get(assetKeyToString(fragment.assetRef));
+          if (archiveName === undefined) {
+            throw new Error(`archive path is not allocated: ${assetKeyToString(fragment.assetRef)}`);
+          }
+          return this.utils.escapeHtml(`./${this.utils.encodeURI(archiveName)}`);
+        })
+        .join('');
+    return render(this.postObj.html);
+  }
+
+  /**
+   * 選択条件で除外されたアセットのプレースホルダーを描く。
+   *
+   * 「取得に失敗した」とは別の状態なので文言を分ける。URL は残さない
+   * @param assetCard 除外されたアセットのカード
+   */
+  private renderExcludedAsset(assetCard: AssetCardFragment): string {
+    const label = assetCard.kind === 'cover' ? 'カバー画像' : assetCard.kind === 'image' ? '画像' : '添付ファイル';
+    const name = this.utils.escapeHtml(assetCard.originalName + assetCard.extension);
+    return (
+      `<div class="post card text-center excluded-asset"><p class="pt-2">\n` +
+      `選択条件により除外しました\n<br>\n${label}: ${name}\n</p></div>`
+    );
   }
 }
 
@@ -1751,6 +2035,35 @@ function assertValidZipEntryNameByteLength(
 }
 
 /**
+ * `download-manifest.json` の形式を検証する。
+ * projection が付ける印でもあるので、`downloadZip` はこれが無い入力を受け付けない
+ * @param value 検証対象
+ * @internal
+ */
+function isDownloadManifest(value: unknown): value is DownloadManifest {
+  if (typeof value !== 'object' || value === null) return false;
+  const m = value as Record<string, unknown>;
+  if (m.schemaVersion !== 1) return false;
+  if (typeof m.creatorId !== 'string' || typeof m.generatedAt !== 'string') return false;
+  const selection = m.selection as Record<string, unknown> | undefined;
+  if (
+    typeof selection !== 'object' ||
+    selection === null ||
+    !Array.isArray(selection.postIds) ||
+    !Array.isArray(selection.extensions) ||
+    typeof selection.includeCover !== 'boolean'
+  ) {
+    return false;
+  }
+  const hasGroups = (group: unknown): boolean => {
+    if (typeof group !== 'object' || group === null) return false;
+    const g = group as Record<string, unknown>;
+    return Array.isArray(g.posts) && Array.isArray(g.assets);
+  };
+  return hasGroups(m.included) && hasGroups(m.excluded);
+}
+
+/**
  * 2桁ゼロ埋め
  * @internal
  */
@@ -2005,6 +2318,9 @@ export class DownloadHelper {
       // ルートhtml もルートディレクトリと同じ rootDate を与える (date 省略時は DOS date 0 となり、
       // 展開時に 1980-01-01 より前の不正な日時になるため)
       await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html', rootDate);
+      // 選択条件と、含めた / 除外した対象の記録。info JSON (FANBOX の投稿メタデータ) とは
+      // 出所が違うので混ぜない
+      await enqueue([JSON.stringify(downloadObj.manifest, null, 2)], 'download-manifest.json', rootDate);
       // 投稿処理
       let postCount = 0;
       postLoop: for (const post of downloadObj.posts) {
@@ -2126,6 +2442,11 @@ export class DownloadHelper {
         return false;
       case !Array.isArray(t.tags):
         console.error('ダウンロード用オブジェクトの型が不正(tagsが配列でない)', t.tags);
+        return false;
+      case !isDownloadManifest(t.manifest):
+        // projection を経ていないオブジェクトはここで弾く。絞り込みを経ずに ZIP にすると、
+        // HTML の参照と実際に入るファイルがずれうる
+        console.error('ダウンロード用オブジェクトの型が不正(manifestが無いか形式が違う)', t.manifest);
         return false;
     }
     return !(t.posts as unknown[]).some((it: unknown) => {
