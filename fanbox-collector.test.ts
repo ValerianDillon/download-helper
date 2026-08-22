@@ -187,7 +187,10 @@ describe('addByPostInfo - 本文の検証', () => {
     const m = createManage();
     const result = addByPostInfo(
       m,
-      candidate({ type: 'image', body: { text: 'hello', images: [{ originalUrl: 'https://example.com/a' }] } }),
+      candidate({
+        type: 'image',
+        body: { text: 'hello', images: [{ id: 'i1', originalUrl: 'https://example.com/a' }] },
+      }),
     );
     expect((result as { missing: string[] }).missing).toContain('body.images');
     expect(postCount(m)).toBe(0);
@@ -871,6 +874,21 @@ describe('addByPostInfo - 内部表現に保持する情報', () => {
     // 収集が読まない付随メタデータなので、型が違っても invalid にはしない
     expect(result).toEqual({ status: 'added' });
     expect(posts()[0].files[0].metadata).toEqual({ size: undefined });
+  });
+
+  test.each([
+    ['0', 0],
+    ['安全な整数の上限', Number.MAX_SAFE_INTEGER],
+  ])('size が %s なら有効な値として保持する (境界)', (_label, size) => {
+    const { m, posts } = captureManage();
+    addByPostInfo(
+      m,
+      candidate({
+        type: 'file',
+        body: { text: 'hello', files: [{ id: 'f1', name: 'a', extension: 'txt', url: 'url1', size }] },
+      }),
+    );
+    expect(posts()[0].files[0].metadata).toEqual({ size });
   });
 
   test('width / height も size と同じ規則で落とす', () => {

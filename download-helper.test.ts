@@ -389,6 +389,18 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       expect(json.posts.map((it) => it.encodedName)).toEqual(['same_2', 'same_1']);
     });
 
+    // 同名グループの列挙順は Object.keys のそれに従う。整数に見えるキーが昇順で先に来る挙動も
+    // 出力される files の並び順を決めるので、従来の出力を保つために固定する
+    test('整数に見える名前のグループが先に、昇順で並ぶ', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        post.addFile({ key: imageKey('i1'), name: '10', extension: 'png', url: 'u1' });
+        post.addFile({ key: imageKey('i2'), name: 'alpha', extension: 'png', url: 'u2' });
+        post.addFile({ key: imageKey('i3'), name: '2', extension: 'png', url: 'u3' });
+      });
+      expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['2.png', '10.png', 'alpha.png']);
+    });
+
     test('ファイル名は encodeFileName を通す', () => {
       const json = build((d) => {
         const post = d.addPost('po/st');
@@ -467,6 +479,21 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       post.setHtml([{ assetRef: imageKey('missing') }]);
       expect(() => downloadObject.stringify()).toThrow('archive path is not allocated: image:missing');
     });
+  });
+
+  test('登録した AssetKey は書き換えられない (identity が後から変わらないこと)', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('post');
+    const key = imageKey('i1');
+    const file = post.addFile({ key, name: 'a', extension: 'png', url: 'u1' });
+    // 渡した側のオブジェクトを書き換えても、登録済みの identity は動かない
+    (key as { assetId: string }).assetId = 'i2';
+    expect(file.getKey()).toEqual({ kind: 'image', assetId: 'i1' });
+    // getKey() が返すオブジェクト経由でも書き換えられない (ESM は strict なので TypeError になる)
+    expect(() => {
+      (file.getKey() as { assetId: string }).assetId = 'i3';
+    }).toThrow(TypeError);
+    expect(file.getKey()).toEqual({ kind: 'image', assetId: 'i1' });
   });
 
   test('同じ AssetKey を 2 回追加すると例外になる', () => {

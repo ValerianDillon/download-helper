@@ -43,7 +43,18 @@ export type AssetKind = 'cover' | BodyAssetKind;
  * 収集後にアセットを間引いたときに別のアセットを同一視しうる。
  * カバーは URL 文字列しか持たず id が無いため、投稿内で一意な sentinel として表す。
  */
-export type AssetKey = { kind: 'cover' } | { kind: BodyAssetKind; assetId: string };
+export type AssetKey = { readonly kind: 'cover' } | { readonly kind: BodyAssetKind; readonly assetId: string };
+
+/**
+ * AssetKey を凍結した複製にする。
+ *
+ * identity は登録後に変わってはならない。呼び出し側から渡された参照をそのまま持つと、
+ * 追加後に書き換えられて、重複検査を通り抜けた 2 つのアセットが同じ archive path へ
+ * 解決しうる。型の readonly は実行時には効かないので複製して凍結する。
+ */
+function freezeAssetKey(key: AssetKey): AssetKey {
+  return Object.freeze(key.kind === 'cover' ? { kind: 'cover' as const } : { kind: key.kind, assetId: key.assetId });
+}
 
 /**
  * AssetKey を Map のキーに使える文字列にする。
@@ -561,7 +572,7 @@ export class PostObject {
       name,
       extension: extension ? `.${extension}` : '',
       url,
-      key: { kind: 'cover' },
+      key: freezeAssetKey({ kind: 'cover' }),
       metadata: {},
     };
     this.postObj.cover = fileObj;
@@ -584,7 +595,7 @@ export class PostObject {
       name: asset.name,
       extension: asset.extension ? `.${asset.extension}` : '',
       url: asset.url,
-      key: asset.key,
+      key: freezeAssetKey(asset.key),
       metadata: asset.metadata ?? {},
     };
     this.postObj.files.push(fileObj);

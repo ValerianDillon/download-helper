@@ -43,10 +43,10 @@ export type AssetKind = 'cover' | BodyAssetKind;
  * カバーは URL 文字列しか持たず id が無いため、投稿内で一意な sentinel として表す。
  */
 export type AssetKey = {
-    kind: 'cover';
+    readonly kind: 'cover';
 } | {
-    kind: BodyAssetKind;
-    assetId: string;
+    readonly kind: BodyAssetKind;
+    readonly assetId: string;
 };
 /**
  * AssetKey を Map のキーに使える文字列にする。

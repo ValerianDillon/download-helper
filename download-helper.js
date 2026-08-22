@@ -1,3 +1,6 @@
+function freezeAssetKey(key) {
+  return Object.freeze(key.kind === "cover" ? { kind: "cover" } : { kind: key.kind, assetId: key.assetId });
+}
 export function assetKeyToString(key) {
   return key.kind === "cover" ? "cover" : `${key.kind}:${key.assetId}`;
 }
@@ -231,7 +234,7 @@ export class PostObject {
       name,
       extension: extension ? `.${extension}` : "",
       url,
-      key: { kind: "cover" },
+      key: freezeAssetKey({ kind: "cover" }),
       metadata: {}
     };
     this.postObj.cover = fileObj;
@@ -246,7 +249,7 @@ export class PostObject {
       name: asset.name,
       extension: asset.extension ? `.${asset.extension}` : "",
       url: asset.url,
-      key: asset.key,
+      key: freezeAssetKey(asset.key),
       metadata: asset.metadata ?? {}
     };
     this.postObj.files.push(fileObj);
