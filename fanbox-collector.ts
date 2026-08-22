@@ -134,6 +134,7 @@ export type PostInfoCandidate = {
  * size / width / height は情報表示と絞り込みのための付随メタデータで、非負の安全な整数でなければ
  * 欠落として扱う (読めないことを理由に投稿全体を invalid にはしない)。
  * size は file 系にのみ、width / height は image 系にのみ存在する (実測 2026-08-22)。
+ * id は image 系・file 系とも、配列でもマップでも実 API に存在する (実測 2026-08-22)。
  */
 type ImageInfo = { id: string; originalUrl: string; extension: string; width?: number; height?: number };
 type FileInfo = { id: string; url: string; name: string; extension: string; size?: number };

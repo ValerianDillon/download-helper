@@ -43,7 +43,10 @@ export type AssetKind = 'cover' | BodyAssetKind;
  * 収集後にアセットを間引いたときに別のアセットを同一視しうる。
  * カバーは URL 文字列しか持たず id が無いため、投稿内で一意な sentinel として表す。
  */
-export type AssetKey = { readonly kind: 'cover' } | { readonly kind: BodyAssetKind; readonly assetId: string };
+export type BodyAssetKey = { readonly kind: BodyAssetKind; readonly assetId: string };
+
+/** 投稿内でアセットを一意に指す鍵。カバーは投稿に高々 1 つなので sentinel で表す */
+export type AssetKey = { readonly kind: 'cover' } | BodyAssetKey;
 
 /**
  * AssetKey を凍結した複製にする。
@@ -98,7 +101,12 @@ export type FileObj = {
  * PostObject.addFile に渡すアセット
  */
 export type AssetInput = {
-  key: AssetKey;
+  /**
+   * 本文アセットの鍵。カバーの sentinel は受け付けない。
+   * 受け付けると、カバーと同じ鍵を持つ本文アセットが HTML でカバーのパスに解決され、
+   * 実体は別名で出力される (参照と実体がずれる)
+   */
+  key: BodyAssetKey;
   name: string;
   extension: string;
   url: string;
@@ -381,9 +389,17 @@ export type AllocatedAssetPaths = {
  * 採番規則を知っている場所をここ 1 つに集約する。HTML の生成も JSON の files も
  * この結果だけを参照するので、規則を差し替えても両者がずれない。
  *
- * **実装は決定的でなければならない。** 同じ入力に対して同じ結果を返し、呼び出し回数に
- * 依存する状態 (連番カウンタなど) を持ってはならない。`stringify()` は呼ばれるたびに
- * allocator を再実行するので、状態を持つ実装では 2 回目の出力が 1 回目と食い違う。
+ * 実装が満たすべき契約は次のとおりで、`stringify()` (finalize) が破りを検出して例外にする。
+ * 黙って通すと、ZIP に入っているのに HTML から参照されないファイルや、参照先が別のアセットに
+ * なったリンクが出力に残る。
+ *
+ * - **決定的であること。** 同じ入力に対して同じ結果を返し、呼び出し回数に依存する状態
+ *   (連番カウンタなど) を持たない。`stringify()` は呼ばれるたびに allocator を再実行する
+ * - `allocatePostDirectoryNames` は `posts` と同じ長さ・同じ順序の配列を返す
+ * - `allocateAssetPaths` は `post.files` の各アセットをちょうど 1 回返す (取りこぼしも重複も、
+ *   その投稿に属さない `FileObj` の混入も許さない)
+ * - `post.cover` があるときに限り `coverArchiveName` を返す
+ * - 引数の `posts` / `post` を変更しない
  *
  * 初回の割り当てを `DownloadObject` 側で覚え込む方法は採らない。投稿やアセットを追加してから
  * もう一度 `stringify()` したときに、追加分を反映しない古い採番を返すことになるためで、
@@ -604,6 +620,10 @@ export class PostObject {
    * @param asset 追加するアセット
    */
   addFile(asset: AssetInput): FileObject {
+    // 型では弾いているが、JS からの呼び出しでは通るので実行時にも拒否する
+    if ((asset.key as AssetKey).kind === 'cover') {
+      throw new Error('addFile: cover の AssetKey は本文アセットに使えません (カバーは setCover が持つ)');
+    }
     const duplicated = this.postObj.files.some((it) => assetKeyToString(it.key) === assetKeyToString(asset.key));
     if (duplicated) {
       throw new Error(`asset key is duplicated: ${assetKeyToString(asset.key)}`);
@@ -703,14 +723,14 @@ export class PostObject {
    */
   toJsonObj(directoryName: string, allocator: ArchivePathAllocator): DownloadJsonObj['posts'][number] {
     const allocation = allocator.allocateAssetPaths(this.postObj);
+    this.assertAllocationCoversAssets(allocation);
     const pathByKey = new Map<string, string>();
     for (const { file, archiveName } of allocation.files) {
       pathByKey.set(assetKeyToString(file.key), archiveName);
     }
-    const cover =
-      this.postObj.cover && allocation.coverArchiveName !== undefined
-        ? { url: this.postObj.cover.url, name: allocation.coverArchiveName }
-        : undefined;
+    const cover = this.postObj.cover
+      ? { url: this.postObj.cover.url, name: allocation.coverArchiveName as string }
+      : undefined;
     if (cover) {
       pathByKey.set('cover', cover.name);
     }
@@ -728,6 +748,35 @@ export class PostObject {
       cover,
       publishedDatetime: this.postObj.publishedDatetime,
     };
+  }
+
+  /**
+   * allocator の結果が投稿のアセットと 1 対 1 に対応していることを確かめる。
+   *
+   * 取りこぼしはファイルの欠落、重複や余分は参照先の取り違えになるが、どちらも出力を見ただけでは
+   * 気付けない (ZIP は生成され、HTML も壊れて見えない)。finalize で止める。
+   * @param allocation 割り当て結果
+   */
+  private assertAllocationCoversAssets(allocation: AllocatedAssetPaths): void {
+    const expected = new Set(this.postObj.files.map((it) => assetKeyToString(it.key)));
+    if (allocation.files.length !== this.postObj.files.length) {
+      throw new Error(
+        `allocator が返したアセット数が投稿と一致しません (期待 ${this.postObj.files.length}, 実際 ${allocation.files.length})`,
+      );
+    }
+    for (const { file } of allocation.files) {
+      const key = assetKeyToString(file.key);
+      if (!expected.delete(key)) {
+        throw new Error(`allocator が投稿に属さないアセット、または重複したアセットを返しました: ${key}`);
+      }
+    }
+    if ((this.postObj.cover !== undefined) !== (allocation.coverArchiveName !== undefined)) {
+      throw new Error(
+        this.postObj.cover === undefined
+          ? 'allocator がカバーの無い投稿に coverArchiveName を返しました'
+          : 'allocator がカバーのある投稿に coverArchiveName を返しませんでした',
+      );
+    }
   }
 
   /**

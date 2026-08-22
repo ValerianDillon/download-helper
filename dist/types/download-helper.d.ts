@@ -42,12 +42,14 @@ export type AssetKind = 'cover' | BodyAssetKind;
  * 収集後にアセットを間引いたときに別のアセットを同一視しうる。
  * カバーは URL 文字列しか持たず id が無いため、投稿内で一意な sentinel として表す。
  */
-export type AssetKey = {
-    readonly kind: 'cover';
-} | {
+export type BodyAssetKey = {
     readonly kind: BodyAssetKind;
     readonly assetId: string;
 };
+/** 投稿内でアセットを一意に指す鍵。カバーは投稿に高々 1 つなので sentinel で表す */
+export type AssetKey = {
+    readonly kind: 'cover';
+} | BodyAssetKey;
 /**
  * AssetKey を Map のキーに使える文字列にする。
  * kind を前置するので、image と file で同じ assetId が来ても衝突しない。
@@ -85,7 +87,12 @@ export type FileObj = {
  * PostObject.addFile に渡すアセット
  */
 export type AssetInput = {
-    key: AssetKey;
+    /**
+     * 本文アセットの鍵。カバーの sentinel は受け付けない。
+     * 受け付けると、カバーと同じ鍵を持つ本文アセットが HTML でカバーのパスに解決され、
+     * 実体は別名で出力される (参照と実体がずれる)
+     */
+    key: BodyAssetKey;
     name: string;
     extension: string;
     url: string;
@@ -269,9 +276,17 @@ export type AllocatedAssetPaths = {
  * 採番規則を知っている場所をここ 1 つに集約する。HTML の生成も JSON の files も
  * この結果だけを参照するので、規則を差し替えても両者がずれない。
  *
- * **実装は決定的でなければならない。** 同じ入力に対して同じ結果を返し、呼び出し回数に
- * 依存する状態 (連番カウンタなど) を持ってはならない。`stringify()` は呼ばれるたびに
- * allocator を再実行するので、状態を持つ実装では 2 回目の出力が 1 回目と食い違う。
+ * 実装が満たすべき契約は次のとおりで、`stringify()` (finalize) が破りを検出して例外にする。
+ * 黙って通すと、ZIP に入っているのに HTML から参照されないファイルや、参照先が別のアセットに
+ * なったリンクが出力に残る。
+ *
+ * - **決定的であること。** 同じ入力に対して同じ結果を返し、呼び出し回数に依存する状態
+ *   (連番カウンタなど) を持たない。`stringify()` は呼ばれるたびに allocator を再実行する
+ * - `allocatePostDirectoryNames` は `posts` と同じ長さ・同じ順序の配列を返す
+ * - `allocateAssetPaths` は `post.files` の各アセットをちょうど 1 回返す (取りこぼしも重複も、
+ *   その投稿に属さない `FileObj` の混入も許さない)
+ * - `post.cover` があるときに限り `coverArchiveName` を返す
+ * - 引数の `posts` / `post` を変更しない
  *
  * 初回の割り当てを `DownloadObject` 側で覚え込む方法は採らない。投稿やアセットを追加してから
  * もう一度 `stringify()` したときに、追加分を反映しない古い採番を返すことになるためで、
@@ -371,6 +386,14 @@ export declare class PostObject {
      * @param allocator 投稿内アセットの割り当て器
      */
     toJsonObj(directoryName: string, allocator: ArchivePathAllocator): DownloadJsonObj['posts'][number];
+    /**
+     * allocator の結果が投稿のアセットと 1 対 1 に対応していることを確かめる。
+     *
+     * 取りこぼしはファイルの欠落、重複や余分は参照先の取り違えになるが、どちらも出力を見ただけでは
+     * 気付けない (ZIP は生成され、HTML も壊れて見えない)。finalize で止める。
+     * @param allocation 割り当て結果
+     */
+    private assertAllocationCoversAssets;
     /**
      * 断片列を HTML 文字列に解決する。
      * 参照先の archive path が割り当てられていない断片は、壊れたリンクを出力に残さないよう例外にする

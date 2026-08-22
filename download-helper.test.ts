@@ -3,14 +3,17 @@ process.env.TZ = 'UTC';
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import {
+  type AllocatedAssetPaths,
   type ArchivePathAllocator,
   type AssetKey,
   assertZipEntryCountWithinLimit,
   assertZipEntrySizeWithinLimit,
   assertZipUint32FieldWithinLimit,
   assetKeyToString,
+  type BodyAssetKey,
   clampToZipRange,
   crc32,
+  createLegacyArchivePathAllocator,
   DownloadHelper,
   type DownloadJsonObj,
   DownloadObject,
@@ -22,6 +25,7 @@ import {
   joinHtmlFragments,
   MAX_ZIP_ENTRY_COUNT,
   MAX_ZIP_UINT32_FIELD_VALUE,
+  type PostObj,
   toDosTimeDate,
   ZipWriter,
 } from './download-helper';
@@ -273,7 +277,7 @@ describe('DownloadUtils', () => {
 });
 
 /** テスト用の AssetKey ショートハンド */
-const imageKey = (assetId: string): AssetKey => ({ kind: 'image', assetId });
+const imageKey = (assetId: string): BodyAssetKey => ({ kind: 'image', assetId });
 
 // ============================================================
 // 2. FileObject tests
@@ -539,6 +543,74 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       d.addPost('same').setTags(['C']);
     });
     expect(json.tags).toEqual(['A', 'B', 'C']);
+  });
+
+  test('cover の AssetKey を addFile に渡すと例外になる', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('post');
+    // 型では弾いているので、JS からの呼び出し (契約違反) を再現するために cast する
+    expect(() =>
+      post.addFile({ key: { kind: 'cover' } as unknown as BodyAssetKey, name: 'a', extension: 'png', url: 'u1' }),
+    ).toThrow('cover の AssetKey は本文アセットに使えません');
+  });
+
+  describe('allocator の契約違反は finalize で止める', () => {
+    /** legacy allocator の結果を加工して契約を破る allocator を作る */
+    const brokenAllocator = (
+      transform: (allocation: AllocatedAssetPaths, post: PostObj) => AllocatedAssetPaths,
+    ): ArchivePathAllocator => {
+      const legacy = createLegacyArchivePathAllocator(utils);
+      return {
+        allocatePostDirectoryNames: (posts) => legacy.allocatePostDirectoryNames(posts),
+        allocateAssetPaths: (post) => transform(legacy.allocateAssetPaths(post), post),
+      };
+    };
+
+    const withTwoFiles = (d: DownloadObject) => {
+      const post = d.addPost('post');
+      post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+      post.addFile({ key: imageKey('i2'), name: 'b', extension: 'png', url: 'u2' });
+    };
+
+    test('アセットを取りこぼすと例外になる (ZIP に入らないファイルを黙って作らない)', () => {
+      expect(() =>
+        build(
+          withTwoFiles,
+          brokenAllocator((a) => ({ ...a, files: a.files.slice(0, 1) })),
+        ),
+      ).toThrow('allocator が返したアセット数が投稿と一致しません');
+    });
+
+    test('同じアセットを 2 回返すと例外になる', () => {
+      expect(() =>
+        build(
+          withTwoFiles,
+          brokenAllocator((a) => ({ ...a, files: [a.files[0], a.files[0]] })),
+        ),
+      ).toThrow('allocator が投稿に属さないアセット、または重複したアセットを返しました');
+    });
+
+    test('カバーのある投稿に coverArchiveName を返さないと例外になる', () => {
+      expect(() =>
+        build(
+          (d) => {
+            d.addPost('post').setCover('cover', 'png', 'u1');
+          },
+          brokenAllocator((a) => ({ ...a, coverArchiveName: undefined })),
+        ),
+      ).toThrow('allocator がカバーのある投稿に coverArchiveName を返しませんでした');
+    });
+
+    test('カバーの無い投稿に coverArchiveName を返すと例外になる', () => {
+      expect(() =>
+        build(
+          (d) => {
+            d.addPost('post');
+          },
+          brokenAllocator((a) => ({ ...a, coverArchiveName: 'stray.png' })),
+        ),
+      ).toThrow('allocator がカバーの無い投稿に coverArchiveName を返しました');
+    });
   });
 
   test('postCount / fileCount は投稿とアセットの総数になる', () => {

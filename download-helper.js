@@ -241,6 +241,9 @@ export class PostObject {
     return new FileObject(fileObj, this.utils);
   }
   addFile(asset) {
+    if (asset.key.kind === "cover") {
+      throw new Error("addFile: cover の AssetKey は本文アセットに使えません (カバーは setCover が持つ)");
+    }
     const duplicated = this.postObj.files.some((it) => assetKeyToString(it.key) === assetKeyToString(asset.key));
     if (duplicated) {
       throw new Error(`asset key is duplicated: ${assetKeyToString(asset.key)}`);
@@ -332,11 +335,12 @@ export class PostObject {
   }
   toJsonObj(directoryName, allocator) {
     const allocation = allocator.allocateAssetPaths(this.postObj);
+    this.assertAllocationCoversAssets(allocation);
     const pathByKey = new Map;
     for (const { file, archiveName } of allocation.files) {
       pathByKey.set(assetKeyToString(file.key), archiveName);
     }
-    const cover = this.postObj.cover && allocation.coverArchiveName !== undefined ? { url: this.postObj.cover.url, name: allocation.coverArchiveName } : undefined;
+    const cover = this.postObj.cover ? { url: this.postObj.cover.url, name: allocation.coverArchiveName } : undefined;
     if (cover) {
       pathByKey.set("cover", cover.name);
     }
@@ -354,6 +358,21 @@ export class PostObject {
       cover,
       publishedDatetime: this.postObj.publishedDatetime
     };
+  }
+  assertAllocationCoversAssets(allocation) {
+    const expected = new Set(this.postObj.files.map((it) => assetKeyToString(it.key)));
+    if (allocation.files.length !== this.postObj.files.length) {
+      throw new Error(`allocator が返したアセット数が投稿と一致しません (期待 ${this.postObj.files.length}, 実際 ${allocation.files.length})`);
+    }
+    for (const { file } of allocation.files) {
+      const key = assetKeyToString(file.key);
+      if (!expected.delete(key)) {
+        throw new Error(`allocator が投稿に属さないアセット、または重複したアセットを返しました: ${key}`);
+      }
+    }
+    if (this.postObj.cover !== undefined !== (allocation.coverArchiveName !== undefined)) {
+      throw new Error(this.postObj.cover === undefined ? "allocator がカバーの無い投稿に coverArchiveName を返しました" : "allocator がカバーのある投稿に coverArchiveName を返しませんでした");
+    }
   }
   resolveHtml(pathByKey) {
     return this.postObj.html.map((fragment) => {

@@ -69,7 +69,7 @@ archive path (ZIP 内の名前) を決めるのは `ArchivePathAllocator` だけ
 
 `fanbox-collector` 側の検証も変わる。
 
-- asset の `id` を必須フィールドとして検証する (`body.images[]` / `body.files[]` / `imageMap` / `fileMap`)。実 API での観測 (2026-08-22、支援中クリエイター 3 名、`post.info` 20 件) では 4 経路すべてに文字列の `id` があり、`body.images[]` の `id` は投稿内で一意、`imageMap` / `fileMap` はマップのキーと値の `id` が一致していた。要素のキーは `images` 系が `id / extension / width / height / originalUrl / thumbnailUrl`、`files` 系が `id / name / extension / size / url`
+- asset の `id` を必須フィールドとして検証する (`body.images[]` / `body.files[]` / `imageMap` / `fileMap`)
 - `imageMap` / `fileMap` はマップのキーと値の `id` が一致することも検証する。identity として使う以上、不一致のまま通すと別のアセットを同一視しうる
 - `body.images` / `body.files` 内で `id` が重複していれば `invalid` にする (`missing` には `body.images[1].id` のように衝突した位置を入れる)
 - `size` / `width` / `height` は非負の安全な整数でなければ欠落として扱う。収集が読まない付随メタデータなので、型が違っても `invalid` にはしない
