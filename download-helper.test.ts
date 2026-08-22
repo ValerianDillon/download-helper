@@ -727,6 +727,18 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       expect(json.posts.map((it) => it.encodedName)).toEqual(['a_2', 'a_1', 'a_1']);
     });
 
+    // encodeURI は % 自体を符号化しないため、% を含む名前は HTML の参照が実在しないファイルを指す
+    test('% を含む archive 名は HTML の参照がずれる', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        const a = post.addFile({ key: imageKey('i1'), name: '%2F', extension: 'png', url: 'u1' });
+        post.setHtml(post.getImageLinkTag(a));
+      });
+      expect(json.posts[0].files[0].encodedName).toBe('%2F.png');
+      // 正しくは ./%252F.png であるべきだが、従来からある欠陥として現状を固定する
+      expect(json.posts[0].htmlText).toContain('href="./%2F.png"');
+    });
+
     test('カバー名と同名の添付が衝突する', () => {
       const json = build((d) => {
         const post = d.addPost('post');

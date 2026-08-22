@@ -78,11 +78,11 @@ export function assetKeyToString(key: AssetKey): string {
  */
 export type AssetMetadata = {
   /** バイト数 (file 系のみ) */
-  size?: number;
+  readonly size?: number;
   /** 画像の幅 (image 系のみ) */
-  width?: number;
+  readonly width?: number;
   /** 画像の高さ (image 系のみ) */
-  height?: number;
+  readonly height?: number;
 };
 
 /**
@@ -424,8 +424,11 @@ export type AllocatedAssetPaths = {
  *
  * - `allocatePostDirectoryNames` は `posts` と同じ長さの、すべて文字列の配列を返す
  * - `allocateAssetPaths` は `post.files` の各アセットの鍵をちょうど 1 回返す (取りこぼしも重複も、
- *   その投稿に属さない鍵の混入も許さない)
- * - `post.cover` があるときに限り `coverArchiveName` を返す
+ *   その投稿に属さない鍵の混入も許さない)。`archiveName` は文字列である
+ * - `post.cover` があるときに限り `coverArchiveName` を返す。返すなら文字列である
+ * - 返す名前 (投稿ディレクトリ名 / `archiveName` / `coverArchiveName`) はすべて正規化済みである
+ *   (`encodeFileName(name) === name`)。JSON と ZIP は名前をそのまま使うのに対し HTML の参照は
+ *   `encodeURI` を通るので、正規化されていないと参照と実体がずれる
  *
  * 次の 2 つは戻り値だけでは判定できないので検出しない。実装者が守る契約である。
  *
@@ -549,7 +552,11 @@ function assertPostDirectoryNames(names: string[], postCount: number, utils: Dow
  * JSON と ZIP のパスは archive 名をそのまま使うのに対し、HTML の参照は encodeURI を通る。
  * encodeURI は URI 予約文字の百分率符号化だけでなく encodeFileName (全角置換と trim) も行うため、
  * 正規化されていない名前を許すと両者がずれる (例: `' a '` は JSON では `' a '`、HTML では `a`)。
- * encodeFileName は冪等なので、正規化済みの名前なら encodeURI の置換部分が恒等になり両者が一致する。
+ * encodeFileName は冪等なので、正規化済みの名前なら encodeURI の置換部分は恒等になる。
+ *
+ * ただし `%` を含む名前は正規化済みでもずれる。encodeURI が `%` 自体を符号化しないため、
+ * `%2F.png` というファイル名の参照は `./%2F.png` になり、ブラウザが `/.png` として解決する
+ * (正しくは `./%252F.png`)。従来からある欠陥で、直すと出力が変わるためここでは扱わない。
  * @param name 検証対象の archive 名
  * @param utils 正規化に使うユーティリティ
  * @param context エラーメッセージに含める対象の説明

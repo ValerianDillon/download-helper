@@ -64,11 +64,11 @@ export declare function assetKeyToString(key: AssetKey): string;
  */
 export type AssetMetadata = {
     /** バイト数 (file 系のみ) */
-    size?: number;
+    readonly size?: number;
     /** 画像の幅 (image 系のみ) */
-    width?: number;
+    readonly width?: number;
     /** 画像の高さ (image 系のみ) */
-    height?: number;
+    readonly height?: number;
 };
 /**
  * ファイル用のObject
@@ -309,8 +309,11 @@ export type AllocatedAssetPaths = {
  *
  * - `allocatePostDirectoryNames` は `posts` と同じ長さの、すべて文字列の配列を返す
  * - `allocateAssetPaths` は `post.files` の各アセットの鍵をちょうど 1 回返す (取りこぼしも重複も、
- *   その投稿に属さない鍵の混入も許さない)
- * - `post.cover` があるときに限り `coverArchiveName` を返す
+ *   その投稿に属さない鍵の混入も許さない)。`archiveName` は文字列である
+ * - `post.cover` があるときに限り `coverArchiveName` を返す。返すなら文字列である
+ * - 返す名前 (投稿ディレクトリ名 / `archiveName` / `coverArchiveName`) はすべて正規化済みである
+ *   (`encodeFileName(name) === name`)。JSON と ZIP は名前をそのまま使うのに対し HTML の参照は
+ *   `encodeURI` を通るので、正規化されていないと参照と実体がずれる
  *
  * 次の 2 つは戻り値だけでは判定できないので検出しない。実装者が守る契約である。
  *

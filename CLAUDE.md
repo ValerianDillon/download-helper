@@ -68,6 +68,8 @@ archive path (ZIP 内の名前) を決めるのは `ArchivePathAllocator` だけ
 
 legacy allocator には既知の名前衝突がある。投稿内で archive 名が重複し (`a` が 2 件と `a_1` が 1 件あると `a_1.png` が 2 つできる。カバーは常に `cover.<ext>` なので、同名の添付や `cover` というタイトルの image 投稿と衝突する)、投稿ディレクトリ名も同じ形で重複する (投稿名 `a`, `a`, `a_1` で `a_1` が 2 つ)。採番規則そのものの欠陥で、直すと出力が変わるため、archive path を postId 由来に変える段階で扱う。
 
+`%` を含む archive 名も、HTML の参照が実在しないファイルを指す。`encodeURI` が `%` 自体を符号化しないため、`%2F.png` というファイル名の参照が `./%2F.png` になり、ブラウザは `/.png` として解決する。これも従来からある欠陥で、直すと出力が変わるため同じ段階で扱う。
+
 finalize では衝突を検出しない。legacy 自身が作れる衝突を例外にすると、`cover` というタイトルの投稿のような現実的な入力でダウンロード全体が落ち、いま得られている「1 ファイルだけ影に入った ZIP」より悪くなる。投稿ディレクトリ名の重複は `downloadZip` が弾くが、その検証は `showSaveFilePicker` より前にあるので、finalize に移しても早期失敗にはならない
 - アセットの付随メタデータ (`size` / `width` / `height`) と投稿タイプ (`PostObj.postType`) は内部表現に保持するが `DownloadJsonObj` には出さない。利用側の絞り込み条件のために持つ
 
