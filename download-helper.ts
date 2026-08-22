@@ -2081,9 +2081,13 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
   if (typeof value !== 'object' || value === null) return false;
   const m = value as Record<string, unknown>;
   if (m.schemaVersion !== 1) return false;
-  if (typeof m.generatedAt !== 'string') return false;
+  // 永続化する schema なので、日時として読める文字列であることまで見る。
+  // 各フィールドは 1 回だけ読む (読むたびに値を変える getter で検証と実値を食い違わせないため)
+  const generatedAt = m.generatedAt;
+  if (typeof generatedAt !== 'string' || !Number.isFinite(new Date(generatedAt).getTime())) return false;
   // creatorId は id と同じであることまで見る。別の収集結果の manifest を貼り付けた入力を通さない
-  if (typeof m.creatorId !== 'string' || m.creatorId !== downloadObj.id) return false;
+  const creatorId = m.creatorId;
+  if (typeof creatorId !== 'string' || creatorId !== downloadObj.id) return false;
 
   const selection = m.selection as Record<string, unknown> | undefined;
   if (
@@ -2113,8 +2117,8 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
   }
   if (downloadObj.fileCount !== totalFiles) return false;
 
-  const selectedPostIds = new Set(selection.postIds as string[]);
-  const selectedExtensions = new Set(selection.extensions as string[]);
+  const selectedPostIds = toSet(selection.postIds as string[]);
+  const selectedExtensions = toSet(selection.extensions as string[]);
   const includeCover = selection.includeCover;
   // 除外された投稿が選択集合に入っていてはいけない (excludedPosts の網羅性は、projection 後の
   // JSON に元の投稿一覧が残らないので検証できない)
@@ -2154,13 +2158,26 @@ function isManifestSelectionConsistent(
 ): boolean {
   const included = manifestPost.included as Record<string, unknown>[];
   const excluded = manifestPost.excluded as Record<string, unknown>[];
-  const hasCover = (assets: Record<string, unknown>[]) => assets.some((it) => it.kind === 'cover');
-  // カバーの扱いは includeCover ひとつで決まる
-  if (includeCover ? hasCover(excluded) : hasCover(included)) return false;
   const matchesExtension = (asset: Record<string, unknown>) =>
     selectedExtensions.has(normalizeExtension(asset.extension as string));
-  if (!included.filter((it) => it.kind !== 'cover').every(matchesExtension)) return false;
-  return !excluded.filter((it) => it.kind !== 'cover').some(matchesExtension);
+  // カバーの扱いは includeCover ひとつで決まる。拡張子の選択はカバーには適用しない
+  for (let index = 0; index < included.length; index++) {
+    const asset = included[index];
+    if (asset.kind === 'cover') {
+      if (!includeCover) return false;
+    } else if (!matchesExtension(asset)) {
+      return false;
+    }
+  }
+  for (let index = 0; index < excluded.length; index++) {
+    const asset = excluded[index];
+    if (asset.kind === 'cover') {
+      if (includeCover) return false;
+    } else if (matchesExtension(asset)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -2177,19 +2194,33 @@ function isManifestPostConsistent(manifestPost: Record<string, unknown>, jsonPos
   const excluded = manifestPost.excluded as Record<string, unknown>[];
 
   // 同じアセットを含めたと除外したの両方に載せない
-  const identities = [...included, ...excluded].map((it) => `${it.kind}:${it.assetId ?? ''}`);
-  if (new Set(identities).size !== identities.length) return false;
+  const identities = new Set<string>();
+  let identityCount = 0;
+  for (const assets of [included, excluded]) {
+    for (let index = 0; index < assets.length; index++) {
+      identities.add(`${assets[index].kind}:${assets[index].assetId ?? ''}`);
+      identityCount++;
+    }
+  }
+  if (identities.size !== identityCount) return false;
 
+  const includedCovers: Record<string, unknown>[] = [];
+  const includedFiles: Record<string, unknown>[] = [];
+  for (let index = 0; index < included.length; index++) {
+    (included[index].kind === 'cover' ? includedCovers : includedFiles).push(included[index]);
+  }
   const cover = jsonPost.cover as Record<string, unknown> | undefined;
-  const includedCovers = included.filter((it) => it.kind === 'cover');
   if (cover === undefined) {
     if (includedCovers.length !== 0) return false;
   } else if (includedCovers.length !== 1 || includedCovers[0].archiveName !== cover.name) {
     return false;
   }
 
-  const files = isDenseArray(jsonPost.files) ? [...(jsonPost.files as Record<string, unknown>[])] : [];
-  const includedFiles = included.filter((it) => it.kind !== 'cover');
+  if (!isDenseArray(jsonPost.files)) return false;
+  const files: Record<string, unknown>[] = [];
+  for (let index = 0; index < jsonPost.files.length; index++) {
+    files.push((jsonPost.files as Record<string, unknown>[])[index]);
+  }
   if (includedFiles.length !== files.length) return false;
   for (const entry of includedFiles) {
     const index = files.findIndex(
@@ -2199,6 +2230,19 @@ function isManifestPostConsistent(manifestPost: Record<string, unknown>, jsonPos
     files.splice(index, 1);
   }
   return true;
+}
+
+/**
+ * 配列を index で読んで Set にする。入力配列の iterator を呼ばない
+ * @param source 検証済みの配列
+ * @internal
+ */
+function toSet(source: readonly string[]): Set<string> {
+  const set = new Set<string>();
+  for (let index = 0; index < source.length; index++) {
+    set.add(source[index]);
+  }
+  return set;
 }
 
 /**
@@ -2221,8 +2265,8 @@ function isDenseArray(value: unknown): value is unknown[] {
 /** 文字列だけの、hole の無い配列か */
 function isStringArray(value: unknown): value is string[] {
   if (!isDenseArray(value)) return false;
-  for (const it of value) {
-    if (typeof it !== 'string') return false;
+  for (let index = 0; index < value.length; index++) {
+    if (typeof value[index] !== 'string') return false;
   }
   return true;
 }
@@ -2241,14 +2285,18 @@ function isRecordWithStringKeys(value: unknown, keys: string[]): boolean {
  */
 function isManifestAssetArray(value: unknown, requireArchiveName: boolean): boolean {
   if (!isDenseArray(value)) return false;
-  return value.every((it: unknown) => {
+  const isValidAsset = (it: unknown) => {
     if (!isRecordWithStringKeys(it, ['originalName', 'extension'])) return false;
     const asset = it as Record<string, unknown>;
     if (asset.kind !== 'cover' && asset.kind !== 'image' && asset.kind !== 'file') return false;
     // カバーは id を持たない。それ以外は文字列の assetId を持つ
     if (asset.kind === 'cover' ? asset.assetId !== undefined : typeof asset.assetId !== 'string') return false;
     return requireArchiveName ? typeof asset.archiveName === 'string' : asset.archiveName === undefined;
-  });
+  };
+  for (let index = 0; index < value.length; index++) {
+    if (!isValidAsset(value[index])) return false;
+  }
+  return true;
 }
 
 /**
@@ -2256,6 +2304,31 @@ function isManifestAssetArray(value: unknown, requireArchiveName: boolean): bool
  * @internal
  */
 const RESERVED_ROOT_ENTRY_NAMES = ['index.html', 'download-manifest.json'];
+
+/**
+ * 投稿ディレクトリ直下に必ず書かれるファイル名。アセットの archive 名として使えない。
+ *
+ * `info.json` / `info.txt` は `createInformationFile` が情報テキストの内容で選ぶので、
+ * どちらも予約する。ライブラリが生成するファイルとの衝突であり、legacy allocator の
+ * アセット同士の衝突 (直さないと決めたもの) とは別の問題である
+ * @internal
+ */
+const RESERVED_POST_ENTRY_NAMES = ['index.html', 'info.json', 'info.txt'];
+
+/**
+ * 投稿ディレクトリ直下の固定ファイルと衝突する名前を弾く。
+ *
+ * 同じパスに 2 つのエントリが入り、展開実装によって投稿 HTML か情報ファイルか
+ * アセットのいずれかが失われる
+ * @param name 検証対象の archive 名
+ * @param field エラーメッセージに含めるフィールド名
+ * @internal
+ */
+function assertNotReservedPostEntryName(name: string, field: string): void {
+  if (RESERVED_POST_ENTRY_NAMES.includes(normalizeForReservedComparison(name))) {
+    throw new Error(`downloadZip: ${field} が投稿ディレクトリの予約名と衝突しています (${name})`);
+  }
+}
 
 /**
  * 予約名と比較するための正規化。
@@ -2268,6 +2341,89 @@ const RESERVED_ROOT_ENTRY_NAMES = ['index.html', 'download-manifest.json'];
  */
 function normalizeForReservedComparison(name: string): string {
   return name.replace(/[ .]+$/, '').toLowerCase();
+}
+
+/**
+ * manifest を一度だけ読んで、素のオブジェクトと配列に写す。
+ *
+ * 値の妥当性はここでは見ない (写した結果を `isDownloadManifest` が検証する)。目的は
+ * 「検証したものと書き出すものを同一にする」ことで、getter や `toJSON`、差し替えた配列
+ * メソッドが検証の後にもう一度評価される余地を無くす。
+ * 各フィールドは 1 回だけ読み、配列は index で読んで素の配列に写す
+ * @param value 未検証の manifest
+ * @internal
+ */
+function snapshotManifest(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null) return value;
+  const m = value as Record<string, unknown>;
+  const selection = m.selection;
+  const selectionRecord =
+    typeof selection === 'object' && selection !== null ? (selection as Record<string, unknown>) : undefined;
+  return {
+    schemaVersion: m.schemaVersion,
+    creatorId: m.creatorId,
+    generatedAt: m.generatedAt,
+    selection: selectionRecord
+      ? {
+          postIds: snapshotArray(selectionRecord.postIds, (it) => it),
+          extensions: snapshotArray(selectionRecord.extensions, (it) => it),
+          includeCover: selectionRecord.includeCover,
+        }
+      : selection,
+    posts: snapshotArray(m.posts, snapshotManifestPost),
+    excludedPosts: snapshotArray(m.excludedPosts, (it) => snapshotFields(it, ['postId'])),
+  };
+}
+
+/**
+ * manifest の投稿 1 件を写す
+ * @param value 未検証の投稿
+ * @internal
+ */
+function snapshotManifestPost(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null) return value;
+  const p = value as Record<string, unknown>;
+  const asset = (it: unknown) => snapshotFields(it, ['kind', 'assetId', 'originalName', 'extension', 'archiveName']);
+  return {
+    postId: p.postId,
+    archiveDirectory: p.archiveDirectory,
+    included: snapshotArray(p.included, asset),
+    excluded: snapshotArray(p.excluded, asset),
+  };
+}
+
+/**
+ * 指定のキーだけを 1 回ずつ読んで素のオブジェクトに写す
+ * @param value 未検証の値
+ * @param keys 写すキー
+ * @internal
+ */
+function snapshotFields(value: unknown, keys: string[]): unknown {
+  if (typeof value !== 'object' || value === null) return value;
+  const record = value as Record<string, unknown>;
+  const copied: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (Object.hasOwn(record, key)) {
+      copied[key] = record[key];
+    }
+  }
+  return copied;
+}
+
+/**
+ * 配列を index で読んで素の配列に写す。配列でなければそのまま返す (検証が弾く)。
+ * hole は undefined として写る
+ * @param value 未検証の値
+ * @param project 要素の変換
+ * @internal
+ */
+function snapshotArray(value: unknown, project: (item: unknown) => unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  const copied: unknown[] = [];
+  for (let index = 0; index < value.length; index++) {
+    copied.push(project(value[index]));
+  }
+  return copied;
 }
 
 /**
@@ -2517,6 +2673,14 @@ export class DownloadHelper {
     if (!isValidPathSegment(encodedId)) {
       throw new Error(`downloadZip: id が不正な値です (encode 後: ${JSON.stringify(encodedId)})`);
     }
+    // manifest は一度だけ読んで素の値に写し、以降はその写しだけを検証・書き出しに使う。
+    // 検証と書き出しで別々に読むと、値を返す getter を仕込まれたときに「検証を通った値」と
+    // 「書き出される値」が食い違う
+    const manifest = snapshotManifest(downloadObj.manifest);
+    if (!isDownloadManifest(manifest, downloadObj as unknown as Record<string, unknown>)) {
+      throw new Error('downloadZip: manifest が不正です (projection を経ていない可能性があります)');
+    }
+
     const seenEncodedNames = new Set<string>();
     for (const post of downloadObj.posts) {
       if (!isValidPathSegment(post.encodedName)) {
@@ -2538,6 +2702,10 @@ export class DownloadHelper {
         if (!isValidPathSegment(file.encodedName)) {
           throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
         }
+        assertNotReservedPostEntryName(file.encodedName, 'file.encodedName');
+      }
+      if (post.cover !== undefined) {
+        assertNotReservedPostEntryName(post.cover.name, 'post.cover.name');
       }
     }
 
@@ -2586,11 +2754,7 @@ export class DownloadHelper {
       await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html', rootDate);
       // 選択条件と、含めた / 除外した対象の記録。info JSON (FANBOX の投稿メタデータ) とは
       // 出所が違うので混ぜない
-      await enqueue(
-        [JSON.stringify(toCanonicalManifest(downloadObj.manifest), null, 2)],
-        'download-manifest.json',
-        rootDate,
-      );
+      await enqueue([JSON.stringify(toCanonicalManifest(manifest), null, 2)], 'download-manifest.json', rootDate);
       // 投稿処理
       let postCount = 0;
       postLoop: for (const post of downloadObj.posts) {

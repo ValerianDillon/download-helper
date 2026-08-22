@@ -1175,6 +1175,8 @@ describe('isDownloadJsonObj', () => {
       // 別の収集結果の manifest を貼り付けた入力を通さない
       ['creatorId が id と一致しない', { creatorId: 'another-creator' }],
       ['generatedAt が文字列でない', { generatedAt: 1 }],
+      // 永続化する schema なので日時として読めることまで見る
+      ['generatedAt が日時として読めない', { generatedAt: 'not-an-iso-date' }],
       ['selection が無い', { selection: undefined }],
       [
         'selection.postIds に文字列でない要素がある',
@@ -1366,6 +1368,17 @@ describe('isDownloadJsonObj', () => {
         expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: { ...validManifest(), selection } })).toBe(
           false,
         );
+      });
+
+      test('selection.postIds の iterator が例外を投げる → 例外ではなく false', () => {
+        const postIds = Object.assign(['p1'], {
+          [Symbol.iterator]() {
+            throw new Error('hostile iterator');
+          },
+        });
+        const selection = { ...validManifest().selection, postIds };
+        const obj = { ...createValidObj(), manifest: { ...validManifest(), selection } };
+        expect(() => helper.isDownloadJsonObj(obj)).not.toThrow();
       });
 
       test('excludedPosts が疎配列 → false', () => {
@@ -3400,6 +3413,70 @@ describe('DownloadHelper.downloadZip', () => {
       const text = new TextDecoder().decode(await runDownloadZip(obj));
       expect(text).not.toContain('leak.example');
       expect(text).toContain('"archiveDirectory"');
+    });
+
+    // 書き出しは manifest 本体ではなく、検証したのと同じ写しから読む。
+    // 写しを取らずに書き出し時点でもう一度読むと、そこで返された値が ZIP に入ってしまう。
+    // 「検証を通った後の読み出しは存在しない」ことを、読むたびに値を変える getter で確かめる
+    test('検証を通った後は manifest を読み直さない', async () => {
+      const base = createValidObj();
+      const validGeneratedAt = '2026-08-23T00:00:00.000Z';
+      let reads = 0;
+      const manifest = Object.defineProperty({ ...base.manifest }, 'generatedAt', {
+        get() {
+          reads += 1;
+          // 検証と写しの取得までは正しい値を返し、それ以降の読み出しでだけ細工した値を返す
+          return reads <= 2 ? validGeneratedAt : ({ toJSON: () => 'https://leak.example/getter' } as unknown as string);
+        },
+        enumerable: true,
+        configurable: true,
+      }) as DownloadManifest;
+      const text = new TextDecoder().decode(await runDownloadZip({ ...base, manifest }));
+      expect(text).not.toContain('leak.example');
+      expect(text).toContain(validGeneratedAt);
+    });
+
+    // 読むたびに値が変わる manifest は、写しを取った時点で検証に落ちる
+    test('検証の途中で値を変える getter がある manifest は ZIP を作らずに落ちる', async () => {
+      const base = createValidObj();
+      let reads = 0;
+      const manifest = Object.defineProperty({ ...base.manifest }, 'generatedAt', {
+        get() {
+          reads += 1;
+          return reads === 1
+            ? '2026-08-23T00:00:00.000Z'
+            : ({ toJSON: () => 'https://leak.example/getter' } as unknown as string);
+        },
+        enumerable: true,
+        configurable: true,
+      }) as DownloadManifest;
+      await expect(runDownloadZip({ ...base, manifest })).rejects.toThrow();
+    });
+
+    // 投稿ディレクトリ直下にはライブラリが index.html と情報ファイルを必ず書く。
+    // 同名のアセットがあると同じパスに 2 エントリ入り、どちらかが失われる
+    test.each([
+      'index.html',
+      'info.json',
+      'INFO.TXT',
+    ])('アセット名が投稿内の予約名 %s と衝突する → 例外', async (reserved) => {
+      const base = createValidObj();
+      const post = base.posts[0];
+      const obj: DownloadJsonObj = {
+        ...base,
+        posts: [{ ...post, files: [{ ...post.files[0], encodedName: reserved }] }, ...base.posts.slice(1)],
+        manifest: {
+          ...base.manifest,
+          posts: [
+            {
+              ...base.manifest.posts[0],
+              included: [{ ...base.manifest.posts[0].included[0], archiveName: reserved }],
+            },
+            ...base.manifest.posts.slice(1),
+          ],
+        },
+      };
+      await expect(runDownloadZip(obj)).rejects.toThrow('投稿ディレクトリの予約名と衝突');
     });
 
     test('download-manifest.json が ZIP ルートに書かれる', async () => {

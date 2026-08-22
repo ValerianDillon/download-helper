@@ -114,7 +114,9 @@ ZIP ルートに `download-manifest.json` を書き出す (`schemaVersion` / `cr
 
 配列は `isDenseArray` で hole が無いことを確かめてから要素を見る。`every` / `some` / `reduce` は hole を飛ばすので、`new Array(3)` のような疎配列はどんな述語でも通ってしまい、書き出すと `[null, null, null]` になる。
 
-ZIP ルート直下の固定ファイル名 (`index.html` / `download-manifest.json`) と同名の投稿ディレクトリは `downloadZip` が拒否する。比較は大文字小文字を畳み、末尾の空白とピリオドを落としてから行う (Windows と既定の macOS は大文字小文字を区別せず、Windows は末尾の空白とピリオドを取り除いて解釈するため、完全一致だけでは `INDEX.HTML` や `index.html.` がすり抜ける)。同じパスがファイルとディレクトリの両方になり、展開できない ZIP になるため。legacy allocator の名前衝突 (同名グループの採番など) を許容するのとは扱いが違う — あちらは「1 ファイルだけ影に入った ZIP」で済むが、こちらはアーカイブ全体が壊れる。`index.html` の衝突は #42 以前からある欠陥で、ここで併せて塞いだ。
+`downloadZip` は **manifest を一度だけ読んで素の値に写し (`snapshotManifest`)、その写しだけを検証と書き出しに使う**。検証と書き出しで別々に読むと、読むたびに値を変える getter で「検証を通った値」と「書き出される値」を食い違わせられる。検証側も各フィールドを 1 回だけ読み、未信頼の配列に対して `map` / `every` / iterator を呼ばない (index で読む)。
+
+ZIP ルート直下の固定ファイル名 (`index.html` / `download-manifest.json`) と同名の投稿ディレクトリ、および投稿ディレクトリ直下の固定ファイル名 (`index.html` / `info.json` / `info.txt`) と同名のアセットは `downloadZip` が拒否する。比較は大文字小文字を畳み、末尾の空白とピリオドを落としてから行う (Windows と既定の macOS は大文字小文字を区別せず、Windows は末尾の空白とピリオドを取り除いて解釈するため、完全一致だけでは `INDEX.HTML` や `index.html.` がすり抜ける)。同じパスがファイルとディレクトリの両方になり、展開できない ZIP になるため。legacy allocator の名前衝突 (同名グループの採番など) を許容するのとは扱いが違う — あちらは「1 ファイルだけ影に入った ZIP」で済むが、こちらはアーカイブ全体が壊れる。`index.html` の衝突は #42 以前からある欠陥で、ここで併せて塞いだ。
 
 `PostObj.postId` は `Selection` が投稿を指すキーである。一意性は検証しない (一覧ページの重複などで同じ投稿が 2 回来ても収集を止めないことを優先する)。同じ postId の投稿が 2 件あれば選択は両方に同時に効く。
 

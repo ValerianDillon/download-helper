@@ -922,7 +922,7 @@ function isDownloadManifest(value, downloadObj) {
   const m = value;
   if (m.schemaVersion !== 1)
     return false;
-  if (typeof m.generatedAt !== "string")
+  if (typeof m.generatedAt !== "string" || !Number.isFinite(new Date(m.generatedAt).getTime()))
     return false;
   if (typeof m.creatorId !== "string" || m.creatorId !== downloadObj.id)
     return false;
@@ -947,8 +947,8 @@ function isDownloadManifest(value, downloadObj) {
   }
   if (downloadObj.fileCount !== totalFiles)
     return false;
-  const selectedPostIds = new Set(selection.postIds);
-  const selectedExtensions = new Set(selection.extensions);
+  const selectedPostIds = toSet(selection.postIds);
+  const selectedExtensions = toSet(selection.extensions);
   const includeCover = selection.includeCover;
   for (const it of m.excludedPosts) {
     if (selectedPostIds.has(it.postId))
@@ -976,30 +976,58 @@ function isDownloadManifest(value, downloadObj) {
 function isManifestSelectionConsistent(manifestPost, selectedExtensions, includeCover) {
   const included = manifestPost.included;
   const excluded = manifestPost.excluded;
-  const hasCover = (assets) => assets.some((it) => it.kind === "cover");
-  if (includeCover ? hasCover(excluded) : hasCover(included))
-    return false;
   const matchesExtension = (asset) => selectedExtensions.has(normalizeExtension(asset.extension));
-  if (!included.filter((it) => it.kind !== "cover").every(matchesExtension))
-    return false;
-  return !excluded.filter((it) => it.kind !== "cover").some(matchesExtension);
+  for (let index = 0;index < included.length; index++) {
+    const asset = included[index];
+    if (asset.kind === "cover") {
+      if (!includeCover)
+        return false;
+    } else if (!matchesExtension(asset)) {
+      return false;
+    }
+  }
+  for (let index = 0;index < excluded.length; index++) {
+    const asset = excluded[index];
+    if (asset.kind === "cover") {
+      if (includeCover)
+        return false;
+    } else if (matchesExtension(asset)) {
+      return false;
+    }
+  }
+  return true;
 }
 function isManifestPostConsistent(manifestPost, jsonPost) {
   const included = manifestPost.included;
   const excluded = manifestPost.excluded;
-  const identities = [...included, ...excluded].map((it) => `${it.kind}:${it.assetId ?? ""}`);
-  if (new Set(identities).size !== identities.length)
+  const identities = new Set;
+  let identityCount = 0;
+  for (const assets of [included, excluded]) {
+    for (let index = 0;index < assets.length; index++) {
+      identities.add(`${assets[index].kind}:${assets[index].assetId ?? ""}`);
+      identityCount++;
+    }
+  }
+  if (identities.size !== identityCount)
     return false;
+  const includedCovers = [];
+  const includedFiles = [];
+  for (let index = 0;index < included.length; index++) {
+    (included[index].kind === "cover" ? includedCovers : includedFiles).push(included[index]);
+  }
   const cover = jsonPost.cover;
-  const includedCovers = included.filter((it) => it.kind === "cover");
   if (cover === undefined) {
     if (includedCovers.length !== 0)
       return false;
   } else if (includedCovers.length !== 1 || includedCovers[0].archiveName !== cover.name) {
     return false;
   }
-  const files = isDenseArray(jsonPost.files) ? [...jsonPost.files] : [];
-  const includedFiles = included.filter((it) => it.kind !== "cover");
+  if (!isDenseArray(jsonPost.files))
+    return false;
+  const files = [];
+  for (let index = 0;index < jsonPost.files.length; index++) {
+    files.push(jsonPost.files[index]);
+  }
   if (includedFiles.length !== files.length)
     return false;
   for (const entry of includedFiles) {
@@ -1009,6 +1037,13 @@ function isManifestPostConsistent(manifestPost, jsonPost) {
     files.splice(index, 1);
   }
   return true;
+}
+function toSet(source) {
+  const set = new Set;
+  for (let index = 0;index < source.length; index++) {
+    set.add(source[index]);
+  }
+  return set;
 }
 function isDenseArray(value) {
   if (!Array.isArray(value))
@@ -1022,8 +1057,8 @@ function isDenseArray(value) {
 function isStringArray(value) {
   if (!isDenseArray(value))
     return false;
-  for (const it of value) {
-    if (typeof it !== "string")
+  for (let index = 0;index < value.length; index++) {
+    if (typeof value[index] !== "string")
       return false;
   }
   return true;
@@ -1037,7 +1072,7 @@ function isRecordWithStringKeys(value, keys) {
 function isManifestAssetArray(value, requireArchiveName) {
   if (!isDenseArray(value))
     return false;
-  return value.every((it) => {
+  const isValidAsset = (it) => {
     if (!isRecordWithStringKeys(it, ["originalName", "extension"]))
       return false;
     const asset = it;
@@ -1046,11 +1081,74 @@ function isManifestAssetArray(value, requireArchiveName) {
     if (asset.kind === "cover" ? asset.assetId !== undefined : typeof asset.assetId !== "string")
       return false;
     return requireArchiveName ? typeof asset.archiveName === "string" : asset.archiveName === undefined;
-  });
+  };
+  for (let index = 0;index < value.length; index++) {
+    if (!isValidAsset(value[index]))
+      return false;
+  }
+  return true;
 }
 const RESERVED_ROOT_ENTRY_NAMES = ["index.html", "download-manifest.json"];
+const RESERVED_POST_ENTRY_NAMES = ["index.html", "info.json", "info.txt"];
+function assertNotReservedPostEntryName(name, field) {
+  if (RESERVED_POST_ENTRY_NAMES.includes(normalizeForReservedComparison(name))) {
+    throw new Error(`downloadZip: ${field} が投稿ディレクトリの予約名と衝突しています (${name})`);
+  }
+}
 function normalizeForReservedComparison(name) {
   return name.replace(/[ .]+$/, "").toLowerCase();
+}
+function snapshotManifest(value) {
+  if (typeof value !== "object" || value === null)
+    return value;
+  const m = value;
+  const selection = m.selection;
+  const selectionRecord = typeof selection === "object" && selection !== null ? selection : undefined;
+  return {
+    schemaVersion: m.schemaVersion,
+    creatorId: m.creatorId,
+    generatedAt: m.generatedAt,
+    selection: selectionRecord ? {
+      postIds: snapshotArray(selectionRecord.postIds, (it) => it),
+      extensions: snapshotArray(selectionRecord.extensions, (it) => it),
+      includeCover: selectionRecord.includeCover
+    } : selection,
+    posts: snapshotArray(m.posts, snapshotManifestPost),
+    excludedPosts: snapshotArray(m.excludedPosts, (it) => snapshotFields(it, ["postId"]))
+  };
+}
+function snapshotManifestPost(value) {
+  if (typeof value !== "object" || value === null)
+    return value;
+  const p = value;
+  const asset = (it) => snapshotFields(it, ["kind", "assetId", "originalName", "extension", "archiveName"]);
+  return {
+    postId: p.postId,
+    archiveDirectory: p.archiveDirectory,
+    included: snapshotArray(p.included, asset),
+    excluded: snapshotArray(p.excluded, asset)
+  };
+}
+function snapshotFields(value, keys) {
+  if (typeof value !== "object" || value === null)
+    return value;
+  const record = value;
+  const copied = {};
+  for (const key of keys) {
+    if (Object.hasOwn(record, key)) {
+      copied[key] = record[key];
+    }
+  }
+  return copied;
+}
+function snapshotArray(value, project) {
+  if (!Array.isArray(value))
+    return value;
+  const copied = [];
+  for (let index = 0;index < value.length; index++) {
+    copied.push(project(value[index]));
+  }
+  return copied;
 }
 function toCanonicalManifest(manifest) {
   const identity = (asset) => asset.kind === "cover" ? { kind: "cover" } : { kind: asset.kind, assetId: asset.assetId };
@@ -1227,6 +1325,10 @@ export class DownloadHelper {
     if (!isValidPathSegment(encodedId)) {
       throw new Error(`downloadZip: id が不正な値です (encode 後: ${JSON.stringify(encodedId)})`);
     }
+    const manifest = snapshotManifest(downloadObj.manifest);
+    if (!isDownloadManifest(manifest, downloadObj)) {
+      throw new Error("downloadZip: manifest が不正です (projection を経ていない可能性があります)");
+    }
     const seenEncodedNames = new Set;
     for (const post of downloadObj.posts) {
       if (!isValidPathSegment(post.encodedName)) {
@@ -1246,6 +1348,10 @@ export class DownloadHelper {
         if (!isValidPathSegment(file.encodedName)) {
           throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
         }
+        assertNotReservedPostEntryName(file.encodedName, "file.encodedName");
+      }
+      if (post.cover !== undefined) {
+        assertNotReservedPostEntryName(post.cover.name, "post.cover.name");
       }
     }
     const handle = options?.handle ?? await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
@@ -1277,7 +1383,7 @@ export class DownloadHelper {
       }, undefined);
       await zip.addDirectory(`${encodedId}/`, rootDate);
       await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html", rootDate);
-      await enqueue([JSON.stringify(toCanonicalManifest(downloadObj.manifest), null, 2)], "download-manifest.json", rootDate);
+      await enqueue([JSON.stringify(toCanonicalManifest(manifest), null, 2)], "download-manifest.json", rootDate);
       let postCount = 0;
       postLoop:
         for (const post of downloadObj.posts) {
