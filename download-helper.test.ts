@@ -279,14 +279,22 @@ describe('DownloadUtils', () => {
 });
 
 /** テスト用の最小 manifest (projection が付ける印) */
-const testManifest = (): DownloadManifest => ({
+const testManifest = (archiveDirectories: string[] = []): DownloadManifest => ({
   schemaVersion: 1,
   creatorId: 'creator-id',
   generatedAt: '2026-08-23T00:00:00.000Z',
   selection: { postIds: [], extensions: [], includeCover: true },
-  included: { posts: [], assets: [] },
-  excluded: { posts: [], assets: [] },
+  posts: archiveDirectories.map((archiveDirectory, i) => ({
+    postId: `p${i + 1}`,
+    archiveDirectory,
+    included: [],
+    excluded: [],
+  })),
+  excludedPosts: [],
 });
+
+/** manifest の generatedAt を固定するための時刻 */
+const FIXED_NOW = new Date('2026-08-23T00:00:00.000Z');
 
 /** テスト用の AssetKey ショートハンド */
 const imageKey = (assetId: string): BodyAssetKey => ({ kind: 'image', assetId });
@@ -467,7 +475,8 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       const post = downloadObject.addPost('p:post', 'post');
       const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
       post.setHtml(post.getImageLinkTag(a));
-      expect(downloadObject.stringify()).toBe(downloadObject.stringify());
+      // manifest に生成日時が入るので、両方に同じ now を渡さないとミリ秒差で落ちる
+      expect(downloadObject.stringify({ now: FIXED_NOW })).toBe(downloadObject.stringify({ now: FIXED_NOW }));
     });
 
     test('allocator を差し替えると HTML 内の参照も追随する', () => {
@@ -493,18 +502,48 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       const downloadObject = new DownloadObject('creator', utils);
       const post = downloadObject.addPost('p:post', 'post');
       const key = imageKey('i1');
-      post.addFile({ key, name: 'a', extension: 'png', url: 'u1' });
-      post.setHtml([{ assetRef: key }]);
+      const file = post.addFile({ key, name: 'a', extension: 'png', url: 'u1' });
+      post.setHtml(post.getImageLinkTag(file));
       (key as { assetId: string }).assetId = 'changed';
-      const json = JSON.parse(downloadObject.stringify()) as DownloadJsonObj;
-      expect(json.posts[0].htmlText).toBe('./a.png');
+      const json = JSON.parse(downloadObject.stringify({ now: FIXED_NOW })) as DownloadJsonObj;
+      expect(json.posts[0].htmlText).toContain('href="./a.png"');
     });
 
-    test('割り当てられていない AssetKey を参照する断片は例外にする', () => {
+    test('投稿に存在しないアセットを参照するカードは例外にする', () => {
       const downloadObject = new DownloadObject('creator', utils);
       const post = downloadObject.addPost('p:post', 'post');
-      post.setHtml([{ assetRef: imageKey('missing') }]);
-      expect(() => downloadObject.stringify()).toThrow('archive path is not allocated: image:missing');
+      post.setHtml([
+        {
+          assetCard: {
+            key: imageKey('missing'),
+            kind: 'image',
+            originalName: 'a',
+            extension: '.png',
+            body: [{ assetRef: imageKey('missing') }],
+          },
+        },
+      ]);
+      expect(() => downloadObject.stringify({ now: FIXED_NOW })).toThrow(
+        'HTML が投稿に存在しないアセットを参照しています: image:missing',
+      );
+    });
+
+    test('カードの中の参照が別のアセットを指していれば setHtml で例外にする', () => {
+      const downloadObject = new DownloadObject('creator', utils);
+      const post = downloadObject.addPost('p:post', 'post');
+      expect(() =>
+        post.setHtml([
+          {
+            assetCard: {
+              key: imageKey('i1'),
+              kind: 'image',
+              originalName: 'a',
+              extension: '.png',
+              body: [{ assetRef: imageKey('other') }],
+            },
+          },
+        ]),
+      ).toThrow('カードの中の参照が別のアセットを指しています');
     });
   });
 
@@ -945,20 +984,22 @@ describe('projection', () => {
       expect(m.creatorId).toBe('creator');
       expect(m.generatedAt).toBe('2026-08-23T00:00:00.000Z');
       expect(m.selection).toEqual({ postIds: ['p1'], extensions: ['.png'], includeCover: false });
-      expect(m.included.posts).toEqual([{ postId: 'p1', archiveDirectory: 'post_3' }]);
-      expect(m.included.assets).toEqual([
-        { postId: 'p1', kind: 'image', originalName: 'a', extension: '.png', archiveName: 'a_1.png' },
+      expect(m.posts).toHaveLength(1);
+      expect(m.posts[0].postId).toBe('p1');
+      expect(m.posts[0].archiveDirectory).toBe('post_3');
+      expect(m.posts[0].included).toEqual([
+        { kind: 'image', assetId: 'i1', originalName: 'a', extension: '.png', archiveName: 'a_1.png' },
       ]);
-      expect(m.excluded.posts).toEqual([{ postId: 'p2' }, { postId: 'p3' }]);
-      expect(m.excluded.assets.map((it) => `${it.kind}:${it.originalName}${it.extension}`)).toEqual([
-        'image:a.JPG',
-        'file:a.pdf',
-        'cover:cover.png',
+      expect(m.posts[0].excluded.map((it) => `${it.kind}:${it.assetId}:${it.originalName}${it.extension}`)).toEqual([
+        'image:i2:a.JPG',
+        'file:f1:a.pdf',
+        'cover:undefined:cover.png',
       ]);
+      expect(m.excludedPosts).toEqual([{ postId: 'p2' }, { postId: 'p3' }]);
     });
 
     test('除外したアセットの記述に archiveName は付けない (ZIP に存在しないため)', () => {
-      expect(manifestOf().excluded.assets.every((it) => it.archiveName === undefined)).toBe(true);
+      expect(manifestOf().posts[0].excluded.every((it) => it.archiveName === undefined)).toBe(true);
     });
 
     test('URL は残さない', () => {
@@ -973,8 +1014,8 @@ describe('projection', () => {
         extensions: new Set(['.png', '.jpg', '.pdf']),
         includeCover: true,
       }).manifest;
-      expect(m.excluded.posts).toEqual([{ postId: 'p2' }, { postId: 'p3' }]);
-      expect(m.excluded.assets).toEqual([]);
+      expect(m.excludedPosts).toEqual([{ postId: 'p2' }, { postId: 'p3' }]);
+      expect(m.posts[0].excluded).toEqual([]);
     });
 
     test('選択条件を informationText に混ぜない', () => {
@@ -985,6 +1026,13 @@ describe('projection', () => {
       });
       expect(json.posts[0].informationText).not.toContain('selection');
     });
+  });
+
+  test('返り値の tags を書き換えても入力に逆流しない', () => {
+    const d = build();
+    const first = project(d, d.selectAll());
+    first.posts[0].tags.push('追加');
+    expect(project(d, d.selectAll()).posts[0].tags).toEqual(['tagA']);
   });
 
   test('添付もカバーも 0 件になる選択も通す (許否は利用側の UI が決める)', () => {
@@ -1037,7 +1085,7 @@ describe('isDownloadJsonObj', () => {
     tags: ['tag1'],
     fileCount: 1,
     postCount: 1,
-    manifest: testManifest(),
+    manifest: testManifest(['post1']),
   });
 
   test('有効な最小オブジェクト → true', () => {
@@ -1098,6 +1146,25 @@ describe('isDownloadJsonObj', () => {
   });
 
   describe('manifest (projection を経た印)', () => {
+    /** createValidObj の投稿 1 件に対応する有効な manifest */
+    const validManifest = (): DownloadManifest => ({
+      ...testManifest(['post1']),
+      posts: [
+        {
+          postId: 'p1',
+          archiveDirectory: 'post1',
+          included: [
+            { kind: 'image', assetId: 'i1', originalName: 'file', extension: '.png', archiveName: 'file.png' },
+          ],
+          excluded: [{ kind: 'cover', originalName: 'cover', extension: '.png' }],
+        },
+      ],
+    });
+
+    test('有効な manifest → true', () => {
+      expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: validManifest() })).toBe(true);
+    });
+
     test('manifest が無い → false (projection を経ていない入力を ZIP にしない)', () => {
       const { manifest: _manifest, ...withoutManifest } = createValidObj();
       expect(helper.isDownloadJsonObj(withoutManifest)).toBe(false);
@@ -1106,14 +1173,58 @@ describe('isDownloadJsonObj', () => {
     test.each([
       ['schemaVersion が違う', { schemaVersion: 2 }],
       ['creatorId が文字列でない', { creatorId: 1 }],
+      // 別の収集結果の manifest を貼り付けた入力を通さない
+      ['creatorId が id と一致しない', { creatorId: 'another-creator' }],
       ['generatedAt が文字列でない', { generatedAt: 1 }],
       ['selection が無い', { selection: undefined }],
+      [
+        'selection.postIds に文字列でない要素がある',
+        { selection: { postIds: [42], extensions: [], includeCover: true } },
+      ],
+      [
+        'selection.extensions に文字列でない要素がある',
+        { selection: { postIds: [], extensions: [null], includeCover: true } },
+      ],
       ['selection.includeCover が真偽値でない', { selection: { postIds: [], extensions: [], includeCover: 'yes' } }],
-      ['included が無い', { included: undefined }],
-      ['excluded.assets が配列でない', { excluded: { posts: [], assets: {} } }],
+      ['posts が配列でない', { posts: {} }],
+      ['excludedPosts が配列でない', { excludedPosts: {} }],
+      ['excludedPosts の要素に postId が無い', { excludedPosts: [{}] }],
     ])('%s → false', (_label, override) => {
-      const obj = { ...createValidObj(), manifest: { ...testManifest(), ...override } };
+      const obj = { ...createValidObj(), manifest: { ...validManifest(), ...override } };
       expect(helper.isDownloadJsonObj(obj)).toBe(false);
+    });
+
+    /** manifest.posts[0] を差し替えた入力を作る */
+    const withPost = (override: Record<string, unknown>) => ({
+      ...createValidObj(),
+      manifest: { ...validManifest(), posts: [{ ...validManifest().posts[0], ...override }] },
+    });
+
+    test.each([
+      ['postId が無い', { postId: undefined }],
+      ['archiveDirectory が投稿の encodedName に無い', { archiveDirectory: 'unknown' }],
+      ['included が配列でない', { included: {} }],
+      [
+        'included の要素に archiveName が無い',
+        { included: [{ kind: 'image', assetId: 'i1', originalName: 'f', extension: '.png' }] },
+      ],
+      [
+        'excluded の要素に archiveName がある',
+        { excluded: [{ kind: 'cover', originalName: 'c', extension: '.png', archiveName: 'c.png' }] },
+      ],
+      ['kind が既知の値でない', { excluded: [{ kind: 'audio', assetId: 'a1', originalName: 'c', extension: '.mp3' }] }],
+      [
+        'cover なのに assetId を持つ',
+        { excluded: [{ kind: 'cover', assetId: 'x', originalName: 'c', extension: '.png' }] },
+      ],
+      ['cover 以外なのに assetId を持たない', { excluded: [{ kind: 'image', originalName: 'c', extension: '.png' }] }],
+    ])('posts の %s → false', (_label, override) => {
+      expect(helper.isDownloadJsonObj(withPost(override))).toBe(false);
+    });
+
+    test('manifest の投稿数が JSON の投稿数と合わない → false', () => {
+      const manifest = { ...validManifest(), posts: [] };
+      expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest })).toBe(false);
     });
   });
 
@@ -2827,7 +2938,7 @@ describe('DownloadHelper.downloadZip', () => {
       tags: [],
       fileCount: 2,
       postCount: 2,
-      manifest: testManifest(),
+      manifest: testManifest(['post1', 'post2']),
       ...overrides,
     };
   }
@@ -3251,7 +3362,7 @@ describe('DownloadHelper.downloadZip', () => {
         tags: [],
         fileCount: 2,
         postCount: 2,
-        manifest: testManifest(),
+        manifest: testManifest(['post1', 'post2']),
       };
     }
 
@@ -3374,7 +3485,7 @@ describe('DownloadHelper.downloadZip', () => {
         tags: [],
         fileCount: 2,
         postCount: 1,
-        manifest: testManifest(),
+        manifest: testManifest(['post1']),
       };
       const controller = new AbortController();
       const calledUrls: string[] = [];

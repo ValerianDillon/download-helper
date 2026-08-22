@@ -142,17 +142,26 @@ export type AssetCardFragment = {
   readonly originalName: string;
   /** 元の拡張子 (先頭ドットを含む、または空文字列)。プレースホルダーに出す */
   readonly extension: string;
-  readonly body: readonly HtmlFragment[];
+  readonly body: readonly CardBodyFragment[];
 };
+
+/**
+ * カードの中身の断片
+ *
+ * `assetRef` はアセットへの参照で、finalize 時に allocator が割り当てた archive path へ解決する。
+ * 参照はカードの中にしか置けない。カードの外に置けると、カードごとプレースホルダーへ差し替えても
+ * 参照だけが残り、除外したはずのアセットを指す `src` / `href` が出力に出てしまう。
+ * 参照先はそのカードの `key` に限る (`setHtml` が検証する)。
+ */
+export type CardBodyFragment = string | { readonly assetRef: AssetKey };
 
 /**
  * 投稿 HTML の断片
  *
- * 文字列はそのまま出力する。`assetRef` はアセットへの参照で、finalize 時に
- * allocator が割り当てた archive path へ解決する。`assetCard` はアセット 1 件のカード全体で、
+ * 文字列はそのまま出力する。`assetCard` はアセット 1 件のカード全体で、
  * 選択条件で除外されたときにプレースホルダーへ差し替える単位になる。
  */
-export type HtmlFragment = string | { readonly assetRef: AssetKey } | { readonly assetCard: AssetCardFragment };
+export type HtmlFragment = string | { readonly assetCard: AssetCardFragment };
 
 /**
  * 選択条件
@@ -179,14 +188,32 @@ export function normalizeExtension(extension: string): string {
   return extension.toLowerCase();
 }
 
-/** `download-manifest.json` に書き出すアセットの記述 */
+/**
+ * `download-manifest.json` に書き出すアセットの記述
+ *
+ * `assetId` はカバー以外に付く (カバーは投稿に高々 1 つで id を持たない)。
+ * `kind` と併せてアセットを投稿内で一意に指す
+ */
 export type ManifestAsset = {
-  readonly postId: string;
   readonly kind: AssetKind;
+  readonly assetId?: string;
   readonly originalName: string;
   readonly extension: string;
   /** 含めたアセットにだけ付く。除外したアセットは ZIP に存在しないので持たない */
   readonly archiveName?: string;
+};
+
+/**
+ * manifest に記録する投稿 1 件分
+ *
+ * アセットは投稿にネストする。postId の一意性を保証しない以上、アセットを平坦に並べると
+ * 同じ postId の投稿が 2 件あったときにどちらのものか分からなくなる
+ */
+export type ManifestPost = {
+  readonly postId: string;
+  readonly archiveDirectory: string;
+  readonly included: readonly ManifestAsset[];
+  readonly excluded: readonly ManifestAsset[];
 };
 
 /**
@@ -206,14 +233,10 @@ export type DownloadManifest = {
     readonly extensions: readonly string[];
     readonly includeCover: boolean;
   };
-  readonly included: {
-    readonly posts: readonly { readonly postId: string; readonly archiveDirectory: string }[];
-    readonly assets: readonly ManifestAsset[];
-  };
-  readonly excluded: {
-    readonly posts: readonly { readonly postId: string }[];
-    readonly assets: readonly ManifestAsset[];
-  };
+  /** 選択された投稿。収集順。含めた / 除外したアセットをこの下に持つ */
+  readonly posts: readonly ManifestPost[];
+  /** 投稿ごと除外された投稿。アセットは個別に載せない (投稿単位で除外と分かる) */
+  readonly excludedPosts: readonly { readonly postId: string }[];
 };
 
 /**
@@ -727,10 +750,8 @@ export class DownloadObject {
     assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
 
     const posts: DownloadJsonObj['posts'] = [];
-    const includedPosts: { postId: string; archiveDirectory: string }[] = [];
+    const manifestPosts: ManifestPost[] = [];
     const excludedPosts: { postId: string }[] = [];
-    const includedAssets: ManifestAsset[] = [];
-    const excludedAssets: ManifestAsset[] = [];
     const presentTags = new Set<string>();
     let fileCount = 0;
 
@@ -741,49 +762,43 @@ export class DownloadObject {
         return;
       }
       const includedKeys = new Set<string>();
-      const describe = (file: FileObj): ManifestAsset => ({
-        postId: postObj.postId,
-        kind: file.key.kind,
-        originalName: file.name,
-        extension: file.extension,
-      });
       for (const file of postObj.files) {
         // 拡張子の選択は post.files に対するものであり、カバーには適用しない
         if (selection.extensions.has(normalizeExtension(file.extension))) {
           includedKeys.add(assetKeyToString(file.key));
-        } else {
-          excludedAssets.push(describe(file));
         }
       }
-      if (postObj.cover) {
-        if (selection.includeCover) {
-          includedKeys.add('cover');
-        } else {
-          excludedAssets.push(describe(postObj.cover));
-        }
+      if (postObj.cover && selection.includeCover) {
+        includedKeys.add('cover');
       }
 
       const projected = this.orderedPosts[index].projectPost(directoryNames[index], this.allocator, includedKeys);
       posts.push(projected.json);
-      includedPosts.push({ postId: postObj.postId, archiveDirectory: directoryNames[index] });
       for (const tag of postObj.tags) {
         presentTags.add(tag);
       }
       // fileCount は選択された post.files の数。カバーは含めない (従来の countFile と同じ意味論)
       fileCount += projected.json.files.length;
-      for (const file of postObj.files) {
-        if (includedKeys.has(assetKeyToString(file.key))) {
-          includedAssets.push({
-            ...describe(file),
-            archiveName: projected.archiveNames.get(assetKeyToString(file.key)),
-          });
+
+      const included: ManifestAsset[] = [];
+      const excluded: ManifestAsset[] = [];
+      const assets: FileObj[] = postObj.cover ? [...postObj.files, postObj.cover] : [...postObj.files];
+      for (const file of assets) {
+        const key = assetKeyToString(file.key);
+        const describe: ManifestAsset = {
+          kind: file.key.kind,
+          assetId: file.key.kind === 'cover' ? undefined : file.key.assetId,
+          originalName: file.name,
+          extension: file.extension,
+        };
+        if (includedKeys.has(key)) {
+          included.push({ ...describe, archiveName: projected.archiveNames.get(key) });
+        } else {
+          excluded.push(describe);
         }
       }
-      if (postObj.cover && includedKeys.has('cover')) {
-        includedAssets.push({ ...describe(postObj.cover), archiveName: projected.archiveNames.get('cover') });
-      }
+      manifestPosts.push({ postId: postObj.postId, archiveDirectory: directoryNames[index], included, excluded });
     });
-
     const downloadJson: DownloadJsonObj = {
       posts,
       id: this.downloadObj.id,
@@ -801,8 +816,8 @@ export class DownloadObject {
           extensions: [...selection.extensions].sort(),
           includeCover: selection.includeCover,
         },
-        included: { posts: includedPosts, assets: includedAssets },
-        excluded: { posts: excludedPosts, assets: excludedAssets },
+        posts: manifestPosts,
+        excludedPosts,
       },
     };
     return downloadJson;
@@ -839,19 +854,27 @@ export class DownloadObject {
  */
 function freezeFragment(fragment: HtmlFragment): HtmlFragment {
   if (typeof fragment === 'string') return fragment;
-  if ('assetCard' in fragment) {
-    const assetCard = fragment.assetCard;
-    return Object.freeze({
-      assetCard: Object.freeze({
-        key: freezeAssetKey(assetCard.key),
-        kind: assetCard.kind,
-        originalName: assetCard.originalName,
-        extension: assetCard.extension,
-        body: Object.freeze(assetCard.body.map((it) => freezeFragment(it))),
-      }),
-    });
-  }
-  return Object.freeze({ assetRef: freezeAssetKey(fragment.assetRef) });
+  const assetCard = fragment.assetCard;
+  const cardKey = assetKeyToString(assetCard.key);
+  const body = assetCard.body.map((it) => {
+    if (typeof it === 'string') return it;
+    // 別のアセットを指す参照は、カードごと差し替えても残ってしまう
+    if (assetKeyToString(it.assetRef) !== cardKey) {
+      throw new Error(
+        `カードの中の参照が別のアセットを指しています: ${assetKeyToString(it.assetRef)} (card: ${cardKey})`,
+      );
+    }
+    return Object.freeze({ assetRef: freezeAssetKey(it.assetRef) });
+  });
+  return Object.freeze({
+    assetCard: Object.freeze({
+      key: freezeAssetKey(assetCard.key),
+      kind: assetCard.kind,
+      originalName: assetCard.originalName,
+      extension: assetCard.extension,
+      body: Object.freeze(body),
+    }),
+  });
 }
 
 /**
@@ -869,7 +892,7 @@ export type ProjectedPost = {
  * @param fileObject 対象のアセット
  * @param body カードの中身
  */
-function card(fileObject: FileObject, body: HtmlFragment[]): HtmlFragment[] {
+function card(fileObject: FileObject, body: CardBodyFragment[]): HtmlFragment[] {
   return [
     {
       assetCard: {
@@ -980,7 +1003,7 @@ export class PostObject {
   }
 
   getAudioLinkTag(fileObject: FileObject): HtmlFragment[] {
-    const ref: HtmlFragment = { assetRef: fileObject.getKey() };
+    const ref: CardBodyFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
     return card(fileObject, [
       `<a class="hl" href="`,
@@ -1004,7 +1027,7 @@ export class PostObject {
   }
 
   getFileLinkTag(fileObject: FileObject): HtmlFragment[] {
-    const ref: HtmlFragment = { assetRef: fileObject.getKey() };
+    const ref: CardBodyFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
     return card(fileObject, [
       `<a class="hl" href="`,
@@ -1019,7 +1042,7 @@ export class PostObject {
   }
 
   getImageLinkTag(fileObject: FileObject): HtmlFragment[] {
-    const ref: HtmlFragment = { assetRef: fileObject.getKey() };
+    const ref: CardBodyFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
     return card(fileObject, [
       `<a class="hl" href="`,
@@ -1031,7 +1054,7 @@ export class PostObject {
   }
 
   getVideoLinkTag(fileObject: FileObject): HtmlFragment[] {
-    const ref: HtmlFragment = { assetRef: fileObject.getKey() };
+    const ref: CardBodyFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
     return card(fileObject, [
       `<a class="hl" href="`,
@@ -1075,6 +1098,7 @@ export class PostObject {
       this.postObj.cover && includedKeys.has('cover')
         ? { url: this.postObj.cover.url, name: allocation.coverArchiveName as string }
         : undefined;
+    this.assertHtmlReferencesKnownAssets(pathByKey);
     return {
       json: {
         originalName: this.postObj.name,
@@ -1089,7 +1113,8 @@ export class PostObject {
             const file = fileByKey.get(assetKeyToString(key))!;
             return { url: file.url, originalName: file.name, encodedName: archiveName };
           }),
-        tags: this.postObj.tags,
+        // 戻り値の変更が入力へ逆流しないよう複製する (projection は純粋変換として公開する)
+        tags: [...this.postObj.tags],
         cover,
         publishedDatetime: this.postObj.publishedDatetime,
       },
@@ -1139,6 +1164,23 @@ export class PostObject {
   }
 
   /**
+   * HTML のカードが、投稿が実際に持つアセットだけを参照していることを確かめる。
+   *
+   * 参照先が無いカードを除外扱いにしてプレースホルダーで描くと、「選択条件で外した」のか
+   * 「アセットを登録し忘れた」のか区別できなくなる。後者は実装の誤りなので止める
+   * @param pathByKey 投稿の全アセット (カバーを含む) の archive 名
+   */
+  private assertHtmlReferencesKnownAssets(pathByKey: ReadonlyMap<string, string>): void {
+    for (const fragment of this.postObj.html) {
+      if (typeof fragment === 'string') continue;
+      const key = assetKeyToString(fragment.assetCard.key);
+      if (!pathByKey.has(key)) {
+        throw new Error(`HTML が投稿に存在しないアセットを参照しています: ${key}`);
+      }
+    }
+  }
+
+  /**
    * 断片列を HTML 文字列に解決する。
    *
    * 選択条件で除外されたアセットのカードはプレースホルダーに差し替える。カードごと消さないのは、
@@ -1148,16 +1190,10 @@ export class PostObject {
    * @param includedKeys 出力に含めるアセット
    */
   private resolveHtml(pathByKey: ReadonlyMap<string, string>, includedKeys: ReadonlySet<string>): string {
-    const render = (fragments: readonly HtmlFragment[]): string =>
+    const renderBody = (fragments: readonly CardBodyFragment[]): string =>
       fragments
         .map((fragment) => {
           if (typeof fragment === 'string') return fragment;
-          if ('assetCard' in fragment) {
-            const assetCard = fragment.assetCard;
-            return includedKeys.has(assetKeyToString(assetCard.key))
-              ? render(assetCard.body)
-              : this.renderExcludedAsset(assetCard);
-          }
           const archiveName = pathByKey.get(assetKeyToString(fragment.assetRef));
           if (archiveName === undefined) {
             throw new Error(`archive path is not allocated: ${assetKeyToString(fragment.assetRef)}`);
@@ -1165,7 +1201,15 @@ export class PostObject {
           return this.utils.escapeHtml(`./${this.utils.encodeURI(archiveName)}`);
         })
         .join('');
-    return render(this.postObj.html);
+    return this.postObj.html
+      .map((fragment) => {
+        if (typeof fragment === 'string') return fragment;
+        const assetCard = fragment.assetCard;
+        return includedKeys.has(assetKeyToString(assetCard.key))
+          ? renderBody(assetCard.body)
+          : this.renderExcludedAsset(assetCard);
+      })
+      .join('');
   }
 
   /**
@@ -2040,27 +2084,69 @@ function assertValidZipEntryNameByteLength(
  * @param value 検証対象
  * @internal
  */
-function isDownloadManifest(value: unknown): value is DownloadManifest {
+function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>): value is DownloadManifest {
   if (typeof value !== 'object' || value === null) return false;
   const m = value as Record<string, unknown>;
   if (m.schemaVersion !== 1) return false;
-  if (typeof m.creatorId !== 'string' || typeof m.generatedAt !== 'string') return false;
+  if (typeof m.generatedAt !== 'string') return false;
+  // creatorId は id と同じであることまで見る。別の収集結果の manifest を貼り付けた入力を通さない
+  if (typeof m.creatorId !== 'string' || m.creatorId !== downloadObj.id) return false;
+
   const selection = m.selection as Record<string, unknown> | undefined;
   if (
     typeof selection !== 'object' ||
     selection === null ||
-    !Array.isArray(selection.postIds) ||
-    !Array.isArray(selection.extensions) ||
+    !isStringArray(selection.postIds) ||
+    !isStringArray(selection.extensions) ||
     typeof selection.includeCover !== 'boolean'
   ) {
     return false;
   }
-  const hasGroups = (group: unknown): boolean => {
-    if (typeof group !== 'object' || group === null) return false;
-    const g = group as Record<string, unknown>;
-    return Array.isArray(g.posts) && Array.isArray(g.assets);
-  };
-  return hasGroups(m.included) && hasGroups(m.excluded);
+
+  if (!Array.isArray(m.posts) || !Array.isArray(m.excludedPosts)) return false;
+  if (!m.excludedPosts.every((it) => isRecordWithStringKeys(it, ['postId']))) return false;
+
+  // manifest の投稿と JSON の投稿ディレクトリが対応していることまで見る。対応しない manifest は
+  // 「この ZIP に何を入れたか」の記録として成立しない
+  const encodedNames = Array.isArray(downloadObj.posts)
+    ? (downloadObj.posts as Record<string, unknown>[]).map((it) => it?.encodedName)
+    : [];
+  if (m.posts.length !== encodedNames.length) return false;
+  return m.posts.every((post: unknown) => {
+    if (!isRecordWithStringKeys(post, ['postId', 'archiveDirectory'])) return false;
+    const p = post as Record<string, unknown>;
+    if (!encodedNames.includes(p.archiveDirectory)) return false;
+    return isManifestAssetArray(p.included, true) && isManifestAssetArray(p.excluded, false);
+  });
+}
+
+/** 文字列だけの配列か */
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((it) => typeof it === 'string');
+}
+
+/** 指定のキーがすべて文字列であるオブジェクトか */
+function isRecordWithStringKeys(value: unknown, keys: string[]): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return keys.every((key) => typeof record[key] === 'string');
+}
+
+/**
+ * ManifestAsset の配列か
+ * @param value 検証対象
+ * @param requireArchiveName 含めたアセットなら archiveName を必須にする (除外なら持たないことを求める)
+ */
+function isManifestAssetArray(value: unknown, requireArchiveName: boolean): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.every((it: unknown) => {
+    if (!isRecordWithStringKeys(it, ['originalName', 'extension'])) return false;
+    const asset = it as Record<string, unknown>;
+    if (asset.kind !== 'cover' && asset.kind !== 'image' && asset.kind !== 'file') return false;
+    // カバーは id を持たない。それ以外は文字列の assetId を持つ
+    if (asset.kind === 'cover' ? asset.assetId !== undefined : typeof asset.assetId !== 'string') return false;
+    return requireArchiveName ? typeof asset.archiveName === 'string' : asset.archiveName === undefined;
+  });
 }
 
 /**
@@ -2443,7 +2529,7 @@ export class DownloadHelper {
       case !Array.isArray(t.tags):
         console.error('ダウンロード用オブジェクトの型が不正(tagsが配列でない)', t.tags);
         return false;
-      case !isDownloadManifest(t.manifest):
+      case !isDownloadManifest(t.manifest, t):
         // projection を経ていないオブジェクトはここで弾く。絞り込みを経ずに ZIP にすると、
         // HTML の参照と実際に入るファイルがずれうる
         console.error('ダウンロード用オブジェクトの型が不正(manifestが無いか形式が違う)', t.manifest);
