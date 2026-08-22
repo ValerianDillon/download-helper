@@ -377,8 +377,14 @@ export function createNameKeyedDictionary<T>(): Record<string, T> {
  * 1 投稿分の archive path 割り当て結果
  */
 export type AllocatedAssetPaths = {
-  /** DownloadJsonObj の files に出す順序で並べた、添付ファイルと割り当て名の組 */
-  files: { file: FileObj; archiveName: string }[];
+  /**
+   * DownloadJsonObj の files に出す順序で並べた、アセットの鍵と割り当て名の組。
+   *
+   * `FileObj` そのものではなく鍵を返させる。allocator が決めてよいのは名前と並び順だけで、
+   * URL や元ファイル名は投稿が持つ値をそのまま出す。`FileObj` を返せる形にすると、
+   * 同じ鍵のまま中身を差し替えたオブジェクトを返して出力を書き換えられる
+   */
+  files: { key: AssetKey; archiveName: string }[];
   /** カバー画像の割り当て名。カバーが無ければ undefined */
   coverArchiveName?: string;
 };
@@ -389,16 +395,19 @@ export type AllocatedAssetPaths = {
  * 採番規則を知っている場所をここ 1 つに集約する。HTML の生成も JSON の files も
  * この結果だけを参照するので、規則を差し替えても両者がずれない。
  *
- * 実装が満たすべき契約は次のとおりで、`stringify()` (finalize) が破りを検出して例外にする。
- * 黙って通すと、ZIP に入っているのに HTML から参照されないファイルや、参照先が別のアセットに
- * なったリンクが出力に残る。
+ * `stringify()` (finalize) が検出して例外にする契約は、1 回の呼び出しの戻り値だけで判定できる
+ * 次の構造的条件である。黙って通すと、ZIP に入っているのに HTML から参照されないファイルや、
+ * 参照先が別のアセットになったリンクが出力に残る。
+ *
+ * - `allocatePostDirectoryNames` は `posts` と同じ長さの、すべて文字列の配列を返す
+ * - `allocateAssetPaths` は `post.files` の各アセットの鍵をちょうど 1 回返す (取りこぼしも重複も、
+ *   その投稿に属さない鍵の混入も許さない)
+ * - `post.cover` があるときに限り `coverArchiveName` を返す
+ *
+ * 次の 2 つは戻り値だけでは判定できないので検出しない。実装者が守る契約である。
  *
  * - **決定的であること。** 同じ入力に対して同じ結果を返し、呼び出し回数に依存する状態
  *   (連番カウンタなど) を持たない。`stringify()` は呼ばれるたびに allocator を再実行する
- * - `allocatePostDirectoryNames` は `posts` と同じ長さ・同じ順序の配列を返す
- * - `allocateAssetPaths` は `post.files` の各アセットをちょうど 1 回返す (取りこぼしも重複も、
- *   その投稿に属さない `FileObj` の混入も許さない)
- * - `post.cover` があるときに限り `coverArchiveName` を返す
  * - 引数の `posts` / `post` を変更しない
  *
  * 初回の割り当てを `DownloadObject` 側で覚え込む方法は採らない。投稿やアセットを追加してから
@@ -469,7 +478,10 @@ export function createLegacyArchivePathAllocator(utils: DownloadUtils): ArchiveP
       for (const [key, group] of Object.entries(groups)) {
         group.forEach((file, indexInGroup) => {
           const extension = file.extension ? utils.encodeFileName(file.extension) : '';
-          files.push({ file, archiveName: utils.getFileName(key, extension, group.length, indexInGroup, true) });
+          files.push({
+            key: file.key,
+            archiveName: utils.getFileName(key, extension, group.length, indexInGroup, true),
+          });
         });
       }
       const cover = post.cover;
@@ -481,6 +493,26 @@ export function createLegacyArchivePathAllocator(utils: DownloadUtils): ArchiveP
       };
     },
   };
+}
+
+/**
+ * allocator が返した投稿ディレクトリ名が投稿と 1 対 1 に対応していることを確かめる。
+ * 足りない要素や穴があると encodedName の無い投稿が JSON に出て、ZIP のパスが壊れる
+ * @param names 割り当て結果
+ * @param postCount 投稿数
+ * @internal
+ */
+function assertPostDirectoryNames(names: string[], postCount: number): void {
+  if (names.length !== postCount) {
+    throw new Error(
+      `allocator が返した投稿ディレクトリ名の数が投稿と一致しません (期待 ${postCount}, 実際 ${names.length})`,
+    );
+  }
+  for (let index = 0; index < postCount; index++) {
+    if (typeof names[index] !== 'string') {
+      throw new Error(`allocator が返した投稿ディレクトリ名が文字列ではありません (index ${index})`);
+    }
+  }
 }
 
 /**
@@ -509,6 +541,7 @@ export class DownloadObject {
     // archive path はここ (finalize) で初めて確定する。投稿ディレクトリ名は投稿をまたぐ採番なので
     // 全投稿を渡して一度に割り当てる
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
+    assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length);
     const downloadJson: DownloadJsonObj = {
       posts: this.orderedPosts.map((it, index) => it.toJsonObj(directoryNames[index], this.allocator)),
       id: this.downloadObj.id,
@@ -723,10 +756,11 @@ export class PostObject {
    */
   toJsonObj(directoryName: string, allocator: ArchivePathAllocator): DownloadJsonObj['posts'][number] {
     const allocation = allocator.allocateAssetPaths(this.postObj);
-    this.assertAllocationCoversAssets(allocation);
+    const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it] as const));
+    this.assertAllocationCoversAssets(allocation, fileByKey);
     const pathByKey = new Map<string, string>();
-    for (const { file, archiveName } of allocation.files) {
-      pathByKey.set(assetKeyToString(file.key), archiveName);
+    for (const { key, archiveName } of allocation.files) {
+      pathByKey.set(assetKeyToString(key), archiveName);
     }
     const cover = this.postObj.cover
       ? { url: this.postObj.cover.url, name: allocation.coverArchiveName as string }
@@ -739,11 +773,12 @@ export class PostObject {
       encodedName: directoryName,
       informationText: this.postObj.info,
       htmlText: this.resolveHtml(pathByKey),
-      files: allocation.files.map(({ file, archiveName }) => ({
-        url: file.url,
-        originalName: file.name,
-        encodedName: archiveName,
-      })),
+      // URL と元ファイル名は投稿が持つ値から取る。allocator が決めるのは名前と並び順だけ
+      files: allocation.files.map(({ key, archiveName }) => {
+        // biome-ignore lint/style/noNonNullAssertion: assertAllocationCoversAssets が存在を保証する
+        const file = fileByKey.get(assetKeyToString(key))!;
+        return { url: file.url, originalName: file.name, encodedName: archiveName };
+      }),
       tags: this.postObj.tags,
       cover,
       publishedDatetime: this.postObj.publishedDatetime,
@@ -756,18 +791,20 @@ export class PostObject {
    * 取りこぼしはファイルの欠落、重複や余分は参照先の取り違えになるが、どちらも出力を見ただけでは
    * 気付けない (ZIP は生成され、HTML も壊れて見えない)。finalize で止める。
    * @param allocation 割り当て結果
+   * @param fileByKey 投稿が持つアセットを鍵で引ける形にしたもの
    */
-  private assertAllocationCoversAssets(allocation: AllocatedAssetPaths): void {
-    const expected = new Set(this.postObj.files.map((it) => assetKeyToString(it.key)));
+  private assertAllocationCoversAssets(allocation: AllocatedAssetPaths, fileByKey: ReadonlyMap<string, FileObj>): void {
+    const expected = new Set(fileByKey.keys());
     if (allocation.files.length !== this.postObj.files.length) {
       throw new Error(
         `allocator が返したアセット数が投稿と一致しません (期待 ${this.postObj.files.length}, 実際 ${allocation.files.length})`,
       );
     }
-    for (const { file } of allocation.files) {
-      const key = assetKeyToString(file.key);
-      if (!expected.delete(key)) {
-        throw new Error(`allocator が投稿に属さないアセット、または重複したアセットを返しました: ${key}`);
+    for (const { key } of allocation.files) {
+      if (!expected.delete(assetKeyToString(key))) {
+        throw new Error(
+          `allocator が投稿に属さないアセット、または重複したアセットを返しました: ${assetKeyToString(key)}`,
+        );
       }
     }
     if ((this.postObj.cover !== undefined) !== (allocation.coverArchiveName !== undefined)) {

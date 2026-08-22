@@ -463,7 +463,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       const positional: ArchivePathAllocator = {
         allocatePostDirectoryNames: (posts) => posts.map((_, index) => `posts${index}`),
         allocateAssetPaths: (post) => ({
-          files: post.files.map((file, index) => ({ file, archiveName: `asset${index}.bin` })),
+          files: post.files.map((file, index) => ({ key: file.key, archiveName: `asset${index}.bin` })),
           coverArchiveName: post.cover ? 'coverAsset.bin' : undefined,
         }),
       };
@@ -545,6 +545,26 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     expect(json.tags).toEqual(['A', 'B', 'C']);
   });
 
+  // allocator が FileObj を返せると、同じ鍵のまま url / name を差し替えたオブジェクトで
+  // 出力を書き換えられる。鍵と名前だけを返させ、値は投稿が持つものから取る
+  test('allocator は archive 名と並び順だけを決め、URL と元ファイル名は投稿の値が出る', () => {
+    const reversed: ArchivePathAllocator = {
+      allocatePostDirectoryNames: (posts) => posts.map((_, index) => `post${index}`),
+      allocateAssetPaths: (post) => ({
+        files: [...post.files].reverse().map((file, index) => ({ key: file.key, archiveName: `x${index}.bin` })),
+      }),
+    };
+    const json = build((d) => {
+      const post = d.addPost('post');
+      post.addFile({ key: imageKey('i1'), name: 'first', extension: 'png', url: 'url1' });
+      post.addFile({ key: imageKey('i2'), name: 'second', extension: 'png', url: 'url2' });
+    }, reversed);
+    expect(json.posts[0].files).toEqual([
+      { url: 'url2', originalName: 'second', encodedName: 'x0.bin' },
+      { url: 'url1', originalName: 'first', encodedName: 'x1.bin' },
+    ]);
+  });
+
   test('cover の AssetKey を addFile に渡すと例外になる', () => {
     const downloadObject = new DownloadObject('creator', utils);
     const post = downloadObject.addPost('post');
@@ -588,6 +608,30 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
           brokenAllocator((a) => ({ ...a, files: [a.files[0], a.files[0]] })),
         ),
       ).toThrow('allocator が投稿に属さないアセット、または重複したアセットを返しました');
+    });
+
+    test('投稿ディレクトリ名の数が投稿と合わないと例外になる', () => {
+      const short: ArchivePathAllocator = {
+        allocatePostDirectoryNames: () => [],
+        allocateAssetPaths: () => ({ files: [] }),
+      };
+      expect(() =>
+        build((d) => {
+          d.addPost('post');
+        }, short),
+      ).toThrow('allocator が返した投稿ディレクトリ名の数が投稿と一致しません');
+    });
+
+    test('投稿ディレクトリ名に文字列でない要素があると例外になる', () => {
+      const holed: ArchivePathAllocator = {
+        allocatePostDirectoryNames: (posts) => new Array<string>(posts.length),
+        allocateAssetPaths: () => ({ files: [] }),
+      };
+      expect(() =>
+        build((d) => {
+          d.addPost('post');
+        }, holed),
+      ).toThrow('allocator が返した投稿ディレクトリ名が文字列ではありません');
     });
 
     test('カバーのある投稿に coverArchiveName を返さないと例外になる', () => {

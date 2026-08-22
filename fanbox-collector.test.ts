@@ -796,7 +796,7 @@ describe('addByPostInfo - 内部表現に保持する情報', () => {
       allocateAssetPaths: (post) => {
         captured.push(post);
         return {
-          files: post.files.map((file, index) => ({ file, archiveName: `asset${index}.bin` })),
+          files: post.files.map((file, index) => ({ key: file.key, archiveName: `asset${index}.bin` })),
           coverArchiveName: post.cover ? 'cover.bin' : undefined,
         };
       },

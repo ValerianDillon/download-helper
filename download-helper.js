@@ -141,7 +141,10 @@ export function createLegacyArchivePathAllocator(utils) {
       for (const [key, group] of Object.entries(groups)) {
         group.forEach((file, indexInGroup) => {
           const extension = file.extension ? utils.encodeFileName(file.extension) : "";
-          files.push({ file, archiveName: utils.getFileName(key, extension, group.length, indexInGroup, true) });
+          files.push({
+            key: file.key,
+            archiveName: utils.getFileName(key, extension, group.length, indexInGroup, true)
+          });
         });
       }
       const cover = post.cover;
@@ -151,6 +154,16 @@ export function createLegacyArchivePathAllocator(utils) {
       };
     }
   };
+}
+function assertPostDirectoryNames(names, postCount) {
+  if (names.length !== postCount) {
+    throw new Error(`allocator が返した投稿ディレクトリ名の数が投稿と一致しません (期待 ${postCount}, 実際 ${names.length})`);
+  }
+  for (let index = 0;index < postCount; index++) {
+    if (typeof names[index] !== "string") {
+      throw new Error(`allocator が返した投稿ディレクトリ名が文字列ではありません (index ${index})`);
+    }
+  }
 }
 
 export class DownloadObject {
@@ -167,6 +180,7 @@ export class DownloadObject {
   }
   stringify() {
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
+    assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length);
     const downloadJson = {
       posts: this.orderedPosts.map((it, index) => it.toJsonObj(directoryNames[index], this.allocator)),
       id: this.downloadObj.id,
@@ -335,10 +349,11 @@ export class PostObject {
   }
   toJsonObj(directoryName, allocator) {
     const allocation = allocator.allocateAssetPaths(this.postObj);
-    this.assertAllocationCoversAssets(allocation);
+    const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it]));
+    this.assertAllocationCoversAssets(allocation, fileByKey);
     const pathByKey = new Map;
-    for (const { file, archiveName } of allocation.files) {
-      pathByKey.set(assetKeyToString(file.key), archiveName);
+    for (const { key, archiveName } of allocation.files) {
+      pathByKey.set(assetKeyToString(key), archiveName);
     }
     const cover = this.postObj.cover ? { url: this.postObj.cover.url, name: allocation.coverArchiveName } : undefined;
     if (cover) {
@@ -349,25 +364,23 @@ export class PostObject {
       encodedName: directoryName,
       informationText: this.postObj.info,
       htmlText: this.resolveHtml(pathByKey),
-      files: allocation.files.map(({ file, archiveName }) => ({
-        url: file.url,
-        originalName: file.name,
-        encodedName: archiveName
-      })),
+      files: allocation.files.map(({ key, archiveName }) => {
+        const file = fileByKey.get(assetKeyToString(key));
+        return { url: file.url, originalName: file.name, encodedName: archiveName };
+      }),
       tags: this.postObj.tags,
       cover,
       publishedDatetime: this.postObj.publishedDatetime
     };
   }
-  assertAllocationCoversAssets(allocation) {
-    const expected = new Set(this.postObj.files.map((it) => assetKeyToString(it.key)));
+  assertAllocationCoversAssets(allocation, fileByKey) {
+    const expected = new Set(fileByKey.keys());
     if (allocation.files.length !== this.postObj.files.length) {
       throw new Error(`allocator が返したアセット数が投稿と一致しません (期待 ${this.postObj.files.length}, 実際 ${allocation.files.length})`);
     }
-    for (const { file } of allocation.files) {
-      const key = assetKeyToString(file.key);
-      if (!expected.delete(key)) {
-        throw new Error(`allocator が投稿に属さないアセット、または重複したアセットを返しました: ${key}`);
+    for (const { key } of allocation.files) {
+      if (!expected.delete(assetKeyToString(key))) {
+        throw new Error(`allocator が投稿に属さないアセット、または重複したアセットを返しました: ${assetKeyToString(key)}`);
       }
     }
     if (this.postObj.cover !== undefined !== (allocation.coverArchiveName !== undefined)) {
