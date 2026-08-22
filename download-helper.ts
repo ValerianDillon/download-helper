@@ -1,25 +1,145 @@
 /**
  * ダウンロード用のObject
+ *
+ * posts は収集順の配列で保持する。archive path の採番に使う「同名グループ」は allocator が
+ * 組み立てる (ArchivePathAllocator)。内部表現がグループ構造を持つと、採番規則を知っている場所が
+ * 増えて HTML とファイルパスの結合を切れないため。
  */
-export type DownloadObj = { posts: Record<string, PostObj[]>; id: string };
+export type DownloadObj = { posts: PostObj[]; id: string };
 
 /**
  * 投稿情報のObject
+ *
+ * files は収集順の配列。html は文字列ではなく断片列で、アセットへの参照は archive path ではなく
+ * AssetKey で持つ (archive path が確定するのは allocator を通す finalize 時であり、
+ * それ以前に文字列として埋め込むと採番の変化に追従できないため)。
  */
 export type PostObj = {
   name: string;
   info: string;
-  files: Record<string, FileObj[]>;
-  html: string;
+  files: BodyFileObj[];
+  html: HtmlFragment[];
   tags: string[];
   cover?: FileObj;
   publishedDatetime?: string;
+  /** FANBOX の投稿タイプ。収集結果の絞り込み条件として利用側が読む (この層では使わない) */
+  postType?: string;
+};
+
+/**
+ * 本文中のアセットの種別
+ *
+ * FANBOX が返すどのコレクション由来か (images / imageMap か、files / fileMap か) を表す。
+ */
+export type BodyAssetKind = 'image' | 'file';
+
+/** アセットの種別。カバー画像は投稿に高々 1 つで、本文中のアセットとは別枠になる */
+export type AssetKind = 'cover' | BodyAssetKind;
+
+/**
+ * 投稿内でアセットを一意に指す鍵
+ *
+ * 配列位置にも encodeFileName 後の名前にも依存しない。位置や名前を identity にすると、
+ * 収集後にアセットを間引いたときに別のアセットを同一視しうる。
+ * カバーは URL 文字列しか持たず id が無いため、投稿内で一意な sentinel として表す。
+ */
+export type BodyAssetKey = { readonly kind: BodyAssetKind; readonly assetId: string };
+
+/** 投稿内でアセットを一意に指す鍵。カバーは投稿に高々 1 つなので sentinel で表す */
+export type AssetKey = { readonly kind: 'cover' } | BodyAssetKey;
+
+/**
+ * AssetKey を凍結した複製にする。
+ *
+ * identity は登録後に変わってはならない。呼び出し側から渡された参照をそのまま持つと、
+ * 追加後に書き換えられて、重複検査を通り抜けた 2 つのアセットが同じ archive path へ
+ * 解決しうる。型の readonly は実行時には効かないので複製して凍結する。
+ */
+function freezeAssetKey<T extends AssetKey>(key: T): T {
+  return Object.freeze(
+    key.kind === 'cover' ? { kind: 'cover' as const } : { kind: key.kind, assetId: key.assetId },
+  ) as T;
+}
+
+/**
+ * AssetKey を Map のキーに使える文字列にする。
+ * kind を前置するので、image と file で同じ assetId が来ても衝突しない。
+ */
+export function assetKeyToString(key: AssetKey): string {
+  return key.kind === 'cover' ? 'cover' : `${key.kind}:${key.assetId}`;
+}
+
+/**
+ * アセットの付随メタデータ
+ *
+ * いずれも API が返さないことがあるため optional。size は file 系にのみ存在し image 系には無く、
+ * width / height はその逆である (実測 2026-08-22)。
+ * 非負の安全な整数でない値は欠落として扱う (decoder が落とす)。
+ */
+export type AssetMetadata = {
+  /** バイト数 (file 系のみ) */
+  readonly size?: number;
+  /** 画像の幅 (image 系のみ) */
+  readonly width?: number;
+  /** 画像の高さ (image 系のみ) */
+  readonly height?: number;
 };
 
 /**
  * ファイル用のObject
+ *
+ * key はこのアセットの identity、metadata は情報表示や絞り込みに使う付随情報で、
+ * どちらも archive path の採番には使わない。
  */
-export type FileObj = { url: string; name: string; extension: string };
+export type FileObj = {
+  url: string;
+  name: string;
+  extension: string;
+  key: AssetKey;
+  metadata: AssetMetadata;
+};
+
+/** 本文中のアセット。カバーの sentinel は持たない (addFile の型の境界を allocator まで通す) */
+export type BodyFileObj = FileObj & { readonly key: BodyAssetKey };
+
+/**
+ * PostObject.addFile に渡すアセット
+ */
+export type AssetInput = {
+  /**
+   * 本文アセットの鍵。カバーの sentinel は受け付けない。
+   * 受け付けると、カバーと同じ鍵を持つ本文アセットが HTML でカバーのパスに解決され、
+   * 実体は別名で出力される (参照と実体がずれる)
+   */
+  key: BodyAssetKey;
+  name: string;
+  extension: string;
+  url: string;
+  metadata?: AssetMetadata;
+};
+
+/**
+ * 投稿 HTML の断片
+ *
+ * 文字列はそのまま出力する。{ assetRef } はアセットへの参照で、finalize 時に
+ * allocator が割り当てた archive path へ解決する。
+ */
+export type HtmlFragment = string | { readonly assetRef: AssetKey };
+
+/**
+ * 断片列を区切り文字で連結する。
+ *
+ * parts の要素が空配列でも区切りは入れる (文字列連結時代の `[...].join(separator)` と同じ意味論。
+ * 描画しない block が区切りごと消えると、前後の block の間隔が変わって出力が変わる)。
+ */
+export function joinHtmlFragments(parts: readonly HtmlFragment[][], separator: string): HtmlFragment[] {
+  const joined: HtmlFragment[] = [];
+  parts.forEach((part, index) => {
+    if (index > 0) joined.push(separator);
+    joined.push(...part);
+  });
+  return joined;
+}
 
 /**
  * ダウンロード用JSON元オブジェクト
@@ -258,6 +378,197 @@ export class DownloadUtils {
 export function createNameKeyedDictionary<T>(): Record<string, T> {
   return Object.create(null);
 }
+/**
+ * allocator に渡す投稿の読み取り専用ビュー
+ *
+ * 「引数を変更しない」は実装者が守る契約だが、可変の `PostObj` をそのまま渡すと
+ * `post.files.reverse()` のような書き換えが型検査を素通りする。allocator が決めてよいのは
+ * 名前と並び順だけなので、入力側も型で閉じる。
+ */
+export type ReadonlyPostObj = {
+  readonly name: string;
+  readonly info: string;
+  readonly files: readonly Readonly<BodyFileObj>[];
+  readonly html: readonly HtmlFragment[];
+  readonly tags: readonly string[];
+  readonly cover?: Readonly<FileObj>;
+  readonly publishedDatetime?: string;
+  readonly postType?: string;
+};
+
+/**
+ * 1 投稿分の archive path 割り当て結果
+ */
+export type AllocatedAssetPaths = {
+  /**
+   * DownloadJsonObj の files に出す順序で並べた、アセットの鍵と割り当て名の組。
+   *
+   * `FileObj` そのものではなく鍵を返させる。allocator が決めてよいのは名前と並び順だけで、
+   * URL や元ファイル名は投稿が持つ値をそのまま出す。`FileObj` を返せる形にすると、
+   * 同じ鍵のまま中身を差し替えたオブジェクトを返して出力を書き換えられる
+   */
+  files: { key: BodyAssetKey; archiveName: string }[];
+  /** カバー画像の割り当て名。カバーが無ければ undefined */
+  coverArchiveName?: string;
+};
+
+/**
+ * archive path (ZIP 内の名前) の割り当て器
+ *
+ * 採番規則を知っている場所をここ 1 つに集約する。HTML の生成も JSON の files も
+ * この結果だけを参照するので、規則を差し替えても両者がずれない。
+ *
+ * `stringify()` (finalize) が検出して例外にする契約は、1 回の呼び出しの戻り値だけで判定できる
+ * 次の構造的条件である。黙って通すと、ZIP に入っているのに HTML から参照されないファイルや、
+ * 参照先が別のアセットになったリンクが出力に残る。
+ *
+ * - `allocatePostDirectoryNames` は `posts` と同じ長さの、すべて文字列の配列を返す
+ * - `allocateAssetPaths` は `post.files` の各アセットの鍵をちょうど 1 回返す (取りこぼしも重複も、
+ *   その投稿に属さない鍵の混入も許さない)。`archiveName` は文字列である
+ * - `post.cover` があるときに限り `coverArchiveName` を返す。返すなら文字列である
+ * - 返す名前 (投稿ディレクトリ名 / `archiveName` / `coverArchiveName`) はすべて正規化済みである
+ *   (`encodeFileName(name) === name`)。JSON と ZIP は名前をそのまま使うのに対し HTML の参照は
+ *   `encodeURI` を通るので、正規化されていないと参照と実体がずれる
+ *
+ * 次の 2 つは戻り値だけでは判定できないので検出しない。実装者が守る契約である。
+ *
+ * - **決定的であること。** 同じ入力に対して同じ結果を返し、呼び出し回数に依存する状態
+ *   (連番カウンタなど) を持たない。`stringify()` は呼ばれるたびに allocator を再実行する
+ * - 引数の `posts` / `post` を変更しない
+ *
+ * 初回の割り当てを `DownloadObject` 側で覚え込む方法は採らない。投稿やアセットを追加してから
+ * もう一度 `stringify()` したときに、追加分を反映しない古い採番を返すことになるためで、
+ * こちらのほうが壊れ方として悪い (出力が黙って実態とずれる)。決定性は allocator の契約とする。
+ */
+export interface ArchivePathAllocator {
+  /**
+   * 投稿ディレクトリ名を割り当てる
+   * @param posts 収集順の投稿
+   * @returns posts と同じ長さ・同じ順序のディレクトリ名
+   */
+  allocatePostDirectoryNames(posts: readonly ReadonlyPostObj[]): string[];
+  /**
+   * 1 投稿内のアセットの archive path を割り当てる
+   * @param post 対象の投稿
+   */
+  allocateAssetPaths(post: ReadonlyPostObj): AllocatedAssetPaths;
+}
+
+/**
+ * 従来の採番規則をそのまま実装した allocator
+ *
+ * 同名グループの件数に依存して `_1` / `_2` を付ける (投稿ディレクトリは降順、投稿内アセットは昇順)。
+ * グループの列挙順は Object.keys のそれに従う。ここは出力される files の並び順を決めるので、
+ * 従来と同じ辞書を組み立てて同じ順で列挙する (整数に見えるキーが先に来る挙動も含めて再現する)。
+ *
+ * カバーの割り当て名は encodeFileName を通した名前と拡張子から作る。従来は情報 JSON の
+ * cover.name だけが未エンコードで、HTML 側の参照はエンコード済みだったため、
+ * `/` を含む拡張子のような入力で両者がずれていた (ZIP の事前検証で落ちる)。
+ * 割り当てを 1 箇所にまとめる以上どちらかに寄せる必要があり、参照先が実在する方に揃える。
+ */
+export function createLegacyArchivePathAllocator(utils: DownloadUtils): ArchivePathAllocator {
+  return {
+    allocatePostDirectoryNames(posts: readonly ReadonlyPostObj[]): string[] {
+      // キーは投稿名 (外部入力) なので '__proto__' がありうる。通常の {} だとプロトタイプへの
+      // 代入になり、そのグループが黙って消える
+      const groups = createNameKeyedDictionary<number[]>();
+      posts.forEach((post, index) => {
+        const key = utils.encodeFileName(post.name);
+        const group = groups[key];
+        if (group === undefined) {
+          groups[key] = [index];
+        } else {
+          group.push(index);
+        }
+      });
+      const names = new Array<string>(posts.length);
+      for (const [key, indexes] of Object.entries(groups)) {
+        indexes.forEach((postIndex, indexInGroup) => {
+          names[postIndex] = utils.getFileName(key, '', indexes.length, indexInGroup, false);
+        });
+      }
+      return names;
+    },
+    allocateAssetPaths(post: ReadonlyPostObj): AllocatedAssetPaths {
+      const groups = createNameKeyedDictionary<Readonly<BodyFileObj>[]>();
+      for (const file of post.files) {
+        const key = utils.encodeFileName(file.name);
+        const group = groups[key];
+        if (group === undefined) {
+          groups[key] = [file];
+        } else {
+          group.push(file);
+        }
+      }
+      const files: AllocatedAssetPaths['files'] = [];
+      for (const [key, group] of Object.entries(groups)) {
+        group.forEach((file, indexInGroup) => {
+          const extension = file.extension ? utils.encodeFileName(file.extension) : '';
+          files.push({
+            key: file.key,
+            archiveName: utils.getFileName(key, extension, group.length, indexInGroup, true),
+          });
+        });
+      }
+      const cover = post.cover;
+      return {
+        files,
+        coverArchiveName: cover
+          ? utils.getFileName(utils.encodeFileName(cover.name), utils.encodeFileName(cover.extension), 1, 0, true)
+          : undefined,
+      };
+    },
+  };
+}
+
+/**
+ * allocator が返した投稿ディレクトリ名が投稿と 1 対 1 に対応していることを確かめる。
+ * 足りない要素や穴があると encodedName の無い投稿が JSON に出て、ZIP のパスが壊れる
+ * @param names 割り当て結果
+ * @param postCount 投稿数
+ * @internal
+ */
+function assertPostDirectoryNames(names: string[], postCount: number, utils: DownloadUtils): void {
+  if (names.length !== postCount) {
+    throw new Error(
+      `allocator が返した投稿ディレクトリ名の数が投稿と一致しません (期待 ${postCount}, 実際 ${names.length})`,
+    );
+  }
+  for (let index = 0; index < postCount; index++) {
+    const name = names[index];
+    if (typeof name !== 'string') {
+      throw new Error(`allocator が返した投稿ディレクトリ名が文字列ではありません (index ${index})`);
+    }
+    assertNormalizedArchiveName(name, utils, `投稿ディレクトリ名 (index ${index})`);
+  }
+  // 重複はここでは見ない。legacy allocator 自身が衝突を作れる (投稿名 a, a, a_1 で a_1 が 2 つ) ため、
+  // 例外にすると現実的な入力で stringify が落ちる。downloadZip の事前検証が
+  // showSaveFilePicker より前に弾くので、早期失敗にもならない
+}
+
+/**
+ * archive 名が正規化済み (encodeFileName を通した結果と同じ) であることを確かめる。
+ *
+ * JSON と ZIP のパスは archive 名をそのまま使うのに対し、HTML の参照は encodeURI を通る。
+ * encodeURI は URI 予約文字の百分率符号化だけでなく encodeFileName (全角置換と trim) も行うため、
+ * 正規化されていない名前を許すと両者がずれる (例: `' a '` は JSON では `' a '`、HTML では `a`)。
+ * encodeFileName は冪等なので、正規化済みの名前なら encodeURI の置換部分は恒等になる。
+ *
+ * ただし `%` を含む名前は正規化済みでもずれる。encodeURI が `%` 自体を符号化しないため、
+ * `%2F.png` というファイル名の参照は `./%2F.png` になり、ブラウザが `/.png` として解決する
+ * (正しくは `./%252F.png`)。従来からある欠陥で、直すと出力が変わるためここでは扱わない。
+ * @param name 検証対象の archive 名
+ * @param utils 正規化に使うユーティリティ
+ * @param context エラーメッセージに含める対象の説明
+ * @internal
+ */
+function assertNormalizedArchiveName(name: string, utils: DownloadUtils, context: string): void {
+  if (utils.encodeFileName(name) !== name) {
+    throw new Error(
+      `allocator が返した${context}が正規化されていません (encodeFileName を通した結果と異なります): ${JSON.stringify(name)}`,
+    );
+  }
+}
 
 /**
  * ダウンロード用のオブジェクトラッパークラス
@@ -265,18 +576,29 @@ export function createNameKeyedDictionary<T>(): Record<string, T> {
 export class DownloadObject {
   private readonly downloadObj: DownloadObj;
   private readonly utils: DownloadUtils;
+  private readonly allocator: ArchivePathAllocator;
   private readonly orderedPosts: PostObject[] = [];
   private url = '#main';
   private tags: string[] | undefined;
 
-  constructor(id: string, utils: DownloadUtils) {
-    this.downloadObj = { posts: createNameKeyedDictionary(), id };
+  /**
+   * @param id クリエイターID
+   * @param utils ダウンロード用ユーティリティ
+   * @param allocator archive path の割り当て器 (省略時は従来の採番規則)
+   */
+  constructor(id: string, utils: DownloadUtils, allocator?: ArchivePathAllocator) {
+    this.downloadObj = { posts: [], id };
     this.utils = utils;
+    this.allocator = allocator ?? createLegacyArchivePathAllocator(utils);
   }
 
   stringify(): string {
+    // archive path はここ (finalize) で初めて確定する。投稿ディレクトリ名は投稿をまたぐ採番なので
+    // 全投稿を渡して一度に割り当てる
+    const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
+    assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
     const downloadJson: DownloadJsonObj = {
-      posts: this.orderedPosts.map((it) => it.toJsonObjBy(this.downloadObj.posts)),
+      posts: this.orderedPosts.map((it, index) => it.toJsonObj(directoryNames[index], this.allocator)),
       id: this.downloadObj.id,
       url: this.url,
       tags: this.tags ?? this.collectTags(),
@@ -295,40 +617,26 @@ export class DownloadObject {
   }
 
   addPost(name: string): PostObject {
-    const encodedName = this.utils.encodeFileName(name);
-    if (this.downloadObj.posts[encodedName] === undefined) {
-      this.downloadObj.posts[encodedName] = [];
-    }
-    const postObj: PostObj = { name, info: '', files: createNameKeyedDictionary(), html: '', tags: [] };
-    this.downloadObj.posts[encodedName].push(postObj);
+    const postObj: PostObj = { name, info: '', files: [], html: [], tags: [] };
+    this.downloadObj.posts.push(postObj);
     const postObject = new PostObject(postObj, this.utils);
     this.orderedPosts.push(postObject);
     return postObject;
   }
 
   private countPost(): number {
-    return Object.values(this.downloadObj.posts).reduce((s, posts) => s + posts.length, 0);
+    return this.downloadObj.posts.length;
   }
 
   private countFile(): number {
-    return Object.values(this.downloadObj.posts).reduce(
-      (allFileSize, posts) =>
-        allFileSize +
-        posts.reduce(
-          (postFileSize, post) => postFileSize + Object.values(post.files).reduce((s, files) => s + files.length, 0),
-          0,
-        ),
-      0,
-    );
+    return this.downloadObj.posts.reduce((sum, post) => sum + post.files.length, 0);
   }
 
   private collectTags(): string[] {
     const tags = new Set<string>();
-    for (const posts of Object.values(this.downloadObj.posts)) {
-      for (const post of posts) {
-        for (const tag of post.tags) {
-          tags.add(tag);
-        }
+    for (const post of this.downloadObj.posts) {
+      for (const tag of post.tags) {
+        tags.add(tag);
       }
     }
     return [...tags];
@@ -351,8 +659,17 @@ export class PostObject {
     this.postObj.info = info;
   }
 
-  setHtml(html: string) {
-    this.postObj.html = html;
+  /**
+   * 投稿 HTML の断片列を設定する。
+   *
+   * 断片も AssetKey を運ぶので、配列ごと複製して参照を凍結する。呼び出し側が保持している
+   * 鍵を後から書き換えられると、解決先が別のアセットに変わるか、解決できずに finalize が落ちる。
+   * @param html 断片列
+   */
+  setHtml(html: HtmlFragment[]) {
+    this.postObj.html = html.map((fragment) =>
+      typeof fragment === 'string' ? fragment : Object.freeze({ assetRef: freezeAssetKey(fragment.assetRef) }),
+    );
   }
 
   setTags(tags: string[]) {
@@ -363,23 +680,54 @@ export class PostObject {
     this.postObj.publishedDatetime = iso;
   }
 
+  /**
+   * FANBOX の投稿タイプを保持する。この層では使わず、利用側の絞り込み条件のために持つ
+   * @param type 投稿タイプ
+   */
+  setPostType(type: string) {
+    this.postObj.postType = type;
+  }
+
   setCover(name: string, extension: string, url: string): FileObject {
-    const fileObj: FileObj = { name, extension: extension ? `.${extension}` : '', url };
+    const fileObj: FileObj = {
+      name,
+      extension: extension ? `.${extension}` : '',
+      url,
+      key: freezeAssetKey({ kind: 'cover' }),
+      metadata: {},
+    };
     this.postObj.cover = fileObj;
     return new FileObject(fileObj, this.utils);
   }
 
-  addFile(name: string, extension: string, url: string): FileObject {
-    const encodedName = this.utils.encodeFileName(name);
-    if (this.postObj.files[encodedName] === undefined) {
-      this.postObj.files[encodedName] = [];
+  /**
+   * 投稿内のアセットを追加する
+   *
+   * key は投稿内で一意でなければならない (重複すると HTML の参照が別のアセットへ解決しうる)。
+   * 呼び出し側の decoder が事前に重複を弾く契約なので、ここでの検出は契約違反として例外にする。
+   * @param asset 追加するアセット
+   */
+  addFile(asset: AssetInput): FileObject {
+    // 型では弾いているが、JS からの呼び出しでは通るので実行時にも拒否する
+    if ((asset.key as AssetKey).kind === 'cover') {
+      throw new Error('addFile: cover の AssetKey は本文アセットに使えません (カバーは setCover が持つ)');
     }
-    const fileObj: FileObj = { name, extension: extension ? `.${extension}` : '', url };
-    this.postObj.files[encodedName].push(fileObj);
+    const duplicated = this.postObj.files.some((it) => assetKeyToString(it.key) === assetKeyToString(asset.key));
+    if (duplicated) {
+      throw new Error(`asset key is duplicated: ${assetKeyToString(asset.key)}`);
+    }
+    const fileObj: BodyFileObj = {
+      name: asset.name,
+      extension: asset.extension ? `.${asset.extension}` : '',
+      url: asset.url,
+      key: freezeAssetKey(asset.key),
+      metadata: asset.metadata ?? {},
+    };
+    this.postObj.files.push(fileObj);
     return new FileObject(fileObj, this.utils);
   }
 
-  getAutoAssignedLinkTag(fileObject: FileObject): string {
+  getAutoAssignedLinkTag(fileObject: FileObject): HtmlFragment[] {
     const ext = fileObject.getEncodedExtension();
     switch (true) {
       case this.utils.isAudio(ext):
@@ -393,121 +741,162 @@ export class PostObject {
     }
   }
 
-  getAudioLinkTag(fileObject: FileObject): string {
-    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+  getAudioLinkTag(fileObject: FileObject): HtmlFragment[] {
+    const ref: HtmlFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return (
-      `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">\n` +
-      `<div class="card-header">${this.utils.escapeHtml(fileObject.getOriginalName())}</div>\n` +
-      `<audio class="card-img-top" src="${escapedPath}" controls/>\n</div></a>`
-    );
+    return [
+      `<a class="hl" href="`,
+      ref,
+      `" download="${escapedDownload}"><div class="post card">\n` +
+        `<div class="card-header">${this.utils.escapeHtml(fileObject.getOriginalName())}</div>\n` +
+        `<audio class="card-img-top" src="`,
+      ref,
+      `" controls/>\n</div></a>`,
+    ];
   }
 
-  getLinkTag(url: string, title: string): string {
-    return (
+  getLinkTag(url: string, title: string): HtmlFragment[] {
+    return [
       `<a class="hl" href="${this.utils.escapeHtml(url)}"><div class="post card text-center"><p class="pt-2">\n` +
-      `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-box-arrow-up-left" viewBox="0 0 16 16">\n` +
-      `<path fill-rule="evenodd" d="M7.364 3.5a.5.5 0 0 1 .5-.5H14.5A1.5 1.5 0 0 1 16 4.5v10a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 3 14.5V7.864a.5.5 0 1 1 1 0V14.5a.5.5 0 0 0 .5.5h10a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5H7.864a.5.5 0 0 1-.5-.5z"/>\n` +
-      `<path fill-rule="evenodd" d="M0 .5A.5.5 0 0 1 .5 0h5a.5.5 0 0 1 0 1H1.707l8.147 8.146a.5.5 0 0 1-.708.708L1 1.707V5.5a.5.5 0 0 1-1 0v-5z"/>\n` +
-      `</svg> ${this.utils.escapeHtml(title)}</p></div></a>`
-    );
+        `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-box-arrow-up-left" viewBox="0 0 16 16">\n` +
+        `<path fill-rule="evenodd" d="M7.364 3.5a.5.5 0 0 1 .5-.5H14.5A1.5 1.5 0 0 1 16 4.5v10a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 3 14.5V7.864a.5.5 0 1 1 1 0V14.5a.5.5 0 0 0 .5.5h10a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5H7.864a.5.5 0 0 1-.5-.5z"/>\n` +
+        `<path fill-rule="evenodd" d="M0 .5A.5.5 0 0 1 .5 0h5a.5.5 0 0 1 0 1H1.707l8.147 8.146a.5.5 0 0 1-.708.708L1 1.707V5.5a.5.5 0 0 1-1 0v-5z"/>\n` +
+        `</svg> ${this.utils.escapeHtml(title)}</p></div></a>`,
+    ];
   }
 
-  getFileLinkTag(fileObject: FileObject): string {
-    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+  getFileLinkTag(fileObject: FileObject): HtmlFragment[] {
+    const ref: HtmlFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return (
-      `<a class="hl" href="${escapedPath}" download="${escapedDownload}">` +
-      `<div class="post card text-center"><p class="pt-2">\n` +
-      `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-download" viewBox="0 0 16 16">\n` +
-      `<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>\n` +
-      `<path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/>\n` +
-      `</svg> ${this.utils.escapeHtml(fileObject.getOriginalName() + fileObject.getOriginalExtension())}</p></div></a>`
-    );
+    return [
+      `<a class="hl" href="`,
+      ref,
+      `" download="${escapedDownload}">` +
+        `<div class="post card text-center"><p class="pt-2">\n` +
+        `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-download" viewBox="0 0 16 16">\n` +
+        `<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>\n` +
+        `<path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/>\n` +
+        `</svg> ${this.utils.escapeHtml(fileObject.getOriginalName() + fileObject.getOriginalExtension())}</p></div></a>`,
+    ];
   }
 
-  getImageLinkTag(fileObject: FileObject): string {
-    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+  getImageLinkTag(fileObject: FileObject): HtmlFragment[] {
+    const ref: HtmlFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return (
-      `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">\n` +
-      `<img class="card-img-top" src="${escapedPath}" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>\n</div></a>`
-    );
+    return [
+      `<a class="hl" href="`,
+      ref,
+      `" download="${escapedDownload}"><div class="post card">\n<img class="card-img-top" src="`,
+      ref,
+      `" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>\n</div></a>`,
+    ];
   }
 
-  getVideoLinkTag(fileObject: FileObject): string {
-    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+  getVideoLinkTag(fileObject: FileObject): HtmlFragment[] {
+    const ref: HtmlFragment = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return (
-      `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">\n` +
-      `<video class="card-img-top" src="${escapedPath}" controls/>\n</div></a>`
-    );
+    return [
+      `<a class="hl" href="`,
+      ref,
+      `" download="${escapedDownload}"><div class="post card">\n<video class="card-img-top" src="`,
+      ref,
+      `" controls/>\n</div></a>`,
+    ];
   }
 
-  private getCurrentFilePath(fileObject: FileObject): string {
-    const encodedName = fileObject.getEncodedName();
-    if (fileObject.equals(this.postObj.cover)) {
-      const fileName = this.utils.getFileName(encodedName, fileObject.getEncodedExtension(), 1, 0, true);
-      return `./${this.utils.encodeURI(fileName)}`;
+  /**
+   * 割り当て済みの archive path を使って JSON 出力用のオブジェクトにする
+   * @param directoryName この投稿に割り当てられたディレクトリ名
+   * @param allocator 投稿内アセットの割り当て器
+   */
+  toJsonObj(directoryName: string, allocator: ArchivePathAllocator): DownloadJsonObj['posts'][number] {
+    const allocation = allocator.allocateAssetPaths(this.postObj);
+    const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it] as const));
+    this.assertAllocationCoversAssets(allocation, fileByKey);
+    const pathByKey = new Map<string, string>();
+    for (const { key, archiveName } of allocation.files) {
+      pathByKey.set(assetKeyToString(key), archiveName);
     }
-    if (this.postObj.files[encodedName] === undefined) {
-      throw new Error(`file object is undefined: ${fileObject.getOriginalName()}`);
-    }
-    const index = this.postObj.files[encodedName].findIndex((it) => fileObject.equals(it));
-    if (index < 0) {
-      throw new Error(`file object is not found: ${fileObject.getOriginalName()}`);
-    }
-    const fileName = this.utils.getFileName(
-      encodedName,
-      fileObject.getEncodedExtension(),
-      this.postObj.files[encodedName].length,
-      index,
-      true,
-    );
-    return `./${this.utils.encodeURI(fileName)}`;
-  }
-
-  toJsonObjBy(posts: Record<string, PostObj[]>): DownloadJsonObj['posts'][number] {
-    const key = this.utils.encodeFileName(this.postObj.name);
-    const postIndex = posts[key]?.indexOf(this.postObj);
-    if (postIndex === undefined || postIndex < 0) {
-      throw new Error(`post object is not found: ${this.postObj.name}`);
-    }
-    const encodedName = this.utils.getFileName(key, '', posts[key].length, postIndex, false);
     const cover = this.postObj.cover
-      ? {
-          url: this.postObj.cover.url,
-          name: this.utils.getFileName(this.postObj.cover.name, this.postObj.cover.extension, 1, 0, true),
-        }
+      ? { url: this.postObj.cover.url, name: allocation.coverArchiveName as string }
       : undefined;
+    if (cover) {
+      pathByKey.set('cover', cover.name);
+    }
     return {
       originalName: this.postObj.name,
-      encodedName,
+      encodedName: directoryName,
       informationText: this.postObj.info,
-      htmlText: this.postObj.html,
-      files: this.collectFiles(),
+      htmlText: this.resolveHtml(pathByKey),
+      // URL と元ファイル名は投稿が持つ値から取る。allocator が決めるのは名前と並び順だけ
+      files: allocation.files.map(({ key, archiveName }) => {
+        // biome-ignore lint/style/noNonNullAssertion: assertAllocationCoversAssets が存在を保証する
+        const file = fileByKey.get(assetKeyToString(key))!;
+        return { url: file.url, originalName: file.name, encodedName: archiveName };
+      }),
       tags: this.postObj.tags,
       cover,
       publishedDatetime: this.postObj.publishedDatetime,
     };
   }
 
-  private collectFiles(): DownloadJsonObj['posts'][number]['files'] {
-    // 順序自由
-    const ret: DownloadJsonObj['posts'][number]['files'] = [];
-    for (const [key, fileObjArray] of Object.entries(this.postObj.files)) {
-      let fileIndex = 0;
-      for (const fileObj of fileObjArray) {
-        const extension = fileObj.extension ? this.utils.encodeFileName(fileObj.extension) : '';
-        const encodedName = this.utils.getFileName(key, extension, fileObjArray.length, fileIndex++, true);
-        ret.push({
-          url: fileObj.url,
-          originalName: fileObj.name,
-          encodedName,
-        });
-      }
+  /**
+   * allocator の結果が投稿のアセットと 1 対 1 に対応していることを確かめる。
+   *
+   * 取りこぼしはファイルの欠落、重複や余分は参照先の取り違えになるが、どちらも出力を見ただけでは
+   * 気付けない (ZIP は生成され、HTML も壊れて見えない)。finalize で止める。
+   * @param allocation 割り当て結果
+   * @param fileByKey 投稿が持つアセットを鍵で引ける形にしたもの
+   */
+  private assertAllocationCoversAssets(allocation: AllocatedAssetPaths, fileByKey: ReadonlyMap<string, FileObj>): void {
+    const expected = new Set(fileByKey.keys());
+    if (allocation.files.length !== this.postObj.files.length) {
+      throw new Error(
+        `allocator が返したアセット数が投稿と一致しません (期待 ${this.postObj.files.length}, 実際 ${allocation.files.length})`,
+      );
     }
-    return ret;
+    for (const { key, archiveName } of allocation.files) {
+      if (!expected.delete(assetKeyToString(key))) {
+        throw new Error(
+          `allocator が投稿に属さないアセット、または重複したアセットを返しました: ${assetKeyToString(key)}`,
+        );
+      }
+      if (typeof archiveName !== 'string') {
+        throw new Error(`allocator が返した archive 名が文字列ではありません: ${assetKeyToString(key)}`);
+      }
+      assertNormalizedArchiveName(archiveName, this.utils, `archive 名 (${assetKeyToString(key)})`);
+    }
+    if (allocation.coverArchiveName !== undefined) {
+      if (typeof allocation.coverArchiveName !== 'string') {
+        throw new Error('allocator が返したカバーの archive 名が文字列ではありません');
+      }
+      assertNormalizedArchiveName(allocation.coverArchiveName, this.utils, 'カバーの archive 名');
+    }
+    if ((this.postObj.cover !== undefined) !== (allocation.coverArchiveName !== undefined)) {
+      throw new Error(
+        this.postObj.cover === undefined
+          ? 'allocator がカバーの無い投稿に coverArchiveName を返しました'
+          : 'allocator がカバーのある投稿に coverArchiveName を返しませんでした',
+      );
+    }
+  }
+
+  /**
+   * 断片列を HTML 文字列に解決する。
+   * 参照先の archive path が割り当てられていない断片は、壊れたリンクを出力に残さないよう例外にする
+   * @param pathByKey assetKeyToString をキーとする archive path
+   */
+  private resolveHtml(pathByKey: Map<string, string>): string {
+    return this.postObj.html
+      .map((fragment) => {
+        if (typeof fragment === 'string') return fragment;
+        const archiveName = pathByKey.get(assetKeyToString(fragment.assetRef));
+        if (archiveName === undefined) {
+          throw new Error(`archive path is not allocated: ${assetKeyToString(fragment.assetRef)}`);
+        }
+        return this.utils.escapeHtml(`./${this.utils.encodeURI(archiveName)}`);
+      })
+      .join('');
   }
 }
 
@@ -521,6 +910,14 @@ export class FileObject {
   constructor(fileObj: FileObj, utils: DownloadUtils) {
     this.fileObj = fileObj;
     this.utils = utils;
+  }
+
+  getKey(): AssetKey {
+    return this.fileObj.key;
+  }
+
+  getMetadata(): AssetMetadata {
+    return this.fileObj.metadata;
   }
 
   getEncodedName(): string {
@@ -541,14 +938,6 @@ export class FileObject {
 
   getUrl(): string {
     return this.fileObj.url;
-  }
-
-  equals(obj: unknown): boolean {
-    if (typeof obj !== 'object' || obj === null) {
-      return false;
-    }
-    const candidate = obj as { name?: string; url?: string };
-    return candidate.name === this.fileObj.name && candidate.url === this.fileObj.url;
   }
 }
 

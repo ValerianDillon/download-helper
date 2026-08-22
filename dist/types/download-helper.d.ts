@@ -1,30 +1,123 @@
 /**
  * ダウンロード用のObject
+ *
+ * posts は収集順の配列で保持する。archive path の採番に使う「同名グループ」は allocator が
+ * 組み立てる (ArchivePathAllocator)。内部表現がグループ構造を持つと、採番規則を知っている場所が
+ * 増えて HTML とファイルパスの結合を切れないため。
  */
 export type DownloadObj = {
-    posts: Record<string, PostObj[]>;
+    posts: PostObj[];
     id: string;
 };
 /**
  * 投稿情報のObject
+ *
+ * files は収集順の配列。html は文字列ではなく断片列で、アセットへの参照は archive path ではなく
+ * AssetKey で持つ (archive path が確定するのは allocator を通す finalize 時であり、
+ * それ以前に文字列として埋め込むと採番の変化に追従できないため)。
  */
 export type PostObj = {
     name: string;
     info: string;
-    files: Record<string, FileObj[]>;
-    html: string;
+    files: BodyFileObj[];
+    html: HtmlFragment[];
     tags: string[];
     cover?: FileObj;
     publishedDatetime?: string;
+    /** FANBOX の投稿タイプ。収集結果の絞り込み条件として利用側が読む (この層では使わない) */
+    postType?: string;
+};
+/**
+ * 本文中のアセットの種別
+ *
+ * FANBOX が返すどのコレクション由来か (images / imageMap か、files / fileMap か) を表す。
+ */
+export type BodyAssetKind = 'image' | 'file';
+/** アセットの種別。カバー画像は投稿に高々 1 つで、本文中のアセットとは別枠になる */
+export type AssetKind = 'cover' | BodyAssetKind;
+/**
+ * 投稿内でアセットを一意に指す鍵
+ *
+ * 配列位置にも encodeFileName 後の名前にも依存しない。位置や名前を identity にすると、
+ * 収集後にアセットを間引いたときに別のアセットを同一視しうる。
+ * カバーは URL 文字列しか持たず id が無いため、投稿内で一意な sentinel として表す。
+ */
+export type BodyAssetKey = {
+    readonly kind: BodyAssetKind;
+    readonly assetId: string;
+};
+/** 投稿内でアセットを一意に指す鍵。カバーは投稿に高々 1 つなので sentinel で表す */
+export type AssetKey = {
+    readonly kind: 'cover';
+} | BodyAssetKey;
+/**
+ * AssetKey を Map のキーに使える文字列にする。
+ * kind を前置するので、image と file で同じ assetId が来ても衝突しない。
+ */
+export declare function assetKeyToString(key: AssetKey): string;
+/**
+ * アセットの付随メタデータ
+ *
+ * いずれも API が返さないことがあるため optional。size は file 系にのみ存在し image 系には無く、
+ * width / height はその逆である (実測 2026-08-22)。
+ * 非負の安全な整数でない値は欠落として扱う (decoder が落とす)。
+ */
+export type AssetMetadata = {
+    /** バイト数 (file 系のみ) */
+    readonly size?: number;
+    /** 画像の幅 (image 系のみ) */
+    readonly width?: number;
+    /** 画像の高さ (image 系のみ) */
+    readonly height?: number;
 };
 /**
  * ファイル用のObject
+ *
+ * key はこのアセットの identity、metadata は情報表示や絞り込みに使う付随情報で、
+ * どちらも archive path の採番には使わない。
  */
 export type FileObj = {
     url: string;
     name: string;
     extension: string;
+    key: AssetKey;
+    metadata: AssetMetadata;
 };
+/** 本文中のアセット。カバーの sentinel は持たない (addFile の型の境界を allocator まで通す) */
+export type BodyFileObj = FileObj & {
+    readonly key: BodyAssetKey;
+};
+/**
+ * PostObject.addFile に渡すアセット
+ */
+export type AssetInput = {
+    /**
+     * 本文アセットの鍵。カバーの sentinel は受け付けない。
+     * 受け付けると、カバーと同じ鍵を持つ本文アセットが HTML でカバーのパスに解決され、
+     * 実体は別名で出力される (参照と実体がずれる)
+     */
+    key: BodyAssetKey;
+    name: string;
+    extension: string;
+    url: string;
+    metadata?: AssetMetadata;
+};
+/**
+ * 投稿 HTML の断片
+ *
+ * 文字列はそのまま出力する。{ assetRef } はアセットへの参照で、finalize 時に
+ * allocator が割り当てた archive path へ解決する。
+ */
+export type HtmlFragment = string | {
+    readonly assetRef: AssetKey;
+};
+/**
+ * 断片列を区切り文字で連結する。
+ *
+ * parts の要素が空配列でも区切りは入れる (文字列連結時代の `[...].join(separator)` と同じ意味論。
+ * 描画しない block が区切りごと消えると、前後の block の間隔が変わって出力が変わる)。
+ */
+export declare function joinHtmlFragments(parts: readonly HtmlFragment[][], separator: string): HtmlFragment[];
 /**
  * ダウンロード用JSON元オブジェクト
  */
@@ -170,15 +263,110 @@ export declare class DownloadUtils {
  */
 export declare function createNameKeyedDictionary<T>(): Record<string, T>;
 /**
+ * allocator に渡す投稿の読み取り専用ビュー
+ *
+ * 「引数を変更しない」は実装者が守る契約だが、可変の `PostObj` をそのまま渡すと
+ * `post.files.reverse()` のような書き換えが型検査を素通りする。allocator が決めてよいのは
+ * 名前と並び順だけなので、入力側も型で閉じる。
+ */
+export type ReadonlyPostObj = {
+    readonly name: string;
+    readonly info: string;
+    readonly files: readonly Readonly<BodyFileObj>[];
+    readonly html: readonly HtmlFragment[];
+    readonly tags: readonly string[];
+    readonly cover?: Readonly<FileObj>;
+    readonly publishedDatetime?: string;
+    readonly postType?: string;
+};
+/**
+ * 1 投稿分の archive path 割り当て結果
+ */
+export type AllocatedAssetPaths = {
+    /**
+     * DownloadJsonObj の files に出す順序で並べた、アセットの鍵と割り当て名の組。
+     *
+     * `FileObj` そのものではなく鍵を返させる。allocator が決めてよいのは名前と並び順だけで、
+     * URL や元ファイル名は投稿が持つ値をそのまま出す。`FileObj` を返せる形にすると、
+     * 同じ鍵のまま中身を差し替えたオブジェクトを返して出力を書き換えられる
+     */
+    files: {
+        key: BodyAssetKey;
+        archiveName: string;
+    }[];
+    /** カバー画像の割り当て名。カバーが無ければ undefined */
+    coverArchiveName?: string;
+};
+/**
+ * archive path (ZIP 内の名前) の割り当て器
+ *
+ * 採番規則を知っている場所をここ 1 つに集約する。HTML の生成も JSON の files も
+ * この結果だけを参照するので、規則を差し替えても両者がずれない。
+ *
+ * `stringify()` (finalize) が検出して例外にする契約は、1 回の呼び出しの戻り値だけで判定できる
+ * 次の構造的条件である。黙って通すと、ZIP に入っているのに HTML から参照されないファイルや、
+ * 参照先が別のアセットになったリンクが出力に残る。
+ *
+ * - `allocatePostDirectoryNames` は `posts` と同じ長さの、すべて文字列の配列を返す
+ * - `allocateAssetPaths` は `post.files` の各アセットの鍵をちょうど 1 回返す (取りこぼしも重複も、
+ *   その投稿に属さない鍵の混入も許さない)。`archiveName` は文字列である
+ * - `post.cover` があるときに限り `coverArchiveName` を返す。返すなら文字列である
+ * - 返す名前 (投稿ディレクトリ名 / `archiveName` / `coverArchiveName`) はすべて正規化済みである
+ *   (`encodeFileName(name) === name`)。JSON と ZIP は名前をそのまま使うのに対し HTML の参照は
+ *   `encodeURI` を通るので、正規化されていないと参照と実体がずれる
+ *
+ * 次の 2 つは戻り値だけでは判定できないので検出しない。実装者が守る契約である。
+ *
+ * - **決定的であること。** 同じ入力に対して同じ結果を返し、呼び出し回数に依存する状態
+ *   (連番カウンタなど) を持たない。`stringify()` は呼ばれるたびに allocator を再実行する
+ * - 引数の `posts` / `post` を変更しない
+ *
+ * 初回の割り当てを `DownloadObject` 側で覚え込む方法は採らない。投稿やアセットを追加してから
+ * もう一度 `stringify()` したときに、追加分を反映しない古い採番を返すことになるためで、
+ * こちらのほうが壊れ方として悪い (出力が黙って実態とずれる)。決定性は allocator の契約とする。
+ */
+export interface ArchivePathAllocator {
+    /**
+     * 投稿ディレクトリ名を割り当てる
+     * @param posts 収集順の投稿
+     * @returns posts と同じ長さ・同じ順序のディレクトリ名
+     */
+    allocatePostDirectoryNames(posts: readonly ReadonlyPostObj[]): string[];
+    /**
+     * 1 投稿内のアセットの archive path を割り当てる
+     * @param post 対象の投稿
+     */
+    allocateAssetPaths(post: ReadonlyPostObj): AllocatedAssetPaths;
+}
+/**
+ * 従来の採番規則をそのまま実装した allocator
+ *
+ * 同名グループの件数に依存して `_1` / `_2` を付ける (投稿ディレクトリは降順、投稿内アセットは昇順)。
+ * グループの列挙順は Object.keys のそれに従う。ここは出力される files の並び順を決めるので、
+ * 従来と同じ辞書を組み立てて同じ順で列挙する (整数に見えるキーが先に来る挙動も含めて再現する)。
+ *
+ * カバーの割り当て名は encodeFileName を通した名前と拡張子から作る。従来は情報 JSON の
+ * cover.name だけが未エンコードで、HTML 側の参照はエンコード済みだったため、
+ * `/` を含む拡張子のような入力で両者がずれていた (ZIP の事前検証で落ちる)。
+ * 割り当てを 1 箇所にまとめる以上どちらかに寄せる必要があり、参照先が実在する方に揃える。
+ */
+export declare function createLegacyArchivePathAllocator(utils: DownloadUtils): ArchivePathAllocator;
+/**
  * ダウンロード用のオブジェクトラッパークラス
  */
 export declare class DownloadObject {
     private readonly downloadObj;
     private readonly utils;
+    private readonly allocator;
     private readonly orderedPosts;
     private url;
     private tags;
-    constructor(id: string, utils: DownloadUtils);
+    /**
+     * @param id クリエイターID
+     * @param utils ダウンロード用ユーティリティ
+     * @param allocator archive path の割り当て器 (省略時は従来の採番規則)
+     */
+    constructor(id: string, utils: DownloadUtils, allocator?: ArchivePathAllocator);
     stringify(): string;
     setUrl(url: string): void;
     setTags(tags: string[]): void;
@@ -195,20 +383,57 @@ export declare class PostObject {
     private readonly utils;
     constructor(postObj: PostObj, utils: DownloadUtils);
     setInfo(info: string): void;
-    setHtml(html: string): void;
+    /**
+     * 投稿 HTML の断片列を設定する。
+     *
+     * 断片も AssetKey を運ぶので、配列ごと複製して参照を凍結する。呼び出し側が保持している
+     * 鍵を後から書き換えられると、解決先が別のアセットに変わるか、解決できずに finalize が落ちる。
+     * @param html 断片列
+     */
+    setHtml(html: HtmlFragment[]): void;
     setTags(tags: string[]): void;
     setPublishedDatetime(iso: string): void;
+    /**
+     * FANBOX の投稿タイプを保持する。この層では使わず、利用側の絞り込み条件のために持つ
+     * @param type 投稿タイプ
+     */
+    setPostType(type: string): void;
     setCover(name: string, extension: string, url: string): FileObject;
-    addFile(name: string, extension: string, url: string): FileObject;
-    getAutoAssignedLinkTag(fileObject: FileObject): string;
-    getAudioLinkTag(fileObject: FileObject): string;
-    getLinkTag(url: string, title: string): string;
-    getFileLinkTag(fileObject: FileObject): string;
-    getImageLinkTag(fileObject: FileObject): string;
-    getVideoLinkTag(fileObject: FileObject): string;
-    private getCurrentFilePath;
-    toJsonObjBy(posts: Record<string, PostObj[]>): DownloadJsonObj['posts'][number];
-    private collectFiles;
+    /**
+     * 投稿内のアセットを追加する
+     *
+     * key は投稿内で一意でなければならない (重複すると HTML の参照が別のアセットへ解決しうる)。
+     * 呼び出し側の decoder が事前に重複を弾く契約なので、ここでの検出は契約違反として例外にする。
+     * @param asset 追加するアセット
+     */
+    addFile(asset: AssetInput): FileObject;
+    getAutoAssignedLinkTag(fileObject: FileObject): HtmlFragment[];
+    getAudioLinkTag(fileObject: FileObject): HtmlFragment[];
+    getLinkTag(url: string, title: string): HtmlFragment[];
+    getFileLinkTag(fileObject: FileObject): HtmlFragment[];
+    getImageLinkTag(fileObject: FileObject): HtmlFragment[];
+    getVideoLinkTag(fileObject: FileObject): HtmlFragment[];
+    /**
+     * 割り当て済みの archive path を使って JSON 出力用のオブジェクトにする
+     * @param directoryName この投稿に割り当てられたディレクトリ名
+     * @param allocator 投稿内アセットの割り当て器
+     */
+    toJsonObj(directoryName: string, allocator: ArchivePathAllocator): DownloadJsonObj['posts'][number];
+    /**
+     * allocator の結果が投稿のアセットと 1 対 1 に対応していることを確かめる。
+     *
+     * 取りこぼしはファイルの欠落、重複や余分は参照先の取り違えになるが、どちらも出力を見ただけでは
+     * 気付けない (ZIP は生成され、HTML も壊れて見えない)。finalize で止める。
+     * @param allocation 割り当て結果
+     * @param fileByKey 投稿が持つアセットを鍵で引ける形にしたもの
+     */
+    private assertAllocationCoversAssets;
+    /**
+     * 断片列を HTML 文字列に解決する。
+     * 参照先の archive path が割り当てられていない断片は、壊れたリンクを出力に残さないよう例外にする
+     * @param pathByKey assetKeyToString をキーとする archive path
+     */
+    private resolveHtml;
 }
 /**
  * ファイルオブジェクトラッパークラス
@@ -217,12 +442,13 @@ export declare class FileObject {
     private readonly fileObj;
     private readonly utils;
     constructor(fileObj: FileObj, utils: DownloadUtils);
+    getKey(): AssetKey;
+    getMetadata(): AssetMetadata;
     getEncodedName(): string;
     getEncodedExtension(): string;
     getOriginalName(): string;
     getOriginalExtension(): string;
     getUrl(): string;
-    equals(obj: unknown): boolean;
 }
 /**
  * CRC-32 ルックアップテーブル (IEEE 802.3 polynomial)

@@ -50,6 +50,36 @@ tsconfig.declaration.json   # dist/types/ 生成専用 (declaration: true, entry
 2. **DownloadObject / PostObject / FileObject** — ダウンロードデータのラッパークラス群
 3. **DownloadHelper** — 最上位クラス。UI 生成、ZIP ダウンロード、HTML 生成を統合
 
+### アセットの identity と archive path (Issue #41)
+
+投稿内のアセットは `AssetKey` で一意に指す。通常のアセットは `{ kind: 'image' | 'file', assetId }` で、`assetId` は FANBOX が返す asset の `id` である。カバーは `id` を持たないので `{ kind: 'cover' }` という post 内一意の sentinel にする。
+配列位置や `encodeFileName` 後の名前を identity にしない。位置も名前も、収集後にアセットを間引くと別のアセットを指しうるため。
+
+archive path (ZIP 内の名前) を決めるのは `ArchivePathAllocator` だけである。従来の採番規則 (同名グループの件数に依存して `_1` / `_2` を付ける) は `createLegacyArchivePathAllocator` として保持し、`DownloadObject` / `DownloadManage` の任意引数で差し替えられる。
+
+- `PostObj.html` は文字列ではなく `HtmlFragment[]` (文字列と `{ assetRef: AssetKey }` の列)。`getImageLinkTag` などのリンクタグ生成はパス文字列を埋め込まず、`assetRef` を持つ断片を返す
+- 断片から archive path への解決は `stringify()` (finalize) の時点で行う。したがって HTML 内の参照と `DownloadJsonObj` の `files[].encodedName` / `cover.name` は、定義上ずれない
+- 従来この 2 つが一致していたのは「同名グループへの `addFile` がすべて終わってから HTML を生成する」という `addByPostInfo` の呼び出し順序に依存していたためで、契約としては書かれていなかった
+従来の出力から変わるのは次の 3 点だけで、いずれも壊れていた出力を直すものである。それ以外は `DownloadJsonObj` の内容・キー順・`posts[].files` の並び順・投稿ディレクトリの採番を含めて変わらない。
+
+- カバーの割り当て名は `encodeFileName` を通す。従来は情報 JSON の `cover.name` だけが未エンコードで、HTML 側の参照はエンコード済みだったため、`/` を含む拡張子のような入力で両者がずれていた (ZIP の事前検証で落ちる)。割り当てを 1 箇所にまとめる以上どちらかに寄せる必要があり、参照先が実在する側に揃えた
+- `name` と `url` がどちらも同じで `assetId` が異なるアセットが同一投稿内にあると、HTML の参照が変わる。従来は `FileObject.equals` が `name` と `url` の一致でアセットを同定していたため、両方の参照が先頭の archive path に解決し、2 つ目のファイルは ZIP に入るのに誰からも参照されなかった。`AssetKey` は両者を区別する
+- `setTags` を呼ばずに `stringify()` したときのタグの並びが、投稿名でグループ化した辞書の列挙順から収集順に変わる。`fanbox-collector` は `applyTags()` で明示設定するので、FANBOX の収集経路はこの既定を通らない
+
+legacy allocator には既知の名前衝突がある。投稿内で archive 名が重複し (`a` が 2 件と `a_1` が 1 件あると `a_1.png` が 2 つできる。カバーは常に `cover.<ext>` なので、同名の添付や `cover` というタイトルの image 投稿と衝突する)、投稿ディレクトリ名も同じ形で重複する (投稿名 `a`, `a`, `a_1` で `a_1` が 2 つ)。採番規則そのものの欠陥で、直すと出力が変わるため、archive path を postId 由来に変える段階で扱う。
+
+`%` を含む archive 名も、HTML の参照が実在しないファイルを指す。`encodeURI` が `%` 自体を符号化しないため、`%2F.png` というファイル名の参照が `./%2F.png` になり、ブラウザは `/.png` として解決する。これも従来からある欠陥で、直すと出力が変わるため同じ段階で扱う。
+
+finalize では衝突を検出しない。legacy 自身が作れる衝突を例外にすると、`cover` というタイトルの投稿のような現実的な入力でダウンロード全体が落ち、いま得られている「1 ファイルだけ影に入った ZIP」より悪くなる。投稿ディレクトリ名の重複は `downloadZip` が弾くが、その検証は `showSaveFilePicker` より前にあるので、finalize に移しても早期失敗にはならない
+- アセットの付随メタデータ (`size` / `width` / `height`) と投稿タイプ (`PostObj.postType`) は内部表現に保持するが `DownloadJsonObj` には出さない。利用側の絞り込み条件のために持つ
+
+`fanbox-collector` 側の検証も変わる。
+
+- asset の `id` を必須フィールドとして検証する (`body.images[]` / `body.files[]` / `imageMap` / `fileMap`)
+- `imageMap` / `fileMap` はマップのキーと値の `id` が一致することも検証する。identity として使う以上、不一致のまま通すと別のアセットを同一視しうる
+- `body.images` / `body.files` 内で `id` が重複していれば `invalid` にする (`missing` には `body.images[1].id` のように衝突した位置を入れる)
+- `size` / `width` / `height` は非負の安全な整数でなければ欠落として扱う。収集が読まない付随メタデータなので、型が違っても `invalid` にはしない
+
 主な機能:
 - ZIP ダウンロード（File System Access API + 自前 ZipWriter）
 - Bootstrap ベースのタグフィルタリング UI
@@ -66,6 +96,8 @@ tsconfig.declaration.json   # dist/types/ 生成専用 (declaration: true, entry
 `downloadZip` は `DownloadZipResult`（`completedPostCount` / `totalPostCount` / `writtenFileCount` /
 `failedFileCount` / `aborted`）を返す（Issue #13）。各件数の定義は `DownloadZipResult` の JSDoc を参照。
 既存呼び出し元（`createDownloadUI` のブックマークレット向け UI）は戻り値を無視しており、そのままコンパイルできる。
+
+`DownloadObject` / `DownloadManage` はどちらも第 3 引数で `ArchivePathAllocator` を受け取る（省略時は legacy allocator）。
 
 `fanbox-collector.ts` は FANBOX API の型定義、`DownloadManage`（収集時の状態管理）、`addByPostInfo` /
 `convertImageMap` / `convertFileMap` / `convertEmbedMap` / `convertUrlEmbedMap`（postInfo → DownloadObject 変換）

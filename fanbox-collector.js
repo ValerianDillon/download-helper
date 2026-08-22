@@ -1,4 +1,9 @@
-import { createNameKeyedDictionary, DownloadObject, DownloadUtils } from "./download-helper";
+import {
+  createNameKeyedDictionary,
+  DownloadObject,
+  DownloadUtils,
+  joinHtmlFragments
+} from "./download-helper";
 
 export class DownloadManage {
   userId;
@@ -11,10 +16,10 @@ export class DownloadManage {
   tags = new Set;
   isLimitAvailable = false;
   limit = 0;
-  constructor(userId, feeMap) {
+  constructor(userId, feeMap, allocator) {
     this.userId = userId;
     this.feeMap = feeMap;
-    this.downloadObject = new DownloadObject(userId, DownloadManage.utils);
+    this.downloadObject = new DownloadObject(userId, DownloadManage.utils, allocator);
   }
   addFee(fee) {
     this.fees.add(fee);
@@ -62,16 +67,32 @@ function serialize(value) {
     return;
   }
 }
-function decodeImageInfo(value) {
-  if (!isRecord(value) || typeof value.originalUrl !== "string" || typeof value.extension !== "string")
-    return;
-  return { originalUrl: value.originalUrl, extension: value.extension };
+function decodeNonNegativeInteger(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
-function decodeFileInfo(value) {
-  if (!isRecord(value) || typeof value.url !== "string" || typeof value.name !== "string" || typeof value.extension !== "string") {
+function decodeImageInfo(value) {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.originalUrl !== "string" || typeof value.extension !== "string") {
     return;
   }
-  return { url: value.url, name: value.name, extension: value.extension };
+  return {
+    id: value.id,
+    originalUrl: value.originalUrl,
+    extension: value.extension,
+    width: decodeNonNegativeInteger(value.width),
+    height: decodeNonNegativeInteger(value.height)
+  };
+}
+function decodeFileInfo(value) {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.url !== "string" || typeof value.name !== "string" || typeof value.extension !== "string") {
+    return;
+  }
+  return {
+    id: value.id,
+    url: value.url,
+    name: value.name,
+    extension: value.extension,
+    size: decodeNonNegativeInteger(value.size)
+  };
 }
 function decodeEmbedValue(value) {
   const rawJson = serialize(value);
@@ -142,6 +163,27 @@ function decodeRecordOf(value, decodeValue) {
   }
   return decoded;
 }
+function decodeAssetRecordOf(value, decodeValue) {
+  if (!isRecord(value))
+    return;
+  const decoded = createNameKeyedDictionary();
+  for (const [key, item] of Object.entries(value)) {
+    const result = decodeValue(item);
+    if (result === undefined || result.id !== key)
+      return;
+    decoded[key] = result;
+  }
+  return decoded;
+}
+function findDuplicatedAssetId(assets, path) {
+  const seen = new Set;
+  for (const [index, asset] of assets.entries()) {
+    if (seen.has(asset.id))
+      return `${path}[${index}].id`;
+    seen.add(asset.id);
+  }
+  return;
+}
 function decodeArrayOf(value, decodeValue) {
   if (!Array.isArray(value))
     return;
@@ -161,17 +203,23 @@ function decodeBody(type, body, missing) {
       const images = decodeArrayOf(body.images, decodeImageInfo);
       if (!images)
         missing.push("body.images");
+      const duplicated = images && findDuplicatedAssetId(images, "body.images");
+      if (duplicated)
+        missing.push(duplicated);
       if (text === undefined)
         missing.push("body.text");
-      return images && text !== undefined ? { type: "image", body: { text, images } } : undefined;
+      return images && !duplicated && text !== undefined ? { type: "image", body: { text, images } } : undefined;
     }
     case "file": {
       const files = decodeArrayOf(body.files, decodeFileInfo);
       if (!files)
         missing.push("body.files");
+      const duplicated = files && findDuplicatedAssetId(files, "body.files");
+      if (duplicated)
+        missing.push(duplicated);
       if (text === undefined)
         missing.push("body.text");
-      return files && text !== undefined ? { type: "file", body: { text, files } } : undefined;
+      return files && !duplicated && text !== undefined ? { type: "file", body: { text, files } } : undefined;
     }
     case "text": {
       if (text === undefined)
@@ -182,10 +230,10 @@ function decodeBody(type, body, missing) {
       const blocks = decodeArrayOf(body.blocks, decodeBlock);
       if (!blocks)
         missing.push("body.blocks");
-      const imageMap = decodeRecordOf(body.imageMap, decodeImageInfo);
+      const imageMap = decodeAssetRecordOf(body.imageMap, decodeImageInfo);
       if (!imageMap)
         missing.push("body.imageMap");
-      const fileMap = decodeRecordOf(body.fileMap, decodeFileInfo);
+      const fileMap = decodeAssetRecordOf(body.fileMap, decodeFileInfo);
       if (!fileMap)
         missing.push("body.fileMap");
       const embedMap = decodeRecordOf(body.embedMap, decodeEmbedValue);
@@ -241,6 +289,24 @@ function decodeCollectablePost(candidate, raw, body) {
 function isKnownPostType(type) {
   return type === "image" || type === "file" || type === "article" || type === "text";
 }
+function toImageAsset(image, postName) {
+  return {
+    key: { kind: "image", assetId: image.id },
+    name: postName,
+    extension: image.extension,
+    url: image.originalUrl,
+    metadata: { width: image.width, height: image.height }
+  };
+}
+function toFileAsset(file) {
+  return {
+    key: { kind: "file", assetId: file.id },
+    name: file.name,
+    extension: file.extension,
+    url: file.url,
+    metadata: { size: file.size }
+  };
+}
 export function addByPostInfo(downloadManage, postInfo) {
   if (!postInfo) {
     return { status: "unavailable", reason: "missing-body" };
@@ -281,6 +347,7 @@ ${postType}@${postInfo.id} missing: ${decoded.missing.join(", ")}`);
   const post = decoded.post;
   const postName = post.title;
   const postObject = downloadManage.downloadObject.addPost(postName);
+  postObject.setPostType(post.type);
   const publishedDatetime = post.metadata.publishedDatetime;
   if (typeof publishedDatetime === "string" && publishedDatetime.length > 0) {
     postObject.setPublishedDatetime(publishedDatetime);
@@ -291,71 +358,74 @@ ${postType}@${postInfo.id} missing: ${decoded.missing.join(", ")}`);
   const header = ((url) => {
     if (url) {
       const ext = url.split(".").pop() ?? "";
-      return `${postObject.getImageLinkTag(postObject.setCover("cover", ext, url))}<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>
-`;
+      return [
+        ...postObject.getImageLinkTag(postObject.setCover("cover", ext, url)),
+        `<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>
+`
+      ];
     }
-    return `<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>
+    return [`<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>
 <br>
-`;
+`];
   })(post.coverImageUrl);
   let parsedText;
   switch (post.type) {
     case "image": {
-      const images = post.body.images.map((it) => postObject.addFile(postName, it.extension, it.originalUrl));
-      const imageTags = images.map((it) => postObject.getImageLinkTag(it)).join(`<br>
+      const images = post.body.images.map((it) => postObject.addFile(toImageAsset(it, postName)));
+      const imageTags = joinHtmlFragments(images.map((it) => postObject.getImageLinkTag(it)), `<br>
 `);
       const text = post.body.text.split(`
 `).map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`).join(`<br>
 `);
-      postObject.setHtml(`${header + imageTags}<br>
-${text}`);
+      postObject.setHtml([...header, ...imageTags, `<br>
+`, text]);
       parsedText = `${post.body.text}
 `;
       break;
     }
     case "file": {
-      const files = post.body.files.map((it) => postObject.addFile(it.name, it.extension, it.url));
-      const fileTags = files.map((it) => postObject.getAutoAssignedLinkTag(it)).join(`<br>
+      const files = post.body.files.map((it) => postObject.addFile(toFileAsset(it)));
+      const fileTags = joinHtmlFragments(files.map((it) => postObject.getAutoAssignedLinkTag(it)), `<br>
 `);
       const text = post.body.text.split(`
 `).map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`).join(`<br>
 `);
-      postObject.setHtml(`${header + fileTags}<br>
-${text}`);
+      postObject.setHtml([...header, ...fileTags, `<br>
+`, text]);
       parsedText = `${post.body.text}
 `;
       break;
     }
     case "article": {
-      const images = convertImageMap(post.body.imageMap, post.body.blocks).map((it) => postObject.addFile(postName, it.extension, it.originalUrl));
-      const files = convertFileMap(post.body.fileMap, post.body.blocks).map((it) => postObject.addFile(it.name, it.extension, it.url));
+      const images = convertImageMap(post.body.imageMap, post.body.blocks).map((it) => postObject.addFile(toImageAsset(it, postName)));
+      const files = convertFileMap(post.body.fileMap, post.body.blocks).map((it) => postObject.addFile(toFileAsset(it)));
       const embeds = convertEmbedMap(post.body.embedMap, post.body.blocks);
       const urlEmbeds = convertUrlEmbedMap(post.body.urlEmbedMap, post.body.blocks);
       let cntImg = 0, cntFile = 0, cntEmbed = 0, cntUrlEmbed = 0;
-      const body = post.body.blocks.map((it) => {
+      const body = joinHtmlFragments(post.body.blocks.map((it) => {
         switch (it.type) {
           case "p":
-            return `<span>${DownloadManage.utils.escapeHtml(it.text)}</span>`;
+            return [`<span>${DownloadManage.utils.escapeHtml(it.text)}</span>`];
           case "header":
-            return `<h2><span>${DownloadManage.utils.escapeHtml(it.text)}</span></h2>`;
+            return [`<h2><span>${DownloadManage.utils.escapeHtml(it.text)}</span></h2>`];
           case "file": {
             if (cntFile >= files.length)
-              return "";
+              return [];
             return postObject.getAutoAssignedLinkTag(files[cntFile++]);
           }
           case "image": {
             if (cntImg >= images.length)
-              return "";
+              return [];
             return postObject.getImageLinkTag(images[cntImg++]);
           }
           case "embed": {
             if (cntEmbed >= embeds.length)
-              return "";
-            return `<span>${DownloadManage.utils.escapeHtml(embeds[cntEmbed++].rawJson)}</span>`;
+              return [];
+            return [`<span>${DownloadManage.utils.escapeHtml(embeds[cntEmbed++].rawJson)}</span>`];
           }
           case "url_embed": {
             if (cntUrlEmbed >= urlEmbeds.length)
-              return "";
+              return [];
             const urlEmbedInfo = urlEmbeds[cntUrlEmbed++];
             switch (urlEmbedInfo.type) {
               case "default":
@@ -363,33 +433,34 @@ ${text}`);
               case "html":
               case "html.card": {
                 const iframeUrl = urlEmbedInfo.html.match(/<iframe.*src="(http.*)"/)?.[1];
-                return iframeUrl ? postObject.getLinkTag(iframeUrl, "iframe link") : `
+                return iframeUrl ? postObject.getLinkTag(iframeUrl, "iframe link") : [`
 ${DownloadManage.utils.escapeHtml(urlEmbedInfo.html)}
 
-`;
+`];
               }
               case "fanbox.post": {
                 const url = `https://www.fanbox.cc/@${urlEmbedInfo.postInfo.creatorId}/posts/${urlEmbedInfo.postInfo.id}`;
                 return postObject.getLinkTag(url, urlEmbedInfo.postInfo.title);
               }
               case "unknown":
-                return `<span>${DownloadManage.utils.escapeHtml(urlEmbedInfo.rawJson)}</span>`;
+                return [`<span>${DownloadManage.utils.escapeHtml(urlEmbedInfo.rawJson)}</span>`];
               default: {
                 const exhaustive = urlEmbedInfo;
-                return `${exhaustive}`;
+                return [`${exhaustive}`];
               }
             }
           }
           case "unknown":
-            return console.error(`unknown block type: ${it.originalType}`);
+            console.error(`unknown block type: ${it.originalType}`);
+            return [];
           default: {
             const exhaustive = it;
-            return `${exhaustive}`;
+            return [`${exhaustive}`];
           }
         }
-      }).join(`<br>
+      }), `<br>
 `);
-      postObject.setHtml(header + body);
+      postObject.setHtml([...header, ...body]);
       parsedText = `${post.body.blocks.filter((it) => it.type === "p" || it.type === "header").map((it) => it.text).join(`
 `)}
 `;
@@ -400,7 +471,7 @@ ${DownloadManage.utils.escapeHtml(urlEmbedInfo.html)}
 `).map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`).join(`<br>
 `);
       parsedText = post.body.text;
-      postObject.setHtml(header + body);
+      postObject.setHtml([...header, body]);
       break;
     }
   }

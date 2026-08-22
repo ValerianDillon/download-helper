@@ -3,7 +3,15 @@
  * pixiv FANBOX の API レスポンス型、DownloadManage (収集時の状態管理)、
  * postInfo → DownloadObject への変換処理をまとめる。
  */
-import { createNameKeyedDictionary, DownloadObject, DownloadUtils } from './download-helper';
+import {
+  type ArchivePathAllocator,
+  type AssetInput,
+  createNameKeyedDictionary,
+  DownloadObject,
+  DownloadUtils,
+  type HtmlFragment,
+  joinHtmlFragments,
+} from './download-helper';
 
 /**
  * プランAPIの型
@@ -118,9 +126,18 @@ export type PostInfoCandidate = {
  * 両者を同じ型で表すと「検証していない保証」を型で主張することになるため公開もしない。
  */
 
-/** articleタイプのマップ型に対する値の型 */
-type ImageInfo = { originalUrl: string; extension: string };
-type FileInfo = { url: string; name: string; extension: string };
+/**
+ * アセットの内部表現。
+ *
+ * id はアセットの identity (AssetKey の assetId) になるため必須にする。位置や名前を identity に
+ * すると、収集後にアセットを間引いたときに別のアセットを同一視しうる。
+ * size / width / height は情報表示と絞り込みのための付随メタデータで、非負の安全な整数でなければ
+ * 欠落として扱う (読めないことを理由に投稿全体を invalid にはしない)。
+ * size は file 系にのみ、width / height は image 系にのみ存在する (実測 2026-08-22)。
+ * id は image 系・file 系とも、配列でもマップでも実 API に存在する (実測 2026-08-22)。
+ */
+type ImageInfo = { id: string; originalUrl: string; extension: string; width?: number; height?: number };
+type FileInfo = { id: string; url: string; name: string; extension: string; size?: number };
 
 /**
  * embedMap の値。消費側は中身を解釈せず JSON 文字列として出すだけなので、
@@ -233,11 +250,17 @@ export class DownloadManage {
 
   private limit = 0;
 
+  /**
+   * @param userId クリエイターID
+   * @param feeMap 支援額とプラン名の対応
+   * @param allocator archive path の割り当て器 (省略時は従来の採番規則)
+   */
   constructor(
     public readonly userId: string,
     public readonly feeMap: Map<number, string>,
+    allocator?: ArchivePathAllocator,
   ) {
-    this.downloadObject = new DownloadObject(userId, DownloadManage.utils);
+    this.downloadObject = new DownloadObject(userId, DownloadManage.utils, allocator);
   }
 
   addFee(fee: number) {
@@ -338,22 +361,49 @@ function serialize(value: unknown): string | undefined {
   }
 }
 
+/**
+ * 非負の安全な整数だけを採る。欠落も型不正も同じ undefined にする
+ * (付随メタデータなので、読めないことを理由に投稿全体を invalid にしない)
+ */
+function decodeNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 function decodeImageInfo(value: unknown): ImageInfo | undefined {
-  if (!isRecord(value) || typeof value.originalUrl !== 'string' || typeof value.extension !== 'string')
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    typeof value.originalUrl !== 'string' ||
+    typeof value.extension !== 'string'
+  ) {
     return undefined;
-  return { originalUrl: value.originalUrl, extension: value.extension };
+  }
+  return {
+    id: value.id,
+    originalUrl: value.originalUrl,
+    extension: value.extension,
+    width: decodeNonNegativeInteger(value.width),
+    height: decodeNonNegativeInteger(value.height),
+  };
 }
 
 function decodeFileInfo(value: unknown): FileInfo | undefined {
   if (
     !isRecord(value) ||
+    typeof value.id !== 'string' ||
     typeof value.url !== 'string' ||
     typeof value.name !== 'string' ||
     typeof value.extension !== 'string'
   ) {
     return undefined;
   }
-  return { url: value.url, name: value.name, extension: value.extension };
+  return {
+    id: value.id,
+    url: value.url,
+    name: value.name,
+    extension: value.extension,
+    size: decodeNonNegativeInteger(value.size),
+  };
 }
 
 /** embedMap の値。消費側は中身を解釈せず JSON 文字列にするだけなので、ここで文字列化まで済ませる */
@@ -454,6 +504,41 @@ function decodeRecordOf<T>(
   return decoded;
 }
 
+/**
+ * アセットのマップを decode する。キーと値の id が一致することも確認する。
+ *
+ * id をアセットの identity に使う以上、不一致のまま通すと block が参照するキーと
+ * 実際に登録したアセットの identity が食い違い、別のアセットを同一視しうる。
+ */
+function decodeAssetRecordOf<T extends { id: string }>(
+  value: unknown,
+  decodeValue: (item: unknown) => T | undefined,
+): Record<string, T> | undefined {
+  if (!isRecord(value)) return undefined;
+  // キーは外部入力なので '__proto__' がありうる (decodeRecordOf と同じ理由)
+  const decoded = createNameKeyedDictionary<T>();
+  for (const [key, item] of Object.entries(value)) {
+    const result = decodeValue(item);
+    if (result === undefined || result.id !== key) return undefined;
+    decoded[key] = result;
+  }
+  return decoded;
+}
+
+/**
+ * アセット配列内で id が重複していないか調べる。
+ * 重複していれば最初に衝突した要素のパスを返す (AssetKey が投稿内で一意でなくなり、
+ * HTML の参照が別のアセットへ解決しうるため取り込まない)
+ */
+function findDuplicatedAssetId(assets: readonly { id: string }[], path: string): string | undefined {
+  const seen = new Set<string>();
+  for (const [index, asset] of assets.entries()) {
+    if (seen.has(asset.id)) return `${path}[${index}].id`;
+    seen.add(asset.id);
+  }
+  return undefined;
+}
+
 /** 配列の各要素を decode する。1 つでも decode できなければ undefined */
 function decodeArrayOf<T>(value: unknown, decodeValue: (item: unknown) => T | undefined): T[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -483,14 +568,18 @@ function decodeBody(type: KnownPostType, body: Record<string, unknown>, missing:
     case 'image': {
       const images = decodeArrayOf(body.images, decodeImageInfo);
       if (!images) missing.push('body.images');
+      const duplicated = images && findDuplicatedAssetId(images, 'body.images');
+      if (duplicated) missing.push(duplicated);
       if (text === undefined) missing.push('body.text');
-      return images && text !== undefined ? { type: 'image', body: { text, images } } : undefined;
+      return images && !duplicated && text !== undefined ? { type: 'image', body: { text, images } } : undefined;
     }
     case 'file': {
       const files = decodeArrayOf(body.files, decodeFileInfo);
       if (!files) missing.push('body.files');
+      const duplicated = files && findDuplicatedAssetId(files, 'body.files');
+      if (duplicated) missing.push(duplicated);
       if (text === undefined) missing.push('body.text');
-      return files && text !== undefined ? { type: 'file', body: { text, files } } : undefined;
+      return files && !duplicated && text !== undefined ? { type: 'file', body: { text, files } } : undefined;
     }
     case 'text': {
       if (text === undefined) missing.push('body.text');
@@ -499,9 +588,9 @@ function decodeBody(type: KnownPostType, body: Record<string, unknown>, missing:
     case 'article': {
       const blocks = decodeArrayOf(body.blocks, decodeBlock);
       if (!blocks) missing.push('body.blocks');
-      const imageMap = decodeRecordOf(body.imageMap, decodeImageInfo);
+      const imageMap = decodeAssetRecordOf(body.imageMap, decodeImageInfo);
       if (!imageMap) missing.push('body.imageMap');
-      const fileMap = decodeRecordOf(body.fileMap, decodeFileInfo);
+      const fileMap = decodeAssetRecordOf(body.fileMap, decodeFileInfo);
       if (!fileMap) missing.push('body.fileMap');
       const embedMap = decodeRecordOf(body.embedMap, decodeEmbedValue);
       if (!embedMap) missing.push('body.embedMap');
@@ -575,6 +664,36 @@ function isKnownPostType(type: string): type is KnownPostType {
 }
 
 /**
+ * 画像を addFile の引数にする。画像のファイル名は従来どおり投稿タイトルを使う
+ * (FANBOX の画像アセットは名前を持たないため)
+ * @param image 検証済みの画像
+ * @param postName 投稿タイトル
+ */
+function toImageAsset(image: ImageInfo, postName: string): AssetInput {
+  return {
+    key: { kind: 'image', assetId: image.id },
+    name: postName,
+    extension: image.extension,
+    url: image.originalUrl,
+    metadata: { width: image.width, height: image.height },
+  };
+}
+
+/**
+ * 添付ファイルを addFile の引数にする
+ * @param file 検証済みの添付ファイル
+ */
+function toFileAsset(file: FileInfo): AssetInput {
+  return {
+    key: { kind: 'file', assetId: file.id },
+    name: file.name,
+    extension: file.extension,
+    url: file.url,
+    metadata: { size: file.size },
+  };
+}
+
+/**
  * 未検証の投稿オブジェクトを検証して URL リストに追加する
  *
  * 分類の順序には理由がある。
@@ -635,6 +754,7 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
   const post = decoded.post;
   const postName = post.title;
   const postObject = downloadManage.downloadObject.addPost(postName);
+  postObject.setPostType(post.type);
   const publishedDatetime = post.metadata.publishedDatetime;
   if (typeof publishedDatetime === 'string' && publishedDatetime.length > 0) {
     postObject.setPublishedDatetime(publishedDatetime);
@@ -642,44 +762,53 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
   postObject.setTags([downloadManage.getTagByFee(post.feeRequired), ...post.tags]);
   downloadManage.addFee(post.feeRequired);
   downloadManage.addTags(...post.tags);
-  const header: string = ((url: string | null | undefined) => {
+  const header: HtmlFragment[] = ((url: string | null | undefined) => {
     if (url) {
       const ext = url.split('.').pop() ?? '';
-      return `${postObject.getImageLinkTag(postObject.setCover('cover', ext, url))}<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>\n`;
+      return [
+        ...postObject.getImageLinkTag(postObject.setCover('cover', ext, url)),
+        `<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>\n`,
+      ];
     }
-    return `<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>\n<br>\n`;
+    return [`<h5>${DownloadManage.utils.escapeHtml(postName)}</h5>\n<br>\n`];
   })(post.coverImageUrl);
 
   let parsedText: string;
   switch (post.type) {
     case 'image': {
-      const images = post.body.images.map((it) => postObject.addFile(postName, it.extension, it.originalUrl));
-      const imageTags = images.map((it) => postObject.getImageLinkTag(it)).join('<br>\n');
+      const images = post.body.images.map((it) => postObject.addFile(toImageAsset(it, postName)));
+      const imageTags = joinHtmlFragments(
+        images.map((it) => postObject.getImageLinkTag(it)),
+        '<br>\n',
+      );
       const text = post.body.text
         .split('\n')
         .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
-      postObject.setHtml(`${header + imageTags}<br>\n${text}`);
+      postObject.setHtml([...header, ...imageTags, '<br>\n', text]);
       parsedText = `${post.body.text}\n`;
       break;
     }
     case 'file': {
-      const files = post.body.files.map((it) => postObject.addFile(it.name, it.extension, it.url));
-      const fileTags = files.map((it) => postObject.getAutoAssignedLinkTag(it)).join('<br>\n');
+      const files = post.body.files.map((it) => postObject.addFile(toFileAsset(it)));
+      const fileTags = joinHtmlFragments(
+        files.map((it) => postObject.getAutoAssignedLinkTag(it)),
+        '<br>\n',
+      );
       const text = post.body.text
         .split('\n')
         .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
-      postObject.setHtml(`${header + fileTags}<br>\n${text}`);
+      postObject.setHtml([...header, ...fileTags, '<br>\n', text]);
       parsedText = `${post.body.text}\n`;
       break;
     }
     case 'article': {
       const images = convertImageMap(post.body.imageMap, post.body.blocks).map((it) =>
-        postObject.addFile(postName, it.extension, it.originalUrl),
+        postObject.addFile(toImageAsset(it, postName)),
       );
       const files = convertFileMap(post.body.fileMap, post.body.blocks).map((it) =>
-        postObject.addFile(it.name, it.extension, it.url),
+        postObject.addFile(toFileAsset(it)),
       );
       const embeds = convertEmbedMap(post.body.embedMap, post.body.blocks);
       const urlEmbeds = convertUrlEmbedMap(post.body.urlEmbedMap, post.body.blocks);
@@ -687,28 +816,30 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
         cntFile = 0,
         cntEmbed = 0,
         cntUrlEmbed = 0;
-      const body = post.body.blocks
-        .map((it) => {
+      // 何も描画しない block は空の断片列を返す。区切り (<br>) は joinHtmlFragments が
+      // 位置で入れるので、文字列連結時代に '' を返していたときと出力は変わらない
+      const body = joinHtmlFragments(
+        post.body.blocks.map((it): HtmlFragment[] => {
           switch (it.type) {
             case 'p':
-              return `<span>${DownloadManage.utils.escapeHtml(it.text)}</span>`;
+              return [`<span>${DownloadManage.utils.escapeHtml(it.text)}</span>`];
             case 'header':
-              return `<h2><span>${DownloadManage.utils.escapeHtml(it.text)}</span></h2>`;
+              return [`<h2><span>${DownloadManage.utils.escapeHtml(it.text)}</span></h2>`];
             case 'file': {
-              if (cntFile >= files.length) return '';
+              if (cntFile >= files.length) return [];
               return postObject.getAutoAssignedLinkTag(files[cntFile++]);
             }
             case 'image': {
-              if (cntImg >= images.length) return '';
+              if (cntImg >= images.length) return [];
               return postObject.getImageLinkTag(images[cntImg++]);
             }
             case 'embed': {
-              if (cntEmbed >= embeds.length) return '';
+              if (cntEmbed >= embeds.length) return [];
               // 中身の型が分からないので JSON 文字列のまま出す (decode 時に文字列化済み)
-              return `<span>${DownloadManage.utils.escapeHtml(embeds[cntEmbed++].rawJson)}</span>`;
+              return [`<span>${DownloadManage.utils.escapeHtml(embeds[cntEmbed++].rawJson)}</span>`];
             }
             case 'url_embed': {
-              if (cntUrlEmbed >= urlEmbeds.length) return '';
+              if (cntUrlEmbed >= urlEmbeds.length) return [];
               const urlEmbedInfo = urlEmbeds[cntUrlEmbed++];
               switch (urlEmbedInfo.type) {
                 case 'default':
@@ -718,7 +849,7 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
                   const iframeUrl = urlEmbedInfo.html.match(/<iframe.*src="(http.*)"/)?.[1];
                   return iframeUrl
                     ? postObject.getLinkTag(iframeUrl, 'iframe link')
-                    : `\n${DownloadManage.utils.escapeHtml(urlEmbedInfo.html)}\n\n`;
+                    : [`\n${DownloadManage.utils.escapeHtml(urlEmbedInfo.html)}\n\n`];
                 }
                 case 'fanbox.post': {
                   const url = `https://www.fanbox.cc/@${urlEmbedInfo.postInfo.creatorId}/posts/${urlEmbedInfo.postInfo.id}`;
@@ -726,25 +857,27 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
                 }
                 case 'unknown':
                   // 中身の型が分からないので JSON 文字列のまま出す (decode 時に文字列化済み)
-                  return `<span>${DownloadManage.utils.escapeHtml(urlEmbedInfo.rawJson)}</span>`;
+                  return [`<span>${DownloadManage.utils.escapeHtml(urlEmbedInfo.rawJson)}</span>`];
                 default: {
                   // 既知 variant を追加したときの処理漏れをコンパイル時に検出する
                   const exhaustive: never = urlEmbedInfo;
-                  return `${exhaustive}`;
+                  return [`${exhaustive}`];
                 }
               }
             }
             case 'unknown':
               // 正規化前の type 名でログを出す (sentinel に畳んだせいで診断が劣化しないように)
-              return console.error(`unknown block type: ${it.originalType}`);
+              console.error(`unknown block type: ${it.originalType}`);
+              return [];
             default: {
               const exhaustive: never = it;
-              return `${exhaustive}`;
+              return [`${exhaustive}`];
             }
           }
-        })
-        .join('<br>\n');
-      postObject.setHtml(header + body);
+        }),
+        '<br>\n',
+      );
+      postObject.setHtml([...header, ...body]);
       parsedText = `${post.body.blocks
         .filter((it): it is TextBlock => it.type === 'p' || it.type === 'header')
         .map((it) => it.text)
@@ -757,7 +890,7 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
         .map((it) => `<span>${DownloadManage.utils.escapeHtml(it)}</span>`)
         .join('<br>\n');
       parsedText = post.body.text;
-      postObject.setHtml(header + body);
+      postObject.setHtml([...header, body]);
       break;
     }
   }

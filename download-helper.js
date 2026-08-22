@@ -1,3 +1,19 @@
+function freezeAssetKey(key) {
+  return Object.freeze(key.kind === "cover" ? { kind: "cover" } : { kind: key.kind, assetId: key.assetId });
+}
+export function assetKeyToString(key) {
+  return key.kind === "cover" ? "cover" : `${key.kind}:${key.assetId}`;
+}
+export function joinHtmlFragments(parts, separator) {
+  const joined = [];
+  parts.forEach((part, index) => {
+    if (index > 0)
+      joined.push(separator);
+    joined.push(...part);
+  });
+  return joined;
+}
+
 export class DownloadUtils {
   audioExtension = /\.(mp3|m4a|ogg)$/;
   imageExtension = /\.(apng|avif|gif|jpg|jpeg|jfif|pjpeg|pjp|png|svg|webp)$/;
@@ -89,20 +105,91 @@ export class DownloadUtils {
 export function createNameKeyedDictionary() {
   return Object.create(null);
 }
+export function createLegacyArchivePathAllocator(utils) {
+  return {
+    allocatePostDirectoryNames(posts) {
+      const groups = createNameKeyedDictionary();
+      posts.forEach((post, index) => {
+        const key = utils.encodeFileName(post.name);
+        const group = groups[key];
+        if (group === undefined) {
+          groups[key] = [index];
+        } else {
+          group.push(index);
+        }
+      });
+      const names = new Array(posts.length);
+      for (const [key, indexes] of Object.entries(groups)) {
+        indexes.forEach((postIndex, indexInGroup) => {
+          names[postIndex] = utils.getFileName(key, "", indexes.length, indexInGroup, false);
+        });
+      }
+      return names;
+    },
+    allocateAssetPaths(post) {
+      const groups = createNameKeyedDictionary();
+      for (const file of post.files) {
+        const key = utils.encodeFileName(file.name);
+        const group = groups[key];
+        if (group === undefined) {
+          groups[key] = [file];
+        } else {
+          group.push(file);
+        }
+      }
+      const files = [];
+      for (const [key, group] of Object.entries(groups)) {
+        group.forEach((file, indexInGroup) => {
+          const extension = file.extension ? utils.encodeFileName(file.extension) : "";
+          files.push({
+            key: file.key,
+            archiveName: utils.getFileName(key, extension, group.length, indexInGroup, true)
+          });
+        });
+      }
+      const cover = post.cover;
+      return {
+        files,
+        coverArchiveName: cover ? utils.getFileName(utils.encodeFileName(cover.name), utils.encodeFileName(cover.extension), 1, 0, true) : undefined
+      };
+    }
+  };
+}
+function assertPostDirectoryNames(names, postCount, utils) {
+  if (names.length !== postCount) {
+    throw new Error(`allocator が返した投稿ディレクトリ名の数が投稿と一致しません (期待 ${postCount}, 実際 ${names.length})`);
+  }
+  for (let index = 0;index < postCount; index++) {
+    const name = names[index];
+    if (typeof name !== "string") {
+      throw new Error(`allocator が返した投稿ディレクトリ名が文字列ではありません (index ${index})`);
+    }
+    assertNormalizedArchiveName(name, utils, `投稿ディレクトリ名 (index ${index})`);
+  }
+}
+function assertNormalizedArchiveName(name, utils, context) {
+  if (utils.encodeFileName(name) !== name) {
+    throw new Error(`allocator が返した${context}が正規化されていません (encodeFileName を通した結果と異なります): ${JSON.stringify(name)}`);
+  }
+}
 
 export class DownloadObject {
   downloadObj;
   utils;
+  allocator;
   orderedPosts = [];
   url = "#main";
   tags;
-  constructor(id, utils) {
-    this.downloadObj = { posts: createNameKeyedDictionary(), id };
+  constructor(id, utils, allocator) {
+    this.downloadObj = { posts: [], id };
     this.utils = utils;
+    this.allocator = allocator ?? createLegacyArchivePathAllocator(utils);
   }
   stringify() {
+    const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
+    assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
     const downloadJson = {
-      posts: this.orderedPosts.map((it) => it.toJsonObjBy(this.downloadObj.posts)),
+      posts: this.orderedPosts.map((it, index) => it.toJsonObj(directoryNames[index], this.allocator)),
       id: this.downloadObj.id,
       url: this.url,
       tags: this.tags ?? this.collectTags(),
@@ -118,29 +205,23 @@ export class DownloadObject {
     this.tags = tags;
   }
   addPost(name) {
-    const encodedName = this.utils.encodeFileName(name);
-    if (this.downloadObj.posts[encodedName] === undefined) {
-      this.downloadObj.posts[encodedName] = [];
-    }
-    const postObj = { name, info: "", files: createNameKeyedDictionary(), html: "", tags: [] };
-    this.downloadObj.posts[encodedName].push(postObj);
+    const postObj = { name, info: "", files: [], html: [], tags: [] };
+    this.downloadObj.posts.push(postObj);
     const postObject = new PostObject(postObj, this.utils);
     this.orderedPosts.push(postObject);
     return postObject;
   }
   countPost() {
-    return Object.values(this.downloadObj.posts).reduce((s, posts) => s + posts.length, 0);
+    return this.downloadObj.posts.length;
   }
   countFile() {
-    return Object.values(this.downloadObj.posts).reduce((allFileSize, posts) => allFileSize + posts.reduce((postFileSize, post) => postFileSize + Object.values(post.files).reduce((s, files) => s + files.length, 0), 0), 0);
+    return this.downloadObj.posts.reduce((sum, post) => sum + post.files.length, 0);
   }
   collectTags() {
     const tags = new Set;
-    for (const posts of Object.values(this.downloadObj.posts)) {
-      for (const post of posts) {
-        for (const tag of post.tags) {
-          tags.add(tag);
-        }
+    for (const post of this.downloadObj.posts) {
+      for (const tag of post.tags) {
+        tags.add(tag);
       }
     }
     return [...tags];
@@ -158,7 +239,7 @@ export class PostObject {
     this.postObj.info = info;
   }
   setHtml(html) {
-    this.postObj.html = html;
+    this.postObj.html = html.map((fragment) => typeof fragment === "string" ? fragment : Object.freeze({ assetRef: freezeAssetKey(fragment.assetRef) }));
   }
   setTags(tags) {
     this.postObj.tags = tags;
@@ -166,18 +247,36 @@ export class PostObject {
   setPublishedDatetime(iso) {
     this.postObj.publishedDatetime = iso;
   }
+  setPostType(type) {
+    this.postObj.postType = type;
+  }
   setCover(name, extension, url) {
-    const fileObj = { name, extension: extension ? `.${extension}` : "", url };
+    const fileObj = {
+      name,
+      extension: extension ? `.${extension}` : "",
+      url,
+      key: freezeAssetKey({ kind: "cover" }),
+      metadata: {}
+    };
     this.postObj.cover = fileObj;
     return new FileObject(fileObj, this.utils);
   }
-  addFile(name, extension, url) {
-    const encodedName = this.utils.encodeFileName(name);
-    if (this.postObj.files[encodedName] === undefined) {
-      this.postObj.files[encodedName] = [];
+  addFile(asset) {
+    if (asset.key.kind === "cover") {
+      throw new Error("addFile: cover の AssetKey は本文アセットに使えません (カバーは setCover が持つ)");
     }
-    const fileObj = { name, extension: extension ? `.${extension}` : "", url };
-    this.postObj.files[encodedName].push(fileObj);
+    const duplicated = this.postObj.files.some((it) => assetKeyToString(it.key) === assetKeyToString(asset.key));
+    if (duplicated) {
+      throw new Error(`asset key is duplicated: ${assetKeyToString(asset.key)}`);
+    }
+    const fileObj = {
+      name: asset.name,
+      extension: asset.extension ? `.${asset.extension}` : "",
+      url: asset.url,
+      key: freezeAssetKey(asset.key),
+      metadata: asset.metadata ?? {}
+    };
+    this.postObj.files.push(fileObj);
     return new FileObject(fileObj, this.utils);
   }
   getAutoAssignedLinkTag(fileObject) {
@@ -194,96 +293,127 @@ export class PostObject {
     }
   }
   getAudioLinkTag(fileObject) {
-    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const ref = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">
+    return [
+      `<a class="hl" href="`,
+      ref,
+      `" download="${escapedDownload}"><div class="post card">
 ` + `<div class="card-header">${this.utils.escapeHtml(fileObject.getOriginalName())}</div>
-` + `<audio class="card-img-top" src="${escapedPath}" controls/>
-</div></a>`;
+` + `<audio class="card-img-top" src="`,
+      ref,
+      `" controls/>
+</div></a>`
+    ];
   }
   getLinkTag(url, title) {
-    return `<a class="hl" href="${this.utils.escapeHtml(url)}"><div class="post card text-center"><p class="pt-2">
+    return [
+      `<a class="hl" href="${this.utils.escapeHtml(url)}"><div class="post card text-center"><p class="pt-2">
 ` + `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-box-arrow-up-left" viewBox="0 0 16 16">
 ` + `<path fill-rule="evenodd" d="M7.364 3.5a.5.5 0 0 1 .5-.5H14.5A1.5 1.5 0 0 1 16 4.5v10a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 3 14.5V7.864a.5.5 0 1 1 1 0V14.5a.5.5 0 0 0 .5.5h10a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5H7.864a.5.5 0 0 1-.5-.5z"/>
 ` + `<path fill-rule="evenodd" d="M0 .5A.5.5 0 0 1 .5 0h5a.5.5 0 0 1 0 1H1.707l8.147 8.146a.5.5 0 0 1-.708.708L1 1.707V5.5a.5.5 0 0 1-1 0v-5z"/>
-` + `</svg> ${this.utils.escapeHtml(title)}</p></div></a>`;
+` + `</svg> ${this.utils.escapeHtml(title)}</p></div></a>`
+    ];
   }
   getFileLinkTag(fileObject) {
-    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const ref = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return `<a class="hl" href="${escapedPath}" download="${escapedDownload}">` + `<div class="post card text-center"><p class="pt-2">
+    return [
+      `<a class="hl" href="`,
+      ref,
+      `" download="${escapedDownload}">` + `<div class="post card text-center"><p class="pt-2">
 ` + `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-download" viewBox="0 0 16 16">
 ` + `<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>
 ` + `<path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/>
-` + `</svg> ${this.utils.escapeHtml(fileObject.getOriginalName() + fileObject.getOriginalExtension())}</p></div></a>`;
+` + `</svg> ${this.utils.escapeHtml(fileObject.getOriginalName() + fileObject.getOriginalExtension())}</p></div></a>`
+    ];
   }
   getImageLinkTag(fileObject) {
-    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const ref = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">
-` + `<img class="card-img-top" src="${escapedPath}" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>
-</div></a>`;
+    return [
+      `<a class="hl" href="`,
+      ref,
+      `" download="${escapedDownload}"><div class="post card">
+<img class="card-img-top" src="`,
+      ref,
+      `" alt="${this.utils.escapeHtml(fileObject.getOriginalName())}"/>
+</div></a>`
+    ];
   }
   getVideoLinkTag(fileObject) {
-    const escapedPath = this.utils.escapeHtml(this.getCurrentFilePath(fileObject));
+    const ref = { assetRef: fileObject.getKey() };
     const escapedDownload = this.utils.escapeHtml(fileObject.getEncodedName() + fileObject.getEncodedExtension());
-    return `<a class="hl" href="${escapedPath}" download="${escapedDownload}"><div class="post card">
-` + `<video class="card-img-top" src="${escapedPath}" controls/>
-</div></a>`;
+    return [
+      `<a class="hl" href="`,
+      ref,
+      `" download="${escapedDownload}"><div class="post card">
+<video class="card-img-top" src="`,
+      ref,
+      `" controls/>
+</div></a>`
+    ];
   }
-  getCurrentFilePath(fileObject) {
-    const encodedName = fileObject.getEncodedName();
-    if (fileObject.equals(this.postObj.cover)) {
-      const fileName = this.utils.getFileName(encodedName, fileObject.getEncodedExtension(), 1, 0, true);
-      return `./${this.utils.encodeURI(fileName)}`;
+  toJsonObj(directoryName, allocator) {
+    const allocation = allocator.allocateAssetPaths(this.postObj);
+    const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it]));
+    this.assertAllocationCoversAssets(allocation, fileByKey);
+    const pathByKey = new Map;
+    for (const { key, archiveName } of allocation.files) {
+      pathByKey.set(assetKeyToString(key), archiveName);
     }
-    if (this.postObj.files[encodedName] === undefined) {
-      throw new Error(`file object is undefined: ${fileObject.getOriginalName()}`);
+    const cover = this.postObj.cover ? { url: this.postObj.cover.url, name: allocation.coverArchiveName } : undefined;
+    if (cover) {
+      pathByKey.set("cover", cover.name);
     }
-    const index = this.postObj.files[encodedName].findIndex((it) => fileObject.equals(it));
-    if (index < 0) {
-      throw new Error(`file object is not found: ${fileObject.getOriginalName()}`);
-    }
-    const fileName = this.utils.getFileName(encodedName, fileObject.getEncodedExtension(), this.postObj.files[encodedName].length, index, true);
-    return `./${this.utils.encodeURI(fileName)}`;
-  }
-  toJsonObjBy(posts) {
-    const key = this.utils.encodeFileName(this.postObj.name);
-    const postIndex = posts[key]?.indexOf(this.postObj);
-    if (postIndex === undefined || postIndex < 0) {
-      throw new Error(`post object is not found: ${this.postObj.name}`);
-    }
-    const encodedName = this.utils.getFileName(key, "", posts[key].length, postIndex, false);
-    const cover = this.postObj.cover ? {
-      url: this.postObj.cover.url,
-      name: this.utils.getFileName(this.postObj.cover.name, this.postObj.cover.extension, 1, 0, true)
-    } : undefined;
     return {
       originalName: this.postObj.name,
-      encodedName,
+      encodedName: directoryName,
       informationText: this.postObj.info,
-      htmlText: this.postObj.html,
-      files: this.collectFiles(),
+      htmlText: this.resolveHtml(pathByKey),
+      files: allocation.files.map(({ key, archiveName }) => {
+        const file = fileByKey.get(assetKeyToString(key));
+        return { url: file.url, originalName: file.name, encodedName: archiveName };
+      }),
       tags: this.postObj.tags,
       cover,
       publishedDatetime: this.postObj.publishedDatetime
     };
   }
-  collectFiles() {
-    const ret = [];
-    for (const [key, fileObjArray] of Object.entries(this.postObj.files)) {
-      let fileIndex = 0;
-      for (const fileObj of fileObjArray) {
-        const extension = fileObj.extension ? this.utils.encodeFileName(fileObj.extension) : "";
-        const encodedName = this.utils.getFileName(key, extension, fileObjArray.length, fileIndex++, true);
-        ret.push({
-          url: fileObj.url,
-          originalName: fileObj.name,
-          encodedName
-        });
-      }
+  assertAllocationCoversAssets(allocation, fileByKey) {
+    const expected = new Set(fileByKey.keys());
+    if (allocation.files.length !== this.postObj.files.length) {
+      throw new Error(`allocator が返したアセット数が投稿と一致しません (期待 ${this.postObj.files.length}, 実際 ${allocation.files.length})`);
     }
-    return ret;
+    for (const { key, archiveName } of allocation.files) {
+      if (!expected.delete(assetKeyToString(key))) {
+        throw new Error(`allocator が投稿に属さないアセット、または重複したアセットを返しました: ${assetKeyToString(key)}`);
+      }
+      if (typeof archiveName !== "string") {
+        throw new Error(`allocator が返した archive 名が文字列ではありません: ${assetKeyToString(key)}`);
+      }
+      assertNormalizedArchiveName(archiveName, this.utils, `archive 名 (${assetKeyToString(key)})`);
+    }
+    if (allocation.coverArchiveName !== undefined) {
+      if (typeof allocation.coverArchiveName !== "string") {
+        throw new Error("allocator が返したカバーの archive 名が文字列ではありません");
+      }
+      assertNormalizedArchiveName(allocation.coverArchiveName, this.utils, "カバーの archive 名");
+    }
+    if (this.postObj.cover !== undefined !== (allocation.coverArchiveName !== undefined)) {
+      throw new Error(this.postObj.cover === undefined ? "allocator がカバーの無い投稿に coverArchiveName を返しました" : "allocator がカバーのある投稿に coverArchiveName を返しませんでした");
+    }
+  }
+  resolveHtml(pathByKey) {
+    return this.postObj.html.map((fragment) => {
+      if (typeof fragment === "string")
+        return fragment;
+      const archiveName = pathByKey.get(assetKeyToString(fragment.assetRef));
+      if (archiveName === undefined) {
+        throw new Error(`archive path is not allocated: ${assetKeyToString(fragment.assetRef)}`);
+      }
+      return this.utils.escapeHtml(`./${this.utils.encodeURI(archiveName)}`);
+    }).join("");
   }
 }
 
@@ -293,6 +423,12 @@ export class FileObject {
   constructor(fileObj, utils) {
     this.fileObj = fileObj;
     this.utils = utils;
+  }
+  getKey() {
+    return this.fileObj.key;
+  }
+  getMetadata() {
+    return this.fileObj.metadata;
   }
   getEncodedName() {
     return this.utils.encodeFileName(this.fileObj.name);
@@ -308,13 +444,6 @@ export class FileObject {
   }
   getUrl() {
     return this.fileObj.url;
-  }
-  equals(obj) {
-    if (typeof obj !== "object" || obj === null) {
-      return false;
-    }
-    const candidate = obj;
-    return candidate.name === this.fileObj.name && candidate.url === this.fileObj.url;
   }
 }
 export const crc32Table = (() => {
