@@ -3,18 +3,23 @@ process.env.TZ = 'UTC';
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import {
+  type ArchivePathAllocator,
+  type AssetKey,
   assertZipEntryCountWithinLimit,
   assertZipEntrySizeWithinLimit,
   assertZipUint32FieldWithinLimit,
+  assetKeyToString,
   clampToZipRange,
   crc32,
   DownloadHelper,
   type DownloadJsonObj,
+  DownloadObject,
   DownloadUtils,
   type DownloadZipOptions,
   type DownloadZipResult,
   type FileObj,
   FileObject,
+  joinHtmlFragments,
   MAX_ZIP_ENTRY_COUNT,
   MAX_ZIP_UINT32_FIELD_VALUE,
   toDosTimeDate,
@@ -267,47 +272,40 @@ describe('DownloadUtils', () => {
   });
 });
 
+/** テスト用の AssetKey ショートハンド */
+const imageKey = (assetId: string): AssetKey => ({ kind: 'image', assetId });
+
 // ============================================================
 // 2. FileObject tests
 // ============================================================
 describe('FileObject', () => {
   const utils = new DownloadUtils();
 
-  const createFileObject = (name: string, url: string, extension = '.png'): FileObject => {
-    const fileObj: FileObj = { name, url, extension };
+  const createFileObject = (
+    name: string,
+    url: string,
+    extension = '.png',
+    key: AssetKey = imageKey('a1'),
+  ): FileObject => {
+    const fileObj: FileObj = { name, url, extension, key, metadata: {} };
     return new FileObject(fileObj, utils);
   };
 
-  describe('equals', () => {
-    test('同一 name + url → true', () => {
-      const fo = createFileObject('img', 'https://example.com/img.png');
-      expect(fo.equals({ name: 'img', url: 'https://example.com/img.png' })).toBe(true);
+  describe('getKey / getMetadata', () => {
+    test('登録時の AssetKey がそのまま返る', () => {
+      const fo = createFileObject('img', 'https://example.com/img.png', '.png', imageKey('asset-1'));
+      expect(fo.getKey()).toEqual({ kind: 'image', assetId: 'asset-1' });
     });
 
-    test('name 不一致 → false', () => {
-      const fo = createFileObject('img', 'https://example.com/img.png');
-      expect(fo.equals({ name: 'other', url: 'https://example.com/img.png' })).toBe(false);
-    });
-
-    test('url 不一致 → false', () => {
-      const fo = createFileObject('img', 'https://example.com/img.png');
-      expect(fo.equals({ name: 'img', url: 'https://example.com/other.png' })).toBe(false);
-    });
-
-    test('null 入力 → false', () => {
-      const fo = createFileObject('img', 'https://example.com/img.png');
-      expect(fo.equals(null)).toBe(false);
-    });
-
-    test('プリミティブ入力 → false', () => {
-      const fo = createFileObject('img', 'https://example.com/img.png');
-      expect(fo.equals('string')).toBe(false);
-      expect(fo.equals(42)).toBe(false);
-    });
-
-    test('配列入力 → false', () => {
-      const fo = createFileObject('img', 'https://example.com/img.png');
-      expect(fo.equals([1, 2, 3])).toBe(false);
+    test('メタデータがそのまま返る', () => {
+      const fileObj: FileObj = {
+        name: 'f',
+        url: 'https://example.com/f.zip',
+        extension: '.zip',
+        key: { kind: 'file', assetId: 'asset-2' },
+        metadata: { size: 42 },
+      };
+      expect(new FileObject(fileObj, utils).getMetadata()).toEqual({ size: 42 });
     });
   });
 
@@ -321,6 +319,175 @@ describe('FileObject', () => {
       const fo = createFileObject('file', 'https://example.com/f.png', '.png');
       expect(fo.getEncodedExtension()).toBe('.png');
     });
+  });
+});
+
+// ============================================================
+// 2-b. AssetKey / archive path allocator tests
+// ============================================================
+describe('assetKeyToString', () => {
+  test('cover は sentinel を返す', () => {
+    expect(assetKeyToString({ kind: 'cover' })).toBe('cover');
+  });
+
+  test('kind を前置するので image と file で同じ assetId でも衝突しない', () => {
+    expect(assetKeyToString({ kind: 'image', assetId: 'x' })).toBe('image:x');
+    expect(assetKeyToString({ kind: 'file', assetId: 'x' })).toBe('file:x');
+  });
+});
+
+describe('joinHtmlFragments', () => {
+  test('要素の間に区切りを入れる', () => {
+    expect(joinHtmlFragments([['a'], ['b']], '-')).toEqual(['a', '-', 'b']);
+  });
+
+  test('空の断片列でも区切りは入る (何も描画しない block が区切りごと消えないこと)', () => {
+    expect(joinHtmlFragments([['a'], [], ['b']], '-')).toEqual(['a', '-', '-', 'b']);
+  });
+
+  test('空配列は空になる', () => {
+    expect(joinHtmlFragments([], '-')).toEqual([]);
+  });
+});
+
+describe('DownloadObject / PostObject の archive path 割り当て', () => {
+  const utils = new DownloadUtils();
+
+  /** 投稿を 1 件追加して JSON を得る。allocator を省略すると legacy allocator を使う */
+  const build = (
+    setup: (downloadObject: DownloadObject) => void,
+    allocator?: ArchivePathAllocator,
+  ): DownloadJsonObj => {
+    const downloadObject = new DownloadObject('creator', utils, allocator);
+    setup(downloadObject);
+    return JSON.parse(downloadObject.stringify()) as DownloadJsonObj;
+  };
+
+  describe('legacy allocator の採番規則', () => {
+    test('同名ファイルが 1 件なら添字を付けない', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+      });
+      expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['a.png']);
+    });
+
+    test('同名ファイルが複数なら昇順に _1 / _2 を付ける', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+        post.addFile({ key: imageKey('i2'), name: 'a', extension: 'png', url: 'u2' });
+      });
+      expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['a_1.png', 'a_2.png']);
+    });
+
+    test('同名投稿は降順に _2 / _1 を付ける', () => {
+      const json = build((d) => {
+        d.addPost('same');
+        d.addPost('same');
+      });
+      expect(json.posts.map((it) => it.encodedName)).toEqual(['same_2', 'same_1']);
+    });
+
+    test('ファイル名は encodeFileName を通す', () => {
+      const json = build((d) => {
+        const post = d.addPost('po/st');
+        post.addFile({ key: imageKey('i1'), name: 'a/b', extension: 'png', url: 'u1' });
+      });
+      expect(json.posts[0].encodedName).toBe('po／st');
+      expect(json.posts[0].files[0].encodedName).toBe('a／b.png');
+    });
+
+    // 従来はカバーだけが情報 JSON では未エンコード、HTML 内の参照ではエンコード済みで、
+    // 両者がずれうる入力があった。allocator に集約する際、参照先が実在する側に揃えた
+    test('カバーの割り当て名も encodeFileName を通す', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        post.setCover('co/ver', 'jp/g', 'https://example.com/c');
+      });
+      expect(json.posts[0].cover?.name).toBe('co／ver.jp／g');
+    });
+  });
+
+  describe('finalize 後の archive path の不変性', () => {
+    test('HTML 内の参照と files の encodedName が一致する', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+        const b = post.addFile({ key: imageKey('i2'), name: 'a', extension: 'png', url: 'u2' });
+        post.setHtml([...post.getImageLinkTag(a), ...post.getImageLinkTag(b)]);
+      });
+      const names = json.posts[0].files.map((it) => it.encodedName);
+      expect(names).toEqual(['a_1.png', 'a_2.png']);
+      for (const name of names) {
+        expect(json.posts[0].htmlText).toContain(`href="./${name}"`);
+      }
+    });
+
+    test('カバーへの参照も割り当て名に解決する', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        const cover = post.setCover('cover', 'png', 'https://example.com/c.png');
+        post.setHtml(post.getImageLinkTag(cover));
+      });
+      expect(json.posts[0].cover?.name).toBe('cover.png');
+      expect(json.posts[0].htmlText).toContain('href="./cover.png"');
+    });
+
+    test('stringify を繰り返しても同じ結果になる (割り当てが finalize のたびに変わらない)', () => {
+      const downloadObject = new DownloadObject('creator', utils);
+      const post = downloadObject.addPost('post');
+      const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+      post.setHtml(post.getImageLinkTag(a));
+      expect(downloadObject.stringify()).toBe(downloadObject.stringify());
+    });
+
+    test('allocator を差し替えると HTML 内の参照も追随する', () => {
+      // 名前にも件数にも依存しない固定名を返す allocator。HTML が採番規則を知らないことの確認
+      const positional: ArchivePathAllocator = {
+        allocatePostDirectoryNames: (posts) => posts.map((_, index) => `posts${index}`),
+        allocateAssetPaths: (post) => ({
+          files: post.files.map((file, index) => ({ file, archiveName: `asset${index}.bin` })),
+          coverArchiveName: post.cover ? 'coverAsset.bin' : undefined,
+        }),
+      };
+      const json = build((d) => {
+        const post = d.addPost('post');
+        const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+        post.setHtml(post.getImageLinkTag(a));
+      }, positional);
+      expect(json.posts[0].encodedName).toBe('posts0');
+      expect(json.posts[0].files[0].encodedName).toBe('asset0.bin');
+      expect(json.posts[0].htmlText).toContain('href="./asset0.bin"');
+    });
+
+    test('割り当てられていない AssetKey を参照する断片は例外にする', () => {
+      const downloadObject = new DownloadObject('creator', utils);
+      const post = downloadObject.addPost('post');
+      post.setHtml([{ assetRef: imageKey('missing') }]);
+      expect(() => downloadObject.stringify()).toThrow('archive path is not allocated: image:missing');
+    });
+  });
+
+  test('同じ AssetKey を 2 回追加すると例外になる', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('post');
+    post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+    expect(() => post.addFile({ key: imageKey('i1'), name: 'b', extension: 'png', url: 'u2' })).toThrow(
+      'asset key is duplicated: image:i1',
+    );
+  });
+
+  test('postCount / fileCount は投稿とアセットの総数になる', () => {
+    const json = build((d) => {
+      const p1 = d.addPost('p1');
+      p1.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+      p1.setCover('cover', 'png', 'https://example.com/c.png');
+      d.addPost('p2');
+    });
+    expect(json.postCount).toBe(2);
+    // fileCount はカバーを含めない (従来の countFile と同じ意味論)
+    expect(json.fileCount).toBe(1);
   });
 });
 

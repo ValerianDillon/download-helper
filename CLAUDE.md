@@ -50,6 +50,26 @@ tsconfig.declaration.json   # dist/types/ 生成専用 (declaration: true, entry
 2. **DownloadObject / PostObject / FileObject** — ダウンロードデータのラッパークラス群
 3. **DownloadHelper** — 最上位クラス。UI 生成、ZIP ダウンロード、HTML 生成を統合
 
+### アセットの identity と archive path (Issue #41)
+
+投稿内のアセットは `AssetKey` で一意に指す。通常のアセットは `{ kind: 'image' | 'file', assetId }` で、`assetId` は FANBOX が返す asset の `id` である。カバーは `id` を持たないので `{ kind: 'cover' }` という post 内一意の sentinel にする。
+配列位置や `encodeFileName` 後の名前を identity にしない。位置も名前も、収集後にアセットを間引くと別のアセットを指しうるため。
+
+archive path (ZIP 内の名前) を決めるのは `ArchivePathAllocator` だけである。従来の採番規則 (同名グループの件数に依存して `_1` / `_2` を付ける) は `createLegacyArchivePathAllocator` として保持し、`DownloadObject` / `DownloadManage` の任意引数で差し替えられる。
+
+- `PostObj.html` は文字列ではなく `HtmlFragment[]` (文字列と `{ assetRef: AssetKey }` の列)。`getImageLinkTag` などのリンクタグ生成はパス文字列を埋め込まず、`assetRef` を持つ断片を返す
+- 断片から archive path への解決は `stringify()` (finalize) の時点で行う。したがって HTML 内の参照と `DownloadJsonObj` の `files[].encodedName` / `cover.name` は、定義上ずれない
+- 従来この 2 つが一致していたのは「同名グループへの `addFile` がすべて終わってから HTML を生成する」という `addByPostInfo` の呼び出し順序に依存していたためで、契約としては書かれていなかった
+- カバーの割り当て名は `encodeFileName` を通す。従来は情報 JSON の `cover.name` だけが未エンコードで、HTML 側の参照はエンコード済みだったため、`/` を含む拡張子のような入力で両者がずれていた (ZIP の事前検証で落ちる)。割り当てを 1 箇所にまとめる以上どちらかに寄せる必要があり、参照先が実在する側に揃えた
+- アセットの付随メタデータ (`size` / `width` / `height`) と投稿タイプ (`PostObj.postType`) は内部表現に保持するが `DownloadJsonObj` には出さない。利用側の絞り込み条件のために持つ
+
+`fanbox-collector` 側の検証も変わる。
+
+- asset の `id` を必須フィールドとして検証する (`body.images[]` / `body.files[]` / `imageMap` / `fileMap`)
+- `imageMap` / `fileMap` はマップのキーと値の `id` が一致することも検証する。identity として使う以上、不一致のまま通すと別のアセットを同一視しうる
+- `body.images` / `body.files` 内で `id` が重複していれば `invalid` にする (`missing` には `body.images[1].id` のように衝突した位置を入れる)
+- `size` / `width` / `height` は非負の安全な整数でなければ欠落として扱う。収集が読まない付随メタデータなので、型が違っても `invalid` にはしない
+
 主な機能:
 - ZIP ダウンロード（File System Access API + 自前 ZipWriter）
 - Bootstrap ベースのタグフィルタリング UI
@@ -66,6 +86,8 @@ tsconfig.declaration.json   # dist/types/ 生成専用 (declaration: true, entry
 `downloadZip` は `DownloadZipResult`（`completedPostCount` / `totalPostCount` / `writtenFileCount` /
 `failedFileCount` / `aborted`）を返す（Issue #13）。各件数の定義は `DownloadZipResult` の JSDoc を参照。
 既存呼び出し元（`createDownloadUI` のブックマークレット向け UI）は戻り値を無視しており、そのままコンパイルできる。
+
+`DownloadObject` / `DownloadManage` はどちらも第 3 引数で `ArchivePathAllocator` を受け取る（省略時は legacy allocator）。
 
 `fanbox-collector.ts` は FANBOX API の型定義、`DownloadManage`（収集時の状態管理）、`addByPostInfo` /
 `convertImageMap` / `convertFileMap` / `convertEmbedMap` / `convertUrlEmbedMap`（postInfo → DownloadObject 変換）

@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from 'bun:test';
+import type { ArchivePathAllocator, PostObj } from './download-helper';
 import {
   addByPostInfo,
   DownloadManage,
@@ -388,8 +389,8 @@ describe('addByPostInfo - 未知値の正規化', () => {
             { type: 'image', imageId: 'img2' },
           ],
           imageMap: {
-            img1: { originalUrl: 'https://example.com/1', extension: 'jpg' },
-            img2: { originalUrl: 'https://example.com/2', extension: 'jpg' },
+            img1: { id: 'img1', originalUrl: 'https://example.com/1', extension: 'jpg' },
+            img2: { id: 'img2', originalUrl: 'https://example.com/2', extension: 'jpg' },
           },
         }),
       }),
@@ -441,7 +442,9 @@ describe('addByPostInfo - 未知値の正規化', () => {
           blocks: [{ type: 'image', imageId: '__proto__' }],
           // オブジェクトリテラルの __proto__ はプロトタイプ指定になり own property にならないので、
           // 実際の入力経路と同じく JSON.parse で作る
-          imageMap: JSON.parse('{"__proto__": {"originalUrl": "https://example.com/proto.jpg", "extension": "jpg"}}'),
+          imageMap: JSON.parse(
+            '{"__proto__": {"id": "__proto__", "originalUrl": "https://example.com/proto.jpg", "extension": "jpg"}}',
+          ),
         }),
       }),
     );
@@ -478,9 +481,9 @@ describe('addByPostInfo - article の並び順', () => {
           { type: 'image', imageId: 'img2' },
         ],
         imageMap: {
-          img1: { originalUrl: 'url1', extension: 'jpg' },
-          img2: { originalUrl: 'url2', extension: 'png' },
-          img3: { originalUrl: 'url3', extension: 'gif' },
+          img1: { id: 'img1', originalUrl: 'url1', extension: 'jpg' },
+          img2: { id: 'img2', originalUrl: 'url2', extension: 'png' },
+          img3: { id: 'img3', originalUrl: 'url3', extension: 'gif' },
         },
       }),
     );
@@ -497,9 +500,9 @@ describe('addByPostInfo - article の並び順', () => {
           { type: 'image', imageId: 'img1' },
         ],
         imageMap: {
-          img1: { originalUrl: 'url1', extension: 'jpg' },
-          imgX: { originalUrl: 'urlX', extension: 'webp' },
-          img2: { originalUrl: 'url2', extension: 'png' },
+          img1: { id: 'img1', originalUrl: 'url1', extension: 'jpg' },
+          imgX: { id: 'imgX', originalUrl: 'urlX', extension: 'webp' },
+          img2: { id: 'img2', originalUrl: 'url2', extension: 'png' },
         },
       }),
     );
@@ -516,7 +519,7 @@ describe('addByPostInfo - article の並び順', () => {
           { type: 'image', imageId: 'img1' },
           { type: 'file', fileId: 'file1' },
         ],
-        imageMap: { img1: { originalUrl: 'url1', extension: 'jpg' } },
+        imageMap: { img1: { id: 'img1', originalUrl: 'url1', extension: 'jpg' } },
       }),
     );
     expect(firstPost(m).files.map((f: { url: string }) => f.url)).toEqual(['url1']);
@@ -532,9 +535,9 @@ describe('addByPostInfo - article の並び順', () => {
           { type: 'file', fileId: 'f1' },
         ],
         fileMap: {
-          f1: { url: 'url1', name: 'a', extension: 'txt' },
-          fX: { url: 'urlX', name: 'x', extension: 'bin' },
-          f2: { url: 'url2', name: 'b', extension: 'pdf' },
+          f1: { id: 'f1', url: 'url1', name: 'a', extension: 'txt' },
+          fX: { id: 'fX', url: 'urlX', name: 'x', extension: 'bin' },
+          f2: { id: 'f2', url: 'url2', name: 'b', extension: 'pdf' },
         },
       }),
     );
@@ -645,7 +648,10 @@ describe('addByPostInfo - 名前が Object.prototype と衝突する入力', () 
     const m = createManage();
     const post = candidate({
       type: 'file',
-      body: { text: 'hello', files: [{ name: '__proto__', extension: 'txt', url: 'https://example.com/proto.txt' }] },
+      body: {
+        text: 'hello',
+        files: [{ id: 'f1', name: '__proto__', extension: 'txt', url: 'https://example.com/proto.txt' }],
+      },
     });
     expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
     expect(firstPost(m).files).toHaveLength(1);
@@ -657,7 +663,10 @@ describe('addByPostInfo - 名前が Object.prototype と衝突する入力', () 
     const m = createManage();
     const post = candidate({
       type: 'file',
-      body: { text: 'hello', files: [{ name: 'constructor', extension: 'txt', url: 'https://example.com/ctor.txt' }] },
+      body: {
+        text: 'hello',
+        files: [{ id: 'f1', name: 'constructor', extension: 'txt', url: 'https://example.com/ctor.txt' }],
+      },
     });
     expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
     expect(firstPost(m).files[0].originalName).toBe('constructor');
@@ -670,13 +679,285 @@ describe('addByPostInfo - 名前が Object.prototype と衝突する入力', () 
       body: {
         text: 'hello',
         files: [
-          { name: '__proto__', extension: 'txt', url: 'https://example.com/1' },
-          { name: '__proto__', extension: 'txt', url: 'https://example.com/2' },
+          { id: 'f1', name: '__proto__', extension: 'txt', url: 'https://example.com/1' },
+          { id: 'f2', name: '__proto__', extension: 'txt', url: 'https://example.com/2' },
         ],
       },
     });
     expect(addByPostInfo(m, post)).toEqual({ status: 'added' });
     expect(firstPost(m).files).toHaveLength(2);
+  });
+});
+
+describe('addByPostInfo - アセットの id 検証', () => {
+  test('images の要素に id が無ければ invalid (id を identity に使うため)', () => {
+    const m = createManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'image',
+        body: { text: 'hello', images: [{ originalUrl: 'https://example.com/a', extension: 'jpg' }] },
+      }),
+    );
+    expect((result as { missing: string[] }).missing).toContain('body.images');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('files の要素に id が無ければ invalid', () => {
+    const m = createManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'file',
+        body: { text: 'hello', files: [{ name: 'a', extension: 'txt', url: 'https://example.com/a' }] },
+      }),
+    );
+    expect((result as { missing: string[] }).missing).toContain('body.files');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('imageMap のキーと値の id が一致しなければ invalid (別のアセットを同一視しうるため)', () => {
+    const m = createManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'article',
+        body: articleBody({ imageMap: { img1: { id: 'img2', originalUrl: 'url1', extension: 'jpg' } } }),
+      }),
+    );
+    expect((result as { missing: string[] }).missing).toContain('body.imageMap');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('fileMap のキーと値の id が一致しなければ invalid', () => {
+    const m = createManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'article',
+        body: articleBody({ fileMap: { f1: { id: 'f2', url: 'url1', name: 'a', extension: 'txt' } } }),
+      }),
+    );
+    expect((result as { missing: string[] }).missing).toContain('body.fileMap');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('images 内で id が重複していれば invalid (AssetKey が投稿内で一意でなくなるため)', () => {
+    const m = createManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'image',
+        body: {
+          text: 'hello',
+          images: [
+            { id: 'i1', originalUrl: 'url1', extension: 'jpg' },
+            { id: 'i1', originalUrl: 'url2', extension: 'jpg' },
+          ],
+        },
+      }),
+    );
+    expect((result as { missing: string[] }).missing).toContain('body.images[1].id');
+    expect(postCount(m)).toBe(0);
+  });
+
+  test('files 内で id が重複していれば invalid', () => {
+    const m = createManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'file',
+        body: {
+          text: 'hello',
+          files: [
+            { id: 'f1', name: 'a', extension: 'txt', url: 'url1' },
+            { id: 'f1', name: 'b', extension: 'txt', url: 'url2' },
+          ],
+        },
+      }),
+    );
+    expect((result as { missing: string[] }).missing).toContain('body.files[1].id');
+    expect(postCount(m)).toBe(0);
+  });
+});
+
+describe('addByPostInfo - 内部表現に保持する情報', () => {
+  /**
+   * allocator は PostObj をそのまま受け取るので、割り当ての過程で内部表現を観測できる。
+   * metadata / postType は DownloadJsonObj に出さない (出力を変えない) ため、ここで確認する
+   */
+  const captureManage = () => {
+    const captured: PostObj[] = [];
+    const allocator: ArchivePathAllocator = {
+      allocatePostDirectoryNames: (posts) => posts.map((_, index) => `post${index}`),
+      allocateAssetPaths: (post) => {
+        captured.push(post);
+        return {
+          files: post.files.map((file, index) => ({ file, archiveName: `asset${index}.bin` })),
+          coverArchiveName: post.cover ? 'cover.bin' : undefined,
+        };
+      },
+    };
+    const m = new DownloadManage('testUser', new Map<number, string>(), allocator);
+    return {
+      m,
+      posts: () => {
+        // 割り当ては stringify (finalize) のときに行われる
+        m.downloadObject.stringify();
+        return captured;
+      },
+    };
+  };
+
+  test('AssetKey は kind と asset の id からできる', () => {
+    const { m, posts } = captureManage();
+    addByPostInfo(
+      m,
+      candidate({
+        type: 'article',
+        coverImageUrl: 'https://example.com/cover.jpg',
+        body: articleBody({
+          imageMap: { img1: { id: 'img1', originalUrl: 'url1', extension: 'jpg' } },
+          fileMap: { f1: { id: 'f1', url: 'url2', name: 'a', extension: 'txt' } },
+        }),
+      }),
+    );
+    const post = posts()[0];
+    expect(post.files.map((it) => it.key)).toEqual([
+      { kind: 'image', assetId: 'img1' },
+      { kind: 'file', assetId: 'f1' },
+    ]);
+    expect(post.cover?.key).toEqual({ kind: 'cover' });
+  });
+
+  test('投稿タイプを保持する', () => {
+    const { m, posts } = captureManage();
+    addByPostInfo(m, candidate({ type: 'text', body: { text: 'hello' } }));
+    expect(posts()[0].postType).toBe('text');
+  });
+
+  test('画像は width / height を、添付は size を保持する', () => {
+    const { m, posts } = captureManage();
+    addByPostInfo(
+      m,
+      candidate({
+        type: 'article',
+        body: articleBody({
+          imageMap: { img1: { id: 'img1', originalUrl: 'url1', extension: 'jpg', width: 100, height: 200 } },
+          fileMap: { f1: { id: 'f1', url: 'url2', name: 'a', extension: 'txt', size: 4096 } },
+        }),
+      }),
+    );
+    expect(posts()[0].files.map((it) => it.metadata)).toEqual([{ width: 100, height: 200 }, { size: 4096 }]);
+  });
+
+  test.each([
+    ['欠落', undefined],
+    ['文字列', '4096'],
+    ['負数', -1],
+    ['小数', 1.5],
+    ['安全な整数の範囲外', Number.MAX_SAFE_INTEGER + 2],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ])('size が %s なら欠落として扱い、投稿は取り込む', (_label, size) => {
+    const { m, posts } = captureManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'file',
+        body: { text: 'hello', files: [{ id: 'f1', name: 'a', extension: 'txt', url: 'url1', size }] },
+      }),
+    );
+    // 収集が読まない付随メタデータなので、型が違っても invalid にはしない
+    expect(result).toEqual({ status: 'added' });
+    expect(posts()[0].files[0].metadata).toEqual({ size: undefined });
+  });
+
+  test('width / height も size と同じ規則で落とす', () => {
+    const { m, posts } = captureManage();
+    addByPostInfo(
+      m,
+      candidate({
+        type: 'image',
+        body: { text: '', images: [{ id: 'i1', originalUrl: 'url1', extension: 'jpg', width: -1, height: '2' }] },
+      }),
+    );
+    expect(posts()[0].files[0].metadata).toEqual({ width: undefined, height: undefined });
+  });
+});
+
+describe('addByPostInfo - HTML とファイルパスの整合', () => {
+  /** htmlText 内の href="./..." を列挙する */
+  const hrefsOf = (htmlText: string): string[] => [...htmlText.matchAll(/href="\.\/([^"]*)"/g)].map((it) => it[1]);
+
+  test('同名アセットが複数あっても HTML の参照は割り当て名と一致する', () => {
+    const m = createManage();
+    addByPostInfo(
+      m,
+      candidate({
+        title: 'post',
+        type: 'image',
+        coverImageUrl: 'https://example.com/cover.png',
+        body: {
+          text: '',
+          images: [
+            { id: 'i1', originalUrl: 'url1', extension: 'png' },
+            { id: 'i2', originalUrl: 'url2', extension: 'png' },
+          ],
+        },
+      }),
+    );
+    const post = firstPost(m);
+    expect(post.files.map((f: { encodedName: string }) => f.encodedName)).toEqual(['post_1.png', 'post_2.png']);
+    expect(post.cover.name).toBe('cover.png');
+    expect(hrefsOf(post.htmlText)).toEqual(['cover.png', 'post_1.png', 'post_2.png']);
+  });
+
+  // 従来の出力をそのまま固定する (legacy allocator の互換テスト)
+  test('cover + 同名画像 2 件の htmlText が従来と同じである', () => {
+    const m = createManage();
+    addByPostInfo(
+      m,
+      candidate({
+        title: 'post',
+        type: 'image',
+        coverImageUrl: 'https://example.com/cover.png',
+        body: {
+          text: 'body',
+          images: [
+            { id: 'i1', originalUrl: 'url1', extension: 'png' },
+            { id: 'i2', originalUrl: 'url2', extension: 'png' },
+          ],
+        },
+      }),
+    );
+    expect(firstPost(m).htmlText).toBe(
+      '<a class="hl" href="./cover.png" download="cover.png"><div class="post card">\n' +
+        '<img class="card-img-top" src="./cover.png" alt="cover"/>\n</div></a><h5>post</h5>\n' +
+        '<a class="hl" href="./post_1.png" download="post.png"><div class="post card">\n' +
+        '<img class="card-img-top" src="./post_1.png" alt="post"/>\n</div></a><br>\n' +
+        '<a class="hl" href="./post_2.png" download="post.png"><div class="post card">\n' +
+        '<img class="card-img-top" src="./post_2.png" alt="post"/>\n</div></a><br>\n<span>body</span>',
+    );
+  });
+
+  test('描画しない block があっても区切りの数は変わらない (文字列連結時代と同じ)', () => {
+    const m = createManage();
+    addByPostInfo(
+      m,
+      candidate({
+        type: 'article',
+        body: articleBody({
+          blocks: [
+            { type: 'p', text: 'a' },
+            { type: 'brand-new' },
+            { type: 'image', imageId: 'missing' },
+            { type: 'p', text: 'b' },
+          ],
+        }),
+      }),
+    );
+    expect(firstPost(m).htmlText).toBe('<h5>タイトル</h5>\n<br>\n<span>a</span><br>\n<br>\n<br>\n<span>b</span>');
   });
 });
 

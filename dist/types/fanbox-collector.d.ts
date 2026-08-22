@@ -3,7 +3,7 @@
  * pixiv FANBOX の API レスポンス型、DownloadManage (収集時の状態管理)、
  * postInfo → DownloadObject への変換処理をまとめる。
  */
-import { DownloadObject, DownloadUtils } from './download-helper';
+import { type ArchivePathAllocator, DownloadObject, DownloadUtils } from './download-helper';
 /**
  * プランAPIの型
  * @see https://api.fanbox.cc/plan.listCreator?creatorId=${creatorId}
@@ -114,7 +114,12 @@ export declare class DownloadManage {
     private tags;
     private isLimitAvailable;
     private limit;
-    constructor(userId: string, feeMap: Map<number, string>);
+    /**
+     * @param userId クリエイターID
+     * @param feeMap 支援額とプラン名の対応
+     * @param allocator archive path の割り当て器 (省略時は従来の採番規則)
+     */
+    constructor(userId: string, feeMap: Map<number, string>, allocator?: ArchivePathAllocator);
     addFee(fee: number): void;
     addTags(...tags: string[]): void;
     applyTags(): void;
