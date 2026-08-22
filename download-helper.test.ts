@@ -1388,16 +1388,28 @@ describe('isDownloadJsonObj', () => {
     });
 
     // 検証できる範囲の境界を固定する。DownloadJsonObj 側に対応する値が無いので、
-    // manifest にしか現れない identity は実際の投稿・アセットと結び付いていることを確かめられない
+    // manifest にしか現れない情報は実際の投稿・アセットと結び付いていることを確かめられない
     describe('検証できないもの (境界)', () => {
-      test('投稿間で postId を入れ替えても通る', () => {
+      /** 投稿 2 件の有効なオブジェクト (createValidObj は 1 件しか作らない) */
+      const twoPosts = (): DownloadJsonObj => {
         const base = createValidObj();
+        return withManifest({
+          ...base,
+          posts: [base.posts[0], { ...base.posts[0], encodedName: 'post2' }],
+          postCount: 2,
+          fileCount: 2,
+        });
+      };
+
+      test('投稿間で postId を入れ替えても通る', () => {
+        const base = twoPosts();
         const [first, second] = base.manifest.posts;
-        if (second === undefined) return;
+        expect(second).toBeDefined();
         const posts = [
           { ...first, postId: second.postId },
           { ...second, postId: first.postId },
         ];
+        expect(posts[0].postId).not.toBe(first.postId);
         expect(helper.isDownloadJsonObj({ ...base, manifest: { ...base.manifest, posts } })).toBe(true);
       });
 
@@ -1406,6 +1418,42 @@ describe('isDownloadJsonObj', () => {
         const post = base.manifest.posts[0];
         const included = post.included.map((it) => (it.kind === 'cover' ? it : { ...it, assetId: 'rewritten' }));
         const posts = [{ ...post, included }, ...base.manifest.posts.slice(1)];
+        expect(helper.isDownloadJsonObj({ ...base, manifest: { ...base.manifest, posts } })).toBe(true);
+      });
+
+      // 除外されたアセットは ZIP にも JSON にも現れないので、記録と突き合わせる相手が無い
+      test('excluded を空にしても通る (網羅性を確かめられない)', () => {
+        const base = createValidObj();
+        const withExcluded = {
+          ...base.manifest.posts[0],
+          excluded: [{ kind: 'file' as const, assetId: 'x1', originalName: 'z', extension: '.zip' }],
+        };
+        const objWith = { ...base, manifest: { ...base.manifest, posts: [withExcluded] } };
+        expect(helper.isDownloadJsonObj(objWith)).toBe(true);
+        // 同じ入力から excluded を消しても通る
+        const objWithout = { ...base, manifest: { ...base.manifest, posts: [{ ...withExcluded, excluded: [] }] } };
+        expect(helper.isDownloadJsonObj(objWithout)).toBe(true);
+      });
+
+      test('実在しないアセットを excluded に足しても通る (実在性を確かめられない)', () => {
+        const base = createValidObj();
+        const posts = [
+          {
+            ...base.manifest.posts[0],
+            excluded: [{ kind: 'file' as const, assetId: 'never-existed', originalName: '架空', extension: '.zip' }],
+          },
+        ];
+        expect(helper.isDownloadJsonObj({ ...base, manifest: { ...base.manifest, posts } })).toBe(true);
+      });
+
+      test('カバーの originalName を変えても通る (JSON 側に対応する値が無い)', () => {
+        const base = withManifest({
+          ...createValidObj(),
+          posts: [{ ...createValidObj().posts[0], cover: { url: 'https://example.com/c.png', name: 'cover.png' } }],
+        });
+        const post = base.manifest.posts[0];
+        const included = post.included.map((it) => (it.kind === 'cover' ? { ...it, originalName: '別名' } : it));
+        const posts = [{ ...post, included }];
         expect(helper.isDownloadJsonObj({ ...base, manifest: { ...base.manifest, posts } })).toBe(true);
       });
     });

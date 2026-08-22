@@ -221,10 +221,18 @@ export type ManifestPost = {
  * URL は持たない (必要になれば post.info を取り直せば得られるし、保存量も減る)。
  *
  * `isDownloadJsonObj` が突き合わせられるのは、`DownloadJsonObj` 側にも現れる値だけである。
- * `postId` / `kind` / `assetId` / `extension` は manifest にしか無いので、実際の投稿や
- * アセットと結び付いていることは検証できない (投稿間で `postId` を入れ替えても通る)。
+ * 次のものは対応する相手が無いので検証できない。
+ *
+ * - `postId` / `kind` / `assetId` / `extension` が実際の投稿・アセットに結び付いていること
+ *   (投稿間で `postId` を入れ替えても、`assetId` を書き換えても通る)
+ * - `excludedPosts` と各投稿の `excluded` の網羅性と実在性。除外された対象は ZIP にも JSON にも
+ *   現れないので、消しても架空の対象を足しても通る
+ * - 除外アセットと included なカバーの `originalName` (JSON 側のカバーは `url` と archive 名しか持たない)
+ *
  * 突き合わせのためだけに identity を JSON 側へ写す設計は採らない。同じ値を 2 箇所に置いて
  * 一致を確かめる形になり、ずれたときにどちらが正しいのかを決められないため。
+ * したがって manifest は「projection がこう記録した」ことを表すのであって、その記録が
+ * 実際の収集結果と一致することを ZIP の受け手が検証できるわけではない。
  */
 export type DownloadManifest = {
   readonly schemaVersion: 1;
