@@ -285,13 +285,10 @@ const withManifest = (obj: Omit<DownloadJsonObj, 'manifest'>): DownloadJsonObj =
   manifest: testManifest(obj.posts),
 });
 
-const testManifest = (posts: DownloadJsonObj['posts'] = []): DownloadManifest => ({
-  schemaVersion: 1,
-  creatorId: 'creator-id',
-  generatedAt: '2026-08-23T00:00:00.000Z',
-  selection: { postIds: [], extensions: [], includeCover: true },
-  // manifest は JSON の投稿・アセットと 1 対 1 で対応していなければ検証を通らない
-  posts: posts.map((post, i) => ({
+const testManifest = (posts: DownloadJsonObj['posts'] = []): DownloadManifest => {
+  // manifest は JSON の投稿・アセットと 1 対 1 で対応し、記録した選択条件とも矛盾しない
+  // ものだけが検証を通る
+  const manifestPosts = posts.map((post, i) => ({
     postId: `p${i + 1}`,
     archiveDirectory: post.encodedName,
     included: [
@@ -307,9 +304,21 @@ const testManifest = (posts: DownloadJsonObj['posts'] = []): DownloadManifest =>
         : []),
     ],
     excluded: [],
-  })),
-  excludedPosts: [],
-});
+  }));
+  return {
+    schemaVersion: 1,
+    creatorId: 'creator-id',
+    generatedAt: '2026-08-23T00:00:00.000Z',
+    selection: {
+      postIds: manifestPosts.map((it) => it.postId),
+      // 添付は extension を '' として作っているので、選択集合にも '' を入れる
+      extensions: [''],
+      includeCover: true,
+    },
+    posts: manifestPosts,
+    excludedPosts: [],
+  };
+};
 
 /** manifest の generatedAt を固定するための時刻 */
 const FIXED_NOW = new Date('2026-08-23T00:00:00.000Z');
@@ -988,16 +997,20 @@ describe('projection', () => {
       expect(m.posts[0].included).toEqual([
         { kind: 'image', assetId: 'i1', originalName: 'a', extension: '.png', archiveName: 'a_1.png' },
       ]);
-      expect(m.posts[0].excluded.map((it) => `${it.kind}:${it.assetId}:${it.originalName}${it.extension}`)).toEqual([
-        'image:i2:a.JPG',
-        'file:f1:a.pdf',
-        'cover:undefined:cover.png',
-      ]);
+      expect(
+        m.posts[0].excluded.map((it) =>
+          it.kind === 'cover'
+            ? `cover:${it.originalName}${it.extension}`
+            : `${it.kind}:${it.assetId}:${it.originalName}${it.extension}`,
+        ),
+      ).toEqual(['image:i2:a.JPG', 'file:f1:a.pdf', 'cover:cover.png']);
       expect(m.excludedPosts).toEqual([{ postId: 'p2' }, { postId: 'p3' }]);
     });
 
+    // 型でも archiveName を持てないが、生成物にも実際に出ていないことを見る
     test('除外したアセットの記述に archiveName は付けない (ZIP に存在しないため)', () => {
-      expect(manifestOf().posts[0].excluded.every((it) => it.archiveName === undefined)).toBe(true);
+      const excluded = manifestOf().posts[0].excluded as readonly Record<string, unknown>[];
+      expect(excluded.every((it) => it.archiveName === undefined)).toBe(true);
     });
 
     test('URL は残さない', () => {
@@ -1259,6 +1272,76 @@ describe('isDownloadJsonObj', () => {
         ],
       };
       expect(helper.isDownloadJsonObj({ ...twoPosts, manifest })).toBe(false);
+    });
+
+    describe('selection と内容の整合', () => {
+      /** manifest の一部を差し替えた入力を作る */
+      const withManifestOverride = (override: Record<string, unknown>) => ({
+        ...createValidObj(),
+        manifest: { ...validManifest(), ...override },
+      });
+
+      test('出力に載っている投稿が selection.postIds に無い → false', () => {
+        const selection = { ...validManifest().selection, postIds: [] };
+        expect(helper.isDownloadJsonObj(withManifestOverride({ selection }))).toBe(false);
+      });
+
+      test('excludedPosts の投稿が selection.postIds に含まれる → false', () => {
+        const excludedPosts = [{ postId: validManifest().selection.postIds[0] }];
+        expect(helper.isDownloadJsonObj(withManifestOverride({ excludedPosts }))).toBe(false);
+      });
+
+      test('included の拡張子が selection.extensions に無い → false', () => {
+        const selection = { ...validManifest().selection, extensions: ['.other'] };
+        expect(helper.isDownloadJsonObj(withManifestOverride({ selection }))).toBe(false);
+      });
+
+      test('excluded の拡張子が selection.extensions に含まれる → false', () => {
+        const manifest = validManifest();
+        const excluded = [{ kind: 'file' as const, assetId: 'x', originalName: 'z', extension: '' }];
+        const posts = [{ ...manifest.posts[0], excluded }];
+        expect(helper.isDownloadJsonObj(withManifestOverride({ posts }))).toBe(false);
+      });
+
+      test('includeCover が false なのに included に cover がある → false', () => {
+        const selection = { ...validManifest().selection, includeCover: false };
+        const manifest = validManifest();
+        const included = [
+          ...manifest.posts[0].included,
+          { kind: 'cover' as const, originalName: 'cover', extension: '', archiveName: 'cover.png' },
+        ];
+        expect(
+          helper.isDownloadJsonObj(withManifestOverride({ selection, posts: [{ ...manifest.posts[0], included }] })),
+        ).toBe(false);
+      });
+
+      test('includeCover が true なのに excluded に cover がある → false', () => {
+        const manifest = validManifest();
+        const excluded = [{ kind: 'cover' as const, originalName: 'cover', extension: '' }];
+        expect(helper.isDownloadJsonObj(withManifestOverride({ posts: [{ ...manifest.posts[0], excluded }] }))).toBe(
+          false,
+        );
+      });
+
+      test.each([
+        ['postCount', { postCount: 99 }],
+        ['fileCount', { fileCount: 99 }],
+      ])('%s が JSON の実件数と合わない → false', (_label, override) => {
+        expect(helper.isDownloadJsonObj({ ...createValidObj(), ...override })).toBe(false);
+      });
+    });
+
+    describe('不正な入力でも例外を投げない (型ガードとして成立させる)', () => {
+      test.each([
+        ['cover が null', { cover: null }],
+        ['files に null が入る', { files: [null] }],
+        ['files が配列でない', { files: 'x' }],
+      ])('%s → 例外ではなく false', (_label, override) => {
+        const base = createValidObj();
+        const obj = { ...base, posts: [{ ...base.posts[0], ...override }] };
+        expect(() => helper.isDownloadJsonObj(obj)).not.toThrow();
+        expect(helper.isDownloadJsonObj(obj)).toBe(false);
+      });
     });
 
     test('manifest の投稿数が JSON の投稿数と合わない → false', () => {

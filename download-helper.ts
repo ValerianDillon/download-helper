@@ -190,13 +190,14 @@ export function normalizeExtension(extension: string): string {
  * `kind` と併せてアセットを投稿内で一意に指す
  */
 export type ManifestAsset = {
-  readonly kind: AssetKind;
-  readonly assetId?: string;
   readonly originalName: string;
   readonly extension: string;
-  /** 含めたアセットにだけ付く。除外したアセットは ZIP に存在しないので持たない */
-  readonly archiveName?: string;
-};
+} & ({ readonly kind: 'cover' } | { readonly kind: BodyAssetKind; readonly assetId: string });
+
+/**
+ * 含めたアセットの記述。ZIP に入るので archive 名を持つ
+ */
+export type IncludedManifestAsset = ManifestAsset & { readonly archiveName: string };
 
 /**
  * manifest に記録する投稿 1 件分
@@ -207,7 +208,8 @@ export type ManifestAsset = {
 export type ManifestPost = {
   readonly postId: string;
   readonly archiveDirectory: string;
-  readonly included: readonly ManifestAsset[];
+  readonly included: readonly IncludedManifestAsset[];
+  /** 除外したアセットは ZIP に存在しないので archive 名を持たない */
   readonly excluded: readonly ManifestAsset[];
 };
 
@@ -507,6 +509,7 @@ export function createNameKeyedDictionary<T>(): Record<string, T> {
  * 名前と並び順だけなので、入力側も型で閉じる。
  */
 export type ReadonlyPostObj = {
+  readonly postId: string;
   readonly name: string;
   readonly info: string;
   readonly files: readonly Readonly<BodyFileObj>[];
@@ -775,19 +778,17 @@ export class DownloadObject {
       // fileCount は選択された post.files の数。カバーは含めない (従来の countFile と同じ意味論)
       fileCount += projected.json.files.length;
 
-      const included: ManifestAsset[] = [];
+      const included: IncludedManifestAsset[] = [];
       const excluded: ManifestAsset[] = [];
       const assets: FileObj[] = postObj.cover ? [...postObj.files, postObj.cover] : [...postObj.files];
       for (const file of assets) {
         const key = assetKeyToString(file.key);
-        const describe: ManifestAsset = {
-          kind: file.key.kind,
-          assetId: file.key.kind === 'cover' ? undefined : file.key.assetId,
-          originalName: file.name,
-          extension: file.extension,
-        };
-        if (includedKeys.has(key)) {
-          included.push({ ...describe, archiveName: projected.archiveNames.get(key) });
+        const identity =
+          file.key.kind === 'cover' ? ({ kind: 'cover' } as const) : { kind: file.key.kind, assetId: file.key.assetId };
+        const describe: ManifestAsset = { ...identity, originalName: file.name, extension: file.extension };
+        const archiveName = projected.archiveNames.get(key);
+        if (includedKeys.has(key) && archiveName !== undefined) {
+          included.push({ ...describe, archiveName });
         } else {
           excluded.push(describe);
         }
@@ -2102,6 +2103,19 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
   // 付けただけの入力を通すと、projection を経ていないオブジェクトが ZIP に流れる
   const jsonPosts = Array.isArray(downloadObj.posts) ? (downloadObj.posts as Record<string, unknown>[]) : [];
   if (m.posts.length !== jsonPosts.length) return false;
+  // 件数は JSON 側の定義 (postCount = 投稿数、fileCount = 添付数。カバーを含めない) と一致する
+  if (downloadObj.postCount !== jsonPosts.length) return false;
+  const totalFiles = jsonPosts.reduce((sum, it) => sum + (Array.isArray(it?.files) ? it.files.length : 0), 0);
+  if (downloadObj.fileCount !== totalFiles) return false;
+
+  const selectedPostIds = new Set(selection.postIds as string[]);
+  const selectedExtensions = new Set(selection.extensions as string[]);
+  const includeCover = selection.includeCover;
+  // 除外された投稿が選択集合に入っていてはいけない (excludedPosts の網羅性は、projection 後の
+  // JSON に元の投稿一覧が残らないので検証できない)
+  if (m.excludedPosts.some((it) => selectedPostIds.has((it as Record<string, unknown>).postId as string))) {
+    return false;
+  }
   // manifest.posts は収集順と定義しているので、同じ index の投稿と突き合わせる
   return m.posts.every((post: unknown, index: number) => {
     if (!isRecordWithStringKeys(post, ['postId', 'archiveDirectory'])) return false;
@@ -2109,8 +2123,37 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
     const jsonPost = jsonPosts[index];
     if (p.archiveDirectory !== jsonPost?.encodedName) return false;
     if (!isManifestAssetArray(p.included, true) || !isManifestAssetArray(p.excluded, false)) return false;
+    // 出力に載っている投稿は選択されていなければならない
+    if (!selectedPostIds.has(p.postId as string)) return false;
+    if (!isManifestSelectionConsistent(p, selectedExtensions, includeCover)) return false;
     return isManifestPostConsistent(p, jsonPost);
   });
+}
+
+/**
+ * manifest の投稿 1 件が、記録された選択条件と矛盾していないか。
+ *
+ * 選択条件と含めた / 除外したアセットが食い違う manifest は、「どういう条件でこの ZIP を
+ * 作ったか」の記録として成立しない
+ * @param manifestPost manifest 側の投稿
+ * @param selectedExtensions 選択された拡張子 (正規化済み)
+ * @param includeCover カバーを含める指定か
+ * @internal
+ */
+function isManifestSelectionConsistent(
+  manifestPost: Record<string, unknown>,
+  selectedExtensions: ReadonlySet<string>,
+  includeCover: boolean,
+): boolean {
+  const included = manifestPost.included as Record<string, unknown>[];
+  const excluded = manifestPost.excluded as Record<string, unknown>[];
+  const hasCover = (assets: Record<string, unknown>[]) => assets.some((it) => it.kind === 'cover');
+  // カバーの扱いは includeCover ひとつで決まる
+  if (includeCover ? hasCover(excluded) : hasCover(included)) return false;
+  const matchesExtension = (asset: Record<string, unknown>) =>
+    selectedExtensions.has(normalizeExtension(asset.extension as string));
+  if (!included.filter((it) => it.kind !== 'cover').every(matchesExtension)) return false;
+  return !excluded.filter((it) => it.kind !== 'cover').some(matchesExtension);
 }
 
 /**
@@ -2571,13 +2614,8 @@ export class DownloadHelper {
       case !Array.isArray(t.tags):
         console.error('ダウンロード用オブジェクトの型が不正(tagsが配列でない)', t.tags);
         return false;
-      case !isDownloadManifest(t.manifest, t):
-        // projection を経ていないオブジェクトはここで弾く。絞り込みを経ずに ZIP にすると、
-        // HTML の参照と実際に入るファイルがずれうる
-        console.error('ダウンロード用オブジェクトの型が不正(manifestが無いか形式が違う)', t.manifest);
-        return false;
     }
-    return !(t.posts as unknown[]).some((it: unknown) => {
+    const postsInvalid = (t.posts as unknown[]).some((it: unknown) => {
       if (typeof it !== 'object' || it === null) {
         console.error('ダウンロード用オブジェクトの型が不正(postsの値にobjectでないものが含まれる)', it, t.posts);
         return true;
@@ -2689,6 +2727,16 @@ export class DownloadHelper {
       }
       return false;
     });
+    if (postsInvalid) return false;
+    // manifest の検証は投稿の型検証を通してから行う。先に行うと、壊れた posts / cover を
+    // 参照して型ガードが例外を投げてしまう
+    if (!isDownloadManifest(t.manifest, t)) {
+      // projection を経ていないオブジェクトはここで弾く。絞り込みを経ずに ZIP にすると、
+      // HTML の参照と実際に入るファイルがずれうる
+      console.error('ダウンロード用オブジェクトの型が不正(manifestが無いか形式が違う)', t.manifest);
+      return false;
+    }
+    return true;
   }
 
   /**

@@ -103,6 +103,12 @@ ZIP ルートに `download-manifest.json` を書き出す (`schemaVersion` / `cr
 - `manifest.posts` が JSON の投稿と件数・`archiveDirectory` で **同じ index に対応する**こと (`manifest.posts` は収集順と定義しているため。集合として含まれるだけでは通さない)
 - 各投稿の `included` が JSON の `files[].encodedName` / `originalName` および `cover.name` と 1 対 1 で対応すること
 - 同じアセットが `included` と `excluded` の両方に無いこと
+- `postCount` / `fileCount` が JSON の実件数と一致すること
+- 記録された `Selection` と内容が矛盾しないこと (出力に載っている投稿が `postIds` に含まれる、`excludedPosts` が `postIds` に含まれない、含めた / 除外したアセットの拡張子が `extensions` と対応する、カバーの扱いが `includeCover` と一致する)
+
+`excludedPosts` の網羅性は検証できない。projection 後の JSON には元の投稿一覧が残らないため。
+
+`isDownloadJsonObj` は `unknown` を受ける型ガードなので、**manifest の検証は投稿の型検証を通してから行う**。先に行うと、壊れた `posts` / `cover` を参照して例外を投げてしまう。
 
 ZIP ルート直下の固定ファイル名 (`index.html` / `download-manifest.json`) と同名の投稿ディレクトリは `downloadZip` が拒否する。同じパスがファイルとディレクトリの両方になり、展開できない ZIP になるため。legacy allocator の名前衝突 (同名グループの採番など) を許容するのとは扱いが違う — あちらは「1 ファイルだけ影に入った ZIP」で済むが、こちらはアーカイブ全体が壊れる。`index.html` の衝突は #42 以前からある欠陥で、ここで併せて塞いだ。
 
