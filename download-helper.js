@@ -218,7 +218,7 @@ export class PostObject {
     this.postObj.info = info;
   }
   setHtml(html) {
-    this.postObj.html = html;
+    this.postObj.html = html.map((fragment) => typeof fragment === "string" ? fragment : Object.freeze({ assetRef: freezeAssetKey(fragment.assetRef) }));
   }
   setTags(tags) {
     this.postObj.tags = tags;

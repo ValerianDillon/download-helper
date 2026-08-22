@@ -473,6 +473,17 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       expect(json.posts[0].htmlText).toContain('href="./asset0.bin"');
     });
 
+    test('setHtml に渡した AssetKey を後から書き換えても解決先は変わらない', () => {
+      const downloadObject = new DownloadObject('creator', utils);
+      const post = downloadObject.addPost('post');
+      const key = imageKey('i1');
+      post.addFile({ key, name: 'a', extension: 'png', url: 'u1' });
+      post.setHtml([{ assetRef: key }]);
+      (key as { assetId: string }).assetId = 'changed';
+      const json = JSON.parse(downloadObject.stringify()) as DownloadJsonObj;
+      expect(json.posts[0].htmlText).toBe('./a.png');
+    });
+
     test('割り当てられていない AssetKey を参照する断片は例外にする', () => {
       const downloadObject = new DownloadObject('creator', utils);
       const post = downloadObject.addPost('post');

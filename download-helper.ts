@@ -111,7 +111,7 @@ export type AssetInput = {
  * 文字列はそのまま出力する。{ assetRef } はアセットへの参照で、finalize 時に
  * allocator が割り当てた archive path へ解決する。
  */
-export type HtmlFragment = string | { assetRef: AssetKey };
+export type HtmlFragment = string | { readonly assetRef: AssetKey };
 
 /**
  * 断片列を区切り文字で連結する。
@@ -380,6 +380,14 @@ export type AllocatedAssetPaths = {
  *
  * 採番規則を知っている場所をここ 1 つに集約する。HTML の生成も JSON の files も
  * この結果だけを参照するので、規則を差し替えても両者がずれない。
+ *
+ * **実装は決定的でなければならない。** 同じ入力に対して同じ結果を返し、呼び出し回数に
+ * 依存する状態 (連番カウンタなど) を持ってはならない。`stringify()` は呼ばれるたびに
+ * allocator を再実行するので、状態を持つ実装では 2 回目の出力が 1 回目と食い違う。
+ *
+ * 初回の割り当てを `DownloadObject` 側で覚え込む方法は採らない。投稿やアセットを追加してから
+ * もう一度 `stringify()` したときに、追加分を反映しない古い採番を返すことになるためで、
+ * こちらのほうが壊れ方として悪い (出力が黙って実態とずれる)。決定性は allocator の契約とする。
  */
 export interface ArchivePathAllocator {
   /**
@@ -547,8 +555,17 @@ export class PostObject {
     this.postObj.info = info;
   }
 
+  /**
+   * 投稿 HTML の断片列を設定する。
+   *
+   * 断片も AssetKey を運ぶので、配列ごと複製して参照を凍結する。呼び出し側が保持している
+   * 鍵を後から書き換えられると、解決先が別のアセットに変わるか、解決できずに finalize が落ちる。
+   * @param html 断片列
+   */
   setHtml(html: HtmlFragment[]) {
-    this.postObj.html = html;
+    this.postObj.html = html.map((fragment) =>
+      typeof fragment === 'string' ? fragment : Object.freeze({ assetRef: freezeAssetKey(fragment.assetRef) }),
+    );
   }
 
   setTags(tags: string[]) {
