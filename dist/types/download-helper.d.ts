@@ -231,6 +231,12 @@ export type DownloadManifest = {
 export declare function joinHtmlFragments(parts: readonly HtmlFragment[][], separator: string): HtmlFragment[];
 /**
  * ダウンロード用JSON元オブジェクト
+ *
+ * 値は `DownloadObject.project()` の出力か、それを `JSON.parse` した結果であることを契約とする。
+ * したがって getter・`Array` の派生クラス・独自の `Symbol.iterator`・`toJSON` は含まれない。
+ * 検証と書き出しはそれでも読み出しを 1 回に畳んで素の値に写すが (`snapshotManifest`)、
+ * これは「検証したものと書き出すものを同一にする」ためであって、任意のオブジェクトを
+ * 安全に扱えることを主張するものではない。
  */
 export type DownloadJsonObj = {
     posts: {

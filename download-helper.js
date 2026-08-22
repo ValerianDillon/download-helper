@@ -922,9 +922,11 @@ function isDownloadManifest(value, downloadObj) {
   const m = value;
   if (m.schemaVersion !== 1)
     return false;
-  if (typeof m.generatedAt !== "string" || !Number.isFinite(new Date(m.generatedAt).getTime()))
+  const generatedAt = m.generatedAt;
+  if (typeof generatedAt !== "string" || !Number.isFinite(new Date(generatedAt).getTime()))
     return false;
-  if (typeof m.creatorId !== "string" || m.creatorId !== downloadObj.id)
+  const creatorId = m.creatorId;
+  if (typeof creatorId !== "string" || creatorId !== downloadObj.id)
     return false;
   const selection = m.selection;
   if (typeof selection !== "object" || selection === null || !isStringArray(selection.postIds) || !isStringArray(selection.extensions) || typeof selection.includeCover !== "boolean") {
