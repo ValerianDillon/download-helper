@@ -106,7 +106,10 @@ ZIP ルートに `download-manifest.json` を書き出す (`schemaVersion` / `cr
 - `postCount` / `fileCount` が JSON の実件数と一致すること
 - 記録された `Selection` と内容が矛盾しないこと (出力に載っている投稿が `postIds` に含まれる、`excludedPosts` が `postIds` に含まれない、含めた / 除外したアセットの拡張子が `extensions` と対応する、カバーの扱いが `includeCover` と一致する)
 
-`excludedPosts` の網羅性は検証できない。projection 後の JSON には元の投稿一覧が残らないため。
+検証できないものが 2 つある。どちらも `DownloadJsonObj` 側に対応する値が無いためで、突き合わせのためだけに identity を JSON へ写す設計は採らない (同じ値を 2 箇所に置いて一致を確かめる形になり、ずれたときにどちらが正しいか決められない)。
+
+- `excludedPosts` の網羅性。projection 後の JSON には元の投稿一覧が残らない
+- `postId` / `kind` / `assetId` / `extension` が実際の投稿・アセットに結び付いていること。これらは manifest にしか無いので、投稿間で `postId` を入れ替えても検証を通る
 
 `isDownloadJsonObj` は `unknown` を受ける型ガードなので、**manifest の検証は投稿の型検証を通してから行う**。先に行うと、壊れた `posts` / `cover` を参照して例外を投げてしまう。
 

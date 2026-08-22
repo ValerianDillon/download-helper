@@ -1387,6 +1387,29 @@ describe('isDownloadJsonObj', () => {
       });
     });
 
+    // 検証できる範囲の境界を固定する。DownloadJsonObj 側に対応する値が無いので、
+    // manifest にしか現れない identity は実際の投稿・アセットと結び付いていることを確かめられない
+    describe('検証できないもの (境界)', () => {
+      test('投稿間で postId を入れ替えても通る', () => {
+        const base = createValidObj();
+        const [first, second] = base.manifest.posts;
+        if (second === undefined) return;
+        const posts = [
+          { ...first, postId: second.postId },
+          { ...second, postId: first.postId },
+        ];
+        expect(helper.isDownloadJsonObj({ ...base, manifest: { ...base.manifest, posts } })).toBe(true);
+      });
+
+      test('included アセットの assetId を変えても通る', () => {
+        const base = createValidObj();
+        const post = base.manifest.posts[0];
+        const included = post.included.map((it) => (it.kind === 'cover' ? it : { ...it, assetId: 'rewritten' }));
+        const posts = [{ ...post, included }, ...base.manifest.posts.slice(1)];
+        expect(helper.isDownloadJsonObj({ ...base, manifest: { ...base.manifest, posts } })).toBe(true);
+      });
+    });
+
     test('manifest の投稿数が JSON の投稿数と合わない → false', () => {
       const manifest = { ...validManifest(), posts: [] };
       expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest })).toBe(false);

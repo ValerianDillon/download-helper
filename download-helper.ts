@@ -219,6 +219,12 @@ export type ManifestPost = {
  * この段階で主張するのは「plan に含めた」「選択条件で除外した」までで、「実際に書けた」とは
  * 主張しない。実行結果を対象単位で扱えるようになってから written / failed / aborted を足す。
  * URL は持たない (必要になれば post.info を取り直せば得られるし、保存量も減る)。
+ *
+ * `isDownloadJsonObj` が突き合わせられるのは、`DownloadJsonObj` 側にも現れる値だけである。
+ * `postId` / `kind` / `assetId` / `extension` は manifest にしか無いので、実際の投稿や
+ * アセットと結び付いていることは検証できない (投稿間で `postId` を入れ替えても通る)。
+ * 突き合わせのためだけに identity を JSON 側へ写す設計は採らない。同じ値を 2 箇所に置いて
+ * 一致を確かめる形になり、ずれたときにどちらが正しいのかを決められないため。
  */
 export type DownloadManifest = {
   readonly schemaVersion: 1;
