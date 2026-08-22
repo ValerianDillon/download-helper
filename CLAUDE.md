@@ -97,7 +97,14 @@ finalize では衝突を検出しない。legacy 自身が作れる衝突を例�
 
 ZIP ルートに `download-manifest.json` を書き出す (`schemaVersion` / `creatorId` / 生成日時 / `Selection` / 投稿ごとの含めた・除外したアセット / 投稿ごと除外した投稿)。**アセットは投稿にネストする** — `postId` の一意性を保証しない以上、平坦に並べると同じ postId の投稿が 2 件あったときにどちらのものか分からなくなる。アセットは `kind` と `assetId` で投稿内を一意に指す (カバーは `assetId` を持たない)。この段階で主張するのは「plan に含めた」「選択条件で除外した」までで、「実際に書けた」とは主張しない。選択条件を `informationText` (info JSON) に混ぜない — info JSON は FANBOX の投稿メタデータで、選択条件はダウンロード実行側の情報なので、混ぜると出所が曖昧になる。
 
-`manifest` は projection を経た印でもある。`isDownloadJsonObj` がこれを必須にすることで、絞り込みを経ていないオブジェクトを ZIP 入力として受け付けない。印として働かせるには形だけでは足りないので、各要素の型に加えて `creatorId` が `id` と一致すること、`manifest.posts` が JSON の投稿と件数・`archiveDirectory` で対応することまで検証する (空のダミーを付けただけの入力を通さないため)。
+`manifest` は projection を経た印でもある。`isDownloadJsonObj` がこれを必須にすることで、絞り込みを経ていないオブジェクトを ZIP 入力として受け付けない。印として働かせるには形だけでは足りないので、各要素の型に加えて次まで検証する (形だけ整えた manifest を付けただけの入力を通さないため)。
+
+- `creatorId` が `id` と一致すること
+- `manifest.posts` が JSON の投稿と件数・`archiveDirectory` で **同じ index に対応する**こと (`manifest.posts` は収集順と定義しているため。集合として含まれるだけでは通さない)
+- 各投稿の `included` が JSON の `files[].encodedName` / `originalName` および `cover.name` と 1 対 1 で対応すること
+- 同じアセットが `included` と `excluded` の両方に無いこと
+
+ZIP ルート直下の固定ファイル名 (`index.html` / `download-manifest.json`) と同名の投稿ディレクトリは `downloadZip` が拒否する。同じパスがファイルとディレクトリの両方になり、展開できない ZIP になるため。legacy allocator の名前衝突 (同名グループの採番など) を許容するのとは扱いが違う — あちらは「1 ファイルだけ影に入った ZIP」で済むが、こちらはアーカイブ全体が壊れる。`index.html` の衝突は #42 以前からある欠陥で、ここで併せて塞いだ。
 
 `PostObj.postId` は `Selection` が投稿を指すキーである。一意性は検証しない (一覧ページの重複などで同じ投稿が 2 回来ても収集を止めないことを優先する)。同じ postId の投稿が 2 件あれば選択は両方に同時に効く。
 

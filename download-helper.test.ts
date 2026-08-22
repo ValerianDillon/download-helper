@@ -279,15 +279,33 @@ describe('DownloadUtils', () => {
 });
 
 /** テスト用の最小 manifest (projection が付ける印) */
-const testManifest = (archiveDirectories: string[] = []): DownloadManifest => ({
+/** JSON の投稿と 1 対 1 で対応する manifest を後付けする */
+const withManifest = (obj: Omit<DownloadJsonObj, 'manifest'>): DownloadJsonObj => ({
+  ...obj,
+  manifest: testManifest(obj.posts),
+});
+
+const testManifest = (posts: DownloadJsonObj['posts'] = []): DownloadManifest => ({
   schemaVersion: 1,
   creatorId: 'creator-id',
   generatedAt: '2026-08-23T00:00:00.000Z',
   selection: { postIds: [], extensions: [], includeCover: true },
-  posts: archiveDirectories.map((archiveDirectory, i) => ({
+  // manifest は JSON の投稿・アセットと 1 対 1 で対応していなければ検証を通らない
+  posts: posts.map((post, i) => ({
     postId: `p${i + 1}`,
-    archiveDirectory,
-    included: [],
+    archiveDirectory: post.encodedName,
+    included: [
+      ...post.files.map((file, j) => ({
+        kind: 'file' as const,
+        assetId: `f${i + 1}-${j + 1}`,
+        originalName: file.originalName,
+        extension: '',
+        archiveName: file.encodedName,
+      })),
+      ...(post.cover
+        ? [{ kind: 'cover' as const, originalName: 'cover', extension: '', archiveName: post.cover.name }]
+        : []),
+    ],
     excluded: [],
   })),
   excludedPosts: [],
@@ -512,17 +530,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     test('投稿に存在しないアセットを参照するカードは例外にする', () => {
       const downloadObject = new DownloadObject('creator', utils);
       const post = downloadObject.addPost('p:post', 'post');
-      post.setHtml([
-        {
-          assetCard: {
-            key: imageKey('missing'),
-            kind: 'image',
-            originalName: 'a',
-            extension: '.png',
-            body: [{ assetRef: imageKey('missing') }],
-          },
-        },
-      ]);
+      post.setHtml([{ assetCard: { key: imageKey('missing'), body: [{ assetRef: imageKey('missing') }] } }]);
       expect(() => downloadObject.stringify({ now: FIXED_NOW })).toThrow(
         'HTML が投稿に存在しないアセットを参照しています: image:missing',
       );
@@ -532,17 +540,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       const downloadObject = new DownloadObject('creator', utils);
       const post = downloadObject.addPost('p:post', 'post');
       expect(() =>
-        post.setHtml([
-          {
-            assetCard: {
-              key: imageKey('i1'),
-              kind: 'image',
-              originalName: 'a',
-              extension: '.png',
-              body: [{ assetRef: imageKey('other') }],
-            },
-          },
-        ]),
+        post.setHtml([{ assetCard: { key: imageKey('i1'), body: [{ assetRef: imageKey('other') }] } }]),
       ).toThrow('カードの中の参照が別のアセットを指しています');
     });
   });
@@ -1063,30 +1061,30 @@ describe('isDownloadJsonObj', () => {
   /**
    * 有効な最小 DownloadJsonObj を生成するヘルパー
    */
-  const createValidObj = (): DownloadJsonObj => ({
-    posts: [
-      {
-        originalName: 'post1',
-        encodedName: 'post1',
-        informationText: '{}',
-        htmlText: '<p>hello</p>',
-        files: [
-          {
-            url: 'https://example.com/file.png',
-            originalName: 'file.png',
-            encodedName: 'file.png',
-          },
-        ],
-        tags: ['tag1'],
-      },
-    ],
-    id: 'creator-id',
-    url: 'https://example.com',
-    tags: ['tag1'],
-    fileCount: 1,
-    postCount: 1,
-    manifest: testManifest(['post1']),
-  });
+  const createValidObj = (): DownloadJsonObj =>
+    withManifest({
+      posts: [
+        {
+          originalName: 'post1',
+          encodedName: 'post1',
+          informationText: '{}',
+          htmlText: '<p>hello</p>',
+          files: [
+            {
+              url: 'https://example.com/file.png',
+              originalName: 'file.png',
+              encodedName: 'file.png',
+            },
+          ],
+          tags: ['tag1'],
+        },
+      ],
+      id: 'creator-id',
+      url: 'https://example.com',
+      tags: ['tag1'],
+      fileCount: 1,
+      postCount: 1,
+    });
 
   test('有効な最小オブジェクト → true', () => {
     expect(helper.isDownloadJsonObj(createValidObj())).toBe(true);
@@ -1146,20 +1144,8 @@ describe('isDownloadJsonObj', () => {
   });
 
   describe('manifest (projection を経た印)', () => {
-    /** createValidObj の投稿 1 件に対応する有効な manifest */
-    const validManifest = (): DownloadManifest => ({
-      ...testManifest(['post1']),
-      posts: [
-        {
-          postId: 'p1',
-          archiveDirectory: 'post1',
-          included: [
-            { kind: 'image', assetId: 'i1', originalName: 'file', extension: '.png', archiveName: 'file.png' },
-          ],
-          excluded: [{ kind: 'cover', originalName: 'cover', extension: '.png' }],
-        },
-      ],
-    });
+    /** createValidObj の投稿と 1 対 1 で対応する有効な manifest */
+    const validManifest = (): DownloadManifest => createValidObj().manifest;
 
     test('有効な manifest → true', () => {
       expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: validManifest() })).toBe(true);
@@ -1220,6 +1206,59 @@ describe('isDownloadJsonObj', () => {
       ['cover 以外なのに assetId を持たない', { excluded: [{ kind: 'image', originalName: 'c', extension: '.png' }] }],
     ])('posts の %s → false', (_label, override) => {
       expect(helper.isDownloadJsonObj(withPost(override))).toBe(false);
+    });
+
+    // 形だけ整った manifest を付けただけの入力を通すと、projection を経ていないオブジェクトが
+    // ZIP に流れる。「含めた」と主張するアセットが実際の対象と一致することまで見る
+    test('included が JSON の files と対応しない (空) → false', () => {
+      const manifest = validManifest();
+      const posts = [{ ...manifest.posts[0], included: [] }];
+      expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: { ...manifest, posts } })).toBe(false);
+    });
+
+    test('included の archiveName が JSON の encodedName と違う → false', () => {
+      const manifest = validManifest();
+      const included = [{ ...manifest.posts[0].included[0], archiveName: 'other.png' }];
+      const posts = [{ ...manifest.posts[0], included }];
+      expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: { ...manifest, posts } })).toBe(false);
+    });
+
+    test('included の originalName が JSON と違う → false', () => {
+      const manifest = validManifest();
+      const included = [{ ...manifest.posts[0].included[0], originalName: 'other' }];
+      const posts = [{ ...manifest.posts[0], included }];
+      expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: { ...manifest, posts } })).toBe(false);
+    });
+
+    test('カバーが無い投稿に included の cover がある → false', () => {
+      const manifest = validManifest();
+      const included = [
+        ...manifest.posts[0].included,
+        { kind: 'cover' as const, originalName: 'cover', extension: '', archiveName: 'cover.png' },
+      ];
+      const posts = [{ ...manifest.posts[0], included }];
+      expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: { ...manifest, posts } })).toBe(false);
+    });
+
+    test('同じアセットが included と excluded の両方にある → false', () => {
+      const manifest = validManifest();
+      const asset = manifest.posts[0].included[0];
+      const posts = [{ ...manifest.posts[0], excluded: [{ ...asset, archiveName: undefined }] }];
+      expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: { ...manifest, posts } })).toBe(false);
+    });
+
+    test('manifest.posts の順序が JSON の投稿と食い違う → false', () => {
+      // 集合として含まれていても、収集順で対応していなければ通さない
+      const obj = createValidObj();
+      const twoPosts = { ...obj, posts: [obj.posts[0], { ...obj.posts[0], encodedName: 'post2' }] };
+      const manifest = {
+        ...obj.manifest,
+        posts: [
+          { ...obj.manifest.posts[0], archiveDirectory: 'post2' },
+          { ...obj.manifest.posts[0], archiveDirectory: 'post2' },
+        ],
+      };
+      expect(helper.isDownloadJsonObj({ ...twoPosts, manifest })).toBe(false);
     });
 
     test('manifest の投稿数が JSON の投稿数と合わない → false', () => {
@@ -2912,7 +2951,7 @@ describe('DownloadHelper.downloadZip', () => {
    * 有効な最小 DownloadJsonObj (投稿 2 件) を生成するヘルパー
    */
   function createValidObj(overrides?: Partial<DownloadJsonObj>): DownloadJsonObj {
-    return {
+    return withManifest({
       posts: [
         {
           originalName: 'post1',
@@ -2938,9 +2977,8 @@ describe('DownloadHelper.downloadZip', () => {
       tags: [],
       fileCount: 2,
       postCount: 2,
-      manifest: testManifest(['post1', 'post2']),
       ...overrides,
-    };
+    });
   }
 
   /**
@@ -3193,6 +3231,23 @@ describe('DownloadHelper.downloadZip', () => {
       }
     });
 
+    test.each([
+      'index.html',
+      'download-manifest.json',
+    ])('投稿ディレクトリ名がルートの予約名 %s と衝突する → 例外', async (reserved) => {
+      // 同じパスがファイルとディレクトリの両方になり、展開できない ZIP になる
+      const base = createValidObj();
+      const obj: DownloadJsonObj = {
+        ...base,
+        posts: [{ ...base.posts[0], encodedName: reserved }, ...base.posts.slice(1)],
+        manifest: {
+          ...base.manifest,
+          posts: [{ ...base.manifest.posts[0], archiveDirectory: reserved }, ...base.manifest.posts.slice(1)],
+        },
+      };
+      await expect(runDownloadZip(obj)).rejects.toThrow('ルートの予約名と衝突');
+    });
+
     test('download-manifest.json が ZIP ルートに書かれる', async () => {
       const obj = createValidObj();
       const buf = await runDownloadZip(obj);
@@ -3336,7 +3391,7 @@ describe('DownloadHelper.downloadZip', () => {
      * カバー・添付を 1 件ずつに絞っている (件数の数え間違いをテスト側で見落としにくくするため)。
      */
     function createObjWithCovers(): DownloadJsonObj {
-      return {
+      return withManifest({
         posts: [
           {
             originalName: 'post1',
@@ -3362,8 +3417,7 @@ describe('DownloadHelper.downloadZip', () => {
         tags: [],
         fileCount: 2,
         postCount: 2,
-        manifest: testManifest(['post1', 'post2']),
-      };
+      });
     }
 
     /**
@@ -3465,7 +3519,7 @@ describe('DownloadHelper.downloadZip', () => {
       // 投稿 1 件に添付を 2 件持たせ、1 件目取得後に signal を立てる。
       // 2 件目はループ先頭の signal チェック (fetchFile 呼び出し前) で打ち切られる分岐であり、
       // 「fetchFile が null を返した直後に signal.aborted を見る」分岐 (別テストでカバー済み) とは経路が異なる
-      const obj: DownloadJsonObj = {
+      const obj: DownloadJsonObj = withManifest({
         posts: [
           {
             originalName: 'post1',
@@ -3485,8 +3539,7 @@ describe('DownloadHelper.downloadZip', () => {
         tags: [],
         fileCount: 2,
         postCount: 1,
-        manifest: testManifest(['post1']),
-      };
+      });
       const controller = new AbortController();
       const calledUrls: string[] = [];
       const fetchFile = async (url: string) => {

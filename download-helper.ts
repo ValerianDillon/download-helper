@@ -137,11 +137,6 @@ export type AssetInput = {
  */
 export type AssetCardFragment = {
   readonly key: AssetKey;
-  readonly kind: AssetKind;
-  /** 元のファイル名 (拡張子を含まない)。プレースホルダーに出す */
-  readonly originalName: string;
-  /** 元の拡張子 (先頭ドットを含む、または空文字列)。プレースホルダーに出す */
-  readonly extension: string;
   readonly body: readonly CardBodyFragment[];
 };
 
@@ -867,13 +862,7 @@ function freezeFragment(fragment: HtmlFragment): HtmlFragment {
     return Object.freeze({ assetRef: freezeAssetKey(it.assetRef) });
   });
   return Object.freeze({
-    assetCard: Object.freeze({
-      key: freezeAssetKey(assetCard.key),
-      kind: assetCard.kind,
-      originalName: assetCard.originalName,
-      extension: assetCard.extension,
-      body: Object.freeze(body),
-    }),
+    assetCard: Object.freeze({ key: freezeAssetKey(assetCard.key), body: Object.freeze(body) }),
   });
 }
 
@@ -893,17 +882,7 @@ export type ProjectedPost = {
  * @param body カードの中身
  */
 function card(fileObject: FileObject, body: CardBodyFragment[]): HtmlFragment[] {
-  return [
-    {
-      assetCard: {
-        key: fileObject.getKey(),
-        kind: fileObject.getKey().kind,
-        originalName: fileObject.getOriginalName(),
-        extension: fileObject.getOriginalExtension(),
-        body,
-      },
-    },
-  ];
+  return [{ assetCard: { key: fileObject.getKey(), body } }];
 }
 
 /**
@@ -1087,6 +1066,10 @@ export class PostObject {
     const allocation = allocator.allocateAssetPaths(this.postObj);
     const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it] as const));
     this.assertAllocationCoversAssets(allocation, fileByKey);
+    const assetByKey = new Map<string, FileObj>(fileByKey);
+    if (this.postObj.cover) {
+      assetByKey.set('cover', this.postObj.cover);
+    }
     const pathByKey = new Map<string, string>();
     for (const { key, archiveName } of allocation.files) {
       pathByKey.set(assetKeyToString(key), archiveName);
@@ -1098,13 +1081,13 @@ export class PostObject {
       this.postObj.cover && includedKeys.has('cover')
         ? { url: this.postObj.cover.url, name: allocation.coverArchiveName as string }
         : undefined;
-    this.assertHtmlReferencesKnownAssets(pathByKey);
+    this.assertHtmlReferencesKnownAssets(assetByKey);
     return {
       json: {
         originalName: this.postObj.name,
         encodedName: directoryName,
         informationText: this.postObj.info,
-        htmlText: this.resolveHtml(pathByKey, includedKeys),
+        htmlText: this.resolveHtml(pathByKey, includedKeys, assetByKey),
         // URL と元ファイル名は投稿が持つ値から取る。allocator が決めるのは名前と並び順だけ
         files: allocation.files
           .filter(({ key }) => includedKeys.has(assetKeyToString(key)))
@@ -1168,13 +1151,13 @@ export class PostObject {
    *
    * 参照先が無いカードを除外扱いにしてプレースホルダーで描くと、「選択条件で外した」のか
    * 「アセットを登録し忘れた」のか区別できなくなる。後者は実装の誤りなので止める
-   * @param pathByKey 投稿の全アセット (カバーを含む) の archive 名
+   * @param assetByKey 投稿の全アセット (カバーを含む)
    */
-  private assertHtmlReferencesKnownAssets(pathByKey: ReadonlyMap<string, string>): void {
+  private assertHtmlReferencesKnownAssets(assetByKey: ReadonlyMap<string, FileObj>): void {
     for (const fragment of this.postObj.html) {
       if (typeof fragment === 'string') continue;
       const key = assetKeyToString(fragment.assetCard.key);
-      if (!pathByKey.has(key)) {
+      if (!assetByKey.has(key)) {
         throw new Error(`HTML が投稿に存在しないアセットを参照しています: ${key}`);
       }
     }
@@ -1189,7 +1172,11 @@ export class PostObject {
    * @param pathByKey assetKeyToString をキーとする archive path (投稿の全アセット)
    * @param includedKeys 出力に含めるアセット
    */
-  private resolveHtml(pathByKey: ReadonlyMap<string, string>, includedKeys: ReadonlySet<string>): string {
+  private resolveHtml(
+    pathByKey: ReadonlyMap<string, string>,
+    includedKeys: ReadonlySet<string>,
+    assetByKey: ReadonlyMap<string, FileObj>,
+  ): string {
     const renderBody = (fragments: readonly CardBodyFragment[]): string =>
       fragments
         .map((fragment) => {
@@ -1204,10 +1191,13 @@ export class PostObject {
     return this.postObj.html
       .map((fragment) => {
         if (typeof fragment === 'string') return fragment;
-        const assetCard = fragment.assetCard;
-        return includedKeys.has(assetKeyToString(assetCard.key))
-          ? renderBody(assetCard.body)
-          : this.renderExcludedAsset(assetCard);
+        const key = assetKeyToString(fragment.assetCard.key);
+        if (includedKeys.has(key)) return renderBody(fragment.assetCard.body);
+        const asset = assetByKey.get(key);
+        if (asset === undefined) {
+          throw new Error(`HTML が投稿に存在しないアセットを参照しています: ${key}`);
+        }
+        return this.renderExcludedAsset(asset);
       })
       .join('');
   }
@@ -1215,12 +1205,14 @@ export class PostObject {
   /**
    * 選択条件で除外されたアセットのプレースホルダーを描く。
    *
-   * 「取得に失敗した」とは別の状態なので文言を分ける。URL は残さない
-   * @param assetCard 除外されたアセットのカード
+   * 「取得に失敗した」とは別の状態なので文言を分ける。URL は残さない。
+   * 種別と名前は登録済みのアセットから取る。カードに持たせると、実在する key に偽の
+   * メタデータを付けたカードで誤った表示ができてしまう
+   * @param asset 除外されたアセット
    */
-  private renderExcludedAsset(assetCard: AssetCardFragment): string {
-    const label = assetCard.kind === 'cover' ? 'カバー画像' : assetCard.kind === 'image' ? '画像' : '添付ファイル';
-    const name = this.utils.escapeHtml(assetCard.originalName + assetCard.extension);
+  private renderExcludedAsset(asset: FileObj): string {
+    const label = asset.key.kind === 'cover' ? 'カバー画像' : asset.key.kind === 'image' ? '画像' : '添付ファイル';
+    const name = this.utils.escapeHtml(asset.name + asset.extension);
     return (
       `<div class="post card text-center excluded-asset"><p class="pt-2">\n` +
       `選択条件により除外しました\n<br>\n${label}: ${name}\n</p></div>`
@@ -2106,18 +2098,57 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
   if (!Array.isArray(m.posts) || !Array.isArray(m.excludedPosts)) return false;
   if (!m.excludedPosts.every((it) => isRecordWithStringKeys(it, ['postId']))) return false;
 
-  // manifest の投稿と JSON の投稿ディレクトリが対応していることまで見る。対応しない manifest は
-  // 「この ZIP に何を入れたか」の記録として成立しない
-  const encodedNames = Array.isArray(downloadObj.posts)
-    ? (downloadObj.posts as Record<string, unknown>[]).map((it) => it?.encodedName)
-    : [];
-  if (m.posts.length !== encodedNames.length) return false;
-  return m.posts.every((post: unknown) => {
+  // manifest が JSON の投稿・アセットと 1 対 1 で対応することまで見る。形だけ整った manifest を
+  // 付けただけの入力を通すと、projection を経ていないオブジェクトが ZIP に流れる
+  const jsonPosts = Array.isArray(downloadObj.posts) ? (downloadObj.posts as Record<string, unknown>[]) : [];
+  if (m.posts.length !== jsonPosts.length) return false;
+  // manifest.posts は収集順と定義しているので、同じ index の投稿と突き合わせる
+  return m.posts.every((post: unknown, index: number) => {
     if (!isRecordWithStringKeys(post, ['postId', 'archiveDirectory'])) return false;
     const p = post as Record<string, unknown>;
-    if (!encodedNames.includes(p.archiveDirectory)) return false;
-    return isManifestAssetArray(p.included, true) && isManifestAssetArray(p.excluded, false);
+    const jsonPost = jsonPosts[index];
+    if (p.archiveDirectory !== jsonPost?.encodedName) return false;
+    if (!isManifestAssetArray(p.included, true) || !isManifestAssetArray(p.excluded, false)) return false;
+    return isManifestPostConsistent(p, jsonPost);
   });
+}
+
+/**
+ * manifest の投稿 1 件が、JSON の同じ投稿と 1 対 1 で対応しているか。
+ *
+ * 「含めた」と主張するアセットが実際に ZIP へ入る対象と一致しなければ、この記録は
+ * 「この ZIP に何を入れたか」を表していない
+ * @param manifestPost manifest 側の投稿
+ * @param jsonPost JSON 側の投稿
+ * @internal
+ */
+function isManifestPostConsistent(manifestPost: Record<string, unknown>, jsonPost: Record<string, unknown>): boolean {
+  const included = manifestPost.included as Record<string, unknown>[];
+  const excluded = manifestPost.excluded as Record<string, unknown>[];
+
+  // 同じアセットを含めたと除外したの両方に載せない
+  const identities = [...included, ...excluded].map((it) => `${it.kind}:${it.assetId ?? ''}`);
+  if (new Set(identities).size !== identities.length) return false;
+
+  const cover = jsonPost.cover as Record<string, unknown> | undefined;
+  const includedCovers = included.filter((it) => it.kind === 'cover');
+  if (cover === undefined) {
+    if (includedCovers.length !== 0) return false;
+  } else if (includedCovers.length !== 1 || includedCovers[0].archiveName !== cover.name) {
+    return false;
+  }
+
+  const files = Array.isArray(jsonPost.files) ? [...(jsonPost.files as Record<string, unknown>[])] : [];
+  const includedFiles = included.filter((it) => it.kind !== 'cover');
+  if (includedFiles.length !== files.length) return false;
+  for (const entry of includedFiles) {
+    const index = files.findIndex(
+      (it) => it.encodedName === entry.archiveName && it.originalName === entry.originalName,
+    );
+    if (index < 0) return false;
+    files.splice(index, 1);
+  }
+  return true;
 }
 
 /** 文字列だけの配列か */
@@ -2148,6 +2179,12 @@ function isManifestAssetArray(value: unknown, requireArchiveName: boolean): bool
     return requireArchiveName ? typeof asset.archiveName === 'string' : asset.archiveName === undefined;
   });
 }
+
+/**
+ * ZIP ルート直下に必ず書かれるファイル名。投稿ディレクトリ名として使えない
+ * @internal
+ */
+const RESERVED_ROOT_ENTRY_NAMES = ['index.html', 'download-manifest.json'];
 
 /**
  * 2桁ゼロ埋め
@@ -2349,6 +2386,11 @@ export class DownloadHelper {
       }
       if (seenEncodedNames.has(post.encodedName)) {
         throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
+      }
+      // ルート直下の固定ファイルと同名の投稿ディレクトリを作ると、同じパスがファイルと
+      // ディレクトリの両方になり展開できない ZIP になる
+      if (RESERVED_ROOT_ENTRY_NAMES.includes(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName がルートの予約名と衝突しています (${post.encodedName})`);
       }
       seenEncodedNames.add(post.encodedName);
       if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
