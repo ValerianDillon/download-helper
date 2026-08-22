@@ -602,10 +602,12 @@ export declare class PostObject {
      */
     private allocateAssets;
     /**
-     * 出力に使わない投稿についても allocator の契約を確かめる
+     * 出力に使わない投稿についても finalize の契約を確かめる。
+     *
+     * 選択された投稿でだけ検査すると、入力の正当性が選択内容に依存してしまう
      * @param allocator 投稿内アセットの割り当て器
      */
-    assertAllocatorContract(allocator: ArchivePathAllocator): void;
+    assertFinalizeContract(allocator: ArchivePathAllocator): void;
     /**
      * allocator の結果が投稿のアセットと 1 対 1 に対応していることを確かめる。
      *

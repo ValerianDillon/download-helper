@@ -1039,7 +1039,17 @@ describe('projection', () => {
     });
   });
 
-  // 選択された投稿でだけ検査すると、壊れた allocator が選択次第で素通りする
+  // 投稿を選択から外しても入力の正当性は変わらない。選択された投稿でだけ検査すると、
+  // 壊れた入力が選択次第で素通りする
+  test('選択されなかった投稿でも、存在しないアセットを参照するカードを例外にする', () => {
+    const d = new DownloadObject('creator', utils);
+    const post = d.addPost('p1', 'post');
+    post.setHtml([{ assetCard: { key: imageKey('missing'), body: [{ assetRef: imageKey('missing') }] } }]);
+    expect(() => d.project({ postIds: new Set(), extensions: new Set(), includeCover: false }, { now: NOW })).toThrow(
+      'HTML が投稿に存在しないアセットを参照しています: image:missing',
+    );
+  });
+
   test('選択されなかった投稿でも allocator の契約を確かめる', () => {
     const broken: ArchivePathAllocator = {
       allocatePostDirectoryNames: (posts) => posts.map((_, index) => `post${index}`),

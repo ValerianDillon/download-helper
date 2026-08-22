@@ -775,9 +775,10 @@ export class DownloadObject {
 
     this.downloadObj.posts.forEach((postObj, index) => {
       if (!selection.postIds.has(postObj.postId)) {
-        // 出力には使わないが、allocator の契約は選択の可否によらず確かめる。
-        // 選択された投稿でだけ検査すると、壊れた allocator が選択次第で素通りする
-        this.orderedPosts[index].assertAllocatorContract(this.allocator);
+        // 出力には使わないが、finalize の契約 (allocator の割り当てと HTML の参照先) は
+        // 選択の可否によらず確かめる。選択された投稿でだけ検査すると、壊れた入力が
+        // 選択次第で素通りする
+        this.orderedPosts[index].assertFinalizeContract(this.allocator);
         // 投稿ごと除外された場合、そのアセットは個別に載せない (投稿単位で除外と分かる)
         excludedPosts.push({ postId: postObj.postId });
         return;
@@ -1087,11 +1088,7 @@ export class PostObject {
     allocator: ArchivePathAllocator,
     includedKeys: ReadonlySet<string>,
   ): ProjectedPost {
-    const { allocation, fileByKey } = this.allocateAssets(allocator);
-    const assetByKey = new Map<string, FileObj>(fileByKey);
-    if (this.postObj.cover) {
-      assetByKey.set('cover', this.postObj.cover);
-    }
+    const { allocation, fileByKey, assetByKey } = this.allocateAssets(allocator);
     const pathByKey = new Map<string, string>();
     for (const { key, archiveName } of allocation.files) {
       pathByKey.set(assetKeyToString(key), archiveName);
@@ -1103,7 +1100,6 @@ export class PostObject {
       this.postObj.cover && includedKeys.has('cover')
         ? { url: this.postObj.cover.url, name: allocation.coverArchiveName as string }
         : undefined;
-    this.assertHtmlReferencesKnownAssets(assetByKey);
     return {
       json: {
         originalName: this.postObj.name,
@@ -1134,18 +1130,26 @@ export class PostObject {
   private allocateAssets(allocator: ArchivePathAllocator): {
     allocation: AllocatedAssetPaths;
     fileByKey: Map<string, BodyFileObj>;
+    assetByKey: Map<string, FileObj>;
   } {
     const allocation = allocator.allocateAssetPaths(this.postObj);
     const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it] as const));
     this.assertAllocationCoversAssets(allocation, fileByKey);
-    return { allocation, fileByKey };
+    const assetByKey = new Map<string, FileObj>(fileByKey);
+    if (this.postObj.cover) {
+      assetByKey.set('cover', this.postObj.cover);
+    }
+    this.assertHtmlReferencesKnownAssets(assetByKey);
+    return { allocation, fileByKey, assetByKey };
   }
 
   /**
-   * 出力に使わない投稿についても allocator の契約を確かめる
+   * 出力に使わない投稿についても finalize の契約を確かめる。
+   *
+   * 選択された投稿でだけ検査すると、入力の正当性が選択内容に依存してしまう
    * @param allocator 投稿内アセットの割り当て器
    */
-  assertAllocatorContract(allocator: ArchivePathAllocator): void {
+  assertFinalizeContract(allocator: ArchivePathAllocator): void {
     this.allocateAssets(allocator);
   }
 

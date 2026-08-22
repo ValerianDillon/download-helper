@@ -209,7 +209,7 @@ export class DownloadObject {
     let fileCount = 0;
     this.downloadObj.posts.forEach((postObj, index) => {
       if (!selection.postIds.has(postObj.postId)) {
-        this.orderedPosts[index].assertAllocatorContract(this.allocator);
+        this.orderedPosts[index].assertFinalizeContract(this.allocator);
         excludedPosts.push({ postId: postObj.postId });
         return;
       }
@@ -431,11 +431,7 @@ export class PostObject {
     ]);
   }
   projectPost(directoryName, allocator, includedKeys) {
-    const { allocation, fileByKey } = this.allocateAssets(allocator);
-    const assetByKey = new Map(fileByKey);
-    if (this.postObj.cover) {
-      assetByKey.set("cover", this.postObj.cover);
-    }
+    const { allocation, fileByKey, assetByKey } = this.allocateAssets(allocator);
     const pathByKey = new Map;
     for (const { key, archiveName } of allocation.files) {
       pathByKey.set(assetKeyToString(key), archiveName);
@@ -444,7 +440,6 @@ export class PostObject {
       pathByKey.set("cover", allocation.coverArchiveName);
     }
     const cover = this.postObj.cover && includedKeys.has("cover") ? { url: this.postObj.cover.url, name: allocation.coverArchiveName } : undefined;
-    this.assertHtmlReferencesKnownAssets(assetByKey);
     return {
       json: {
         originalName: this.postObj.name,
@@ -466,9 +461,14 @@ export class PostObject {
     const allocation = allocator.allocateAssetPaths(this.postObj);
     const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it]));
     this.assertAllocationCoversAssets(allocation, fileByKey);
-    return { allocation, fileByKey };
+    const assetByKey = new Map(fileByKey);
+    if (this.postObj.cover) {
+      assetByKey.set("cover", this.postObj.cover);
+    }
+    this.assertHtmlReferencesKnownAssets(assetByKey);
+    return { allocation, fileByKey, assetByKey };
   }
-  assertAllocatorContract(allocator) {
+  assertFinalizeContract(allocator) {
     this.allocateAssets(allocator);
   }
   assertAllocationCoversAssets(allocation, fileByKey) {

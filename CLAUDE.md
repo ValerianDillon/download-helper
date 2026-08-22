@@ -87,7 +87,7 @@ finalize では衝突を検出しない。legacy 自身が作れる衝突を例�
 `DownloadObject.project(selection, options?)` が `DownloadJsonObj` を返す。入力は変更せず、同じ入力と `Selection` に対して決定的である (`options.now` を渡せば `generatedAt` も含めて決まる)。
 
 - **選択で間引いても archive path を再採番しない。** 割り当ては選択前の全アセットから行い、`Selection` は出力に載せるかどうかだけに使う。間引いた後の件数で採番し直すと HTML 内の参照と一致しなくなる
-- allocator の契約検査は選択の可否によらず全投稿に対して行う。選択された投稿でだけ検査すると、壊れた allocator が選択次第で素通りする
+- finalize の契約検査 (allocator の割り当てと、HTML のカードが投稿の持つアセットだけを参照していること) は選択の可否によらず全投稿に対して行う。選択された投稿でだけ検査すると、入力の正当性が選択内容に依存してしまう
 - `postCount` は選択投稿数、`fileCount` は選択された `post.files` の数 (カバーを含めない。従来の `countFile` と同じ意味論)
 - root の `tags` は選択後の投稿に残っているものだけを出す。`setTags` の並び (支援額タグを先頭に置く) は保つ
 - 「絞り込まずに全部落とす」も projection を経た結果として表す (`selectAll()`)。ZIP 入力の経路を 1 本にするため、`stringify()` は `project(selectAll())` に委譲する
