@@ -2096,16 +2096,21 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
     return false;
   }
 
-  if (!Array.isArray(m.posts) || !Array.isArray(m.excludedPosts)) return false;
-  if (!m.excludedPosts.every((it) => isRecordWithStringKeys(it, ['postId']))) return false;
+  if (!isDenseArray(m.posts) || !isDenseArray(m.excludedPosts)) return false;
+  for (const it of m.excludedPosts) {
+    if (!isRecordWithStringKeys(it, ['postId'])) return false;
+  }
 
   // manifest が JSON の投稿・アセットと 1 対 1 で対応することまで見る。形だけ整った manifest を
   // 付けただけの入力を通すと、projection を経ていないオブジェクトが ZIP に流れる
-  const jsonPosts = Array.isArray(downloadObj.posts) ? (downloadObj.posts as Record<string, unknown>[]) : [];
+  const jsonPosts = isDenseArray(downloadObj.posts) ? (downloadObj.posts as Record<string, unknown>[]) : [];
   if (m.posts.length !== jsonPosts.length) return false;
   // 件数は JSON 側の定義 (postCount = 投稿数、fileCount = 添付数。カバーを含めない) と一致する
   if (downloadObj.postCount !== jsonPosts.length) return false;
-  const totalFiles = jsonPosts.reduce((sum, it) => sum + (Array.isArray(it?.files) ? it.files.length : 0), 0);
+  let totalFiles = 0;
+  for (const it of jsonPosts) {
+    totalFiles += Array.isArray(it?.files) ? it.files.length : 0;
+  }
   if (downloadObj.fileCount !== totalFiles) return false;
 
   const selectedPostIds = new Set(selection.postIds as string[]);
@@ -2113,11 +2118,12 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
   const includeCover = selection.includeCover;
   // 除外された投稿が選択集合に入っていてはいけない (excludedPosts の網羅性は、projection 後の
   // JSON に元の投稿一覧が残らないので検証できない)
-  if (m.excludedPosts.some((it) => selectedPostIds.has((it as Record<string, unknown>).postId as string))) {
-    return false;
+  for (const it of m.excludedPosts) {
+    if (selectedPostIds.has((it as Record<string, unknown>).postId as string)) return false;
   }
   // manifest.posts は収集順と定義しているので、同じ index の投稿と突き合わせる
-  return m.posts.every((post: unknown, index: number) => {
+  for (let index = 0; index < m.posts.length; index++) {
+    const post = m.posts[index];
     if (!isRecordWithStringKeys(post, ['postId', 'archiveDirectory'])) return false;
     const p = post as Record<string, unknown>;
     const jsonPost = jsonPosts[index];
@@ -2126,8 +2132,9 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
     // 出力に載っている投稿は選択されていなければならない
     if (!selectedPostIds.has(p.postId as string)) return false;
     if (!isManifestSelectionConsistent(p, selectedExtensions, includeCover)) return false;
-    return isManifestPostConsistent(p, jsonPost);
-  });
+    if (!isManifestPostConsistent(p, jsonPost)) return false;
+  }
+  return true;
 }
 
 /**
@@ -2181,7 +2188,7 @@ function isManifestPostConsistent(manifestPost: Record<string, unknown>, jsonPos
     return false;
   }
 
-  const files = Array.isArray(jsonPost.files) ? [...(jsonPost.files as Record<string, unknown>[])] : [];
+  const files = isDenseArray(jsonPost.files) ? [...(jsonPost.files as Record<string, unknown>[])] : [];
   const includedFiles = included.filter((it) => it.kind !== 'cover');
   if (includedFiles.length !== files.length) return false;
   for (const entry of includedFiles) {
@@ -2194,9 +2201,30 @@ function isManifestPostConsistent(manifestPost: Record<string, unknown>, jsonPos
   return true;
 }
 
-/** 文字列だけの配列か */
+/**
+ * hole の無い配列か。
+ *
+ * `every` / `some` / `reduce` は hole を飛ばすので、`new Array(3)` のような疎配列は
+ * どんな述語でも通ってしまう。書き出すと `[null, null, null]` になるし、後段で要素を
+ * 参照した時点で例外になる。要素検証の前に密であることを確かめる
+ * @param value 検証対象
+ * @internal
+ */
+function isDenseArray(value: unknown): value is unknown[] {
+  if (!Array.isArray(value)) return false;
+  for (let index = 0; index < value.length; index++) {
+    if (!Object.hasOwn(value, index)) return false;
+  }
+  return true;
+}
+
+/** 文字列だけの、hole の無い配列か */
 function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((it) => typeof it === 'string');
+  if (!isDenseArray(value)) return false;
+  for (const it of value) {
+    if (typeof it !== 'string') return false;
+  }
+  return true;
 }
 
 /** 指定のキーがすべて文字列であるオブジェクトか */
@@ -2212,7 +2240,7 @@ function isRecordWithStringKeys(value: unknown, keys: string[]): boolean {
  * @param requireArchiveName 含めたアセットなら archiveName を必須にする (除外なら持たないことを求める)
  */
 function isManifestAssetArray(value: unknown, requireArchiveName: boolean): boolean {
-  if (!Array.isArray(value)) return false;
+  if (!isDenseArray(value)) return false;
   return value.every((it: unknown) => {
     if (!isRecordWithStringKeys(it, ['originalName', 'extension'])) return false;
     const asset = it as Record<string, unknown>;
@@ -2265,18 +2293,35 @@ function toCanonicalManifest(manifest: DownloadManifest): DownloadManifest {
     creatorId: manifest.creatorId,
     generatedAt: manifest.generatedAt,
     selection: {
-      postIds: [...manifest.selection.postIds],
-      extensions: [...manifest.selection.extensions],
+      postIds: copyArray(manifest.selection.postIds, (it) => it),
+      extensions: copyArray(manifest.selection.extensions, (it) => it),
       includeCover: manifest.selection.includeCover,
     },
-    posts: manifest.posts.map((post) => ({
+    posts: copyArray(manifest.posts, (post) => ({
       postId: post.postId,
       archiveDirectory: post.archiveDirectory,
-      included: post.included.map((it) => ({ ...asset(it), archiveName: it.archiveName })),
-      excluded: post.excluded.map(asset),
+      included: copyArray(post.included, (it) => ({ ...asset(it), archiveName: it.archiveName })),
+      excluded: copyArray(post.excluded, asset),
     })),
-    excludedPosts: manifest.excludedPosts.map((it) => ({ postId: it.postId })),
+    excludedPosts: copyArray(manifest.excludedPosts, (it) => ({ postId: it.postId })),
   };
+}
+
+/**
+ * 配列を index で読んで新しい素の配列に写す。
+ *
+ * 入力配列の `map` や iterator を呼ばない。Array の派生クラスで `map` を差し替えたり
+ * `Symbol.species` を細工したりすると、写した先に `toJSON` や未知プロパティを混ぜ込めるため
+ * @param source 写す元 (検証済みで hole が無いこと)
+ * @param project 要素の変換
+ * @internal
+ */
+function copyArray<T, R>(source: readonly T[], project: (item: T) => R): R[] {
+  const copied: R[] = [];
+  for (let index = 0; index < source.length; index++) {
+    copied.push(project(source[index]));
+  }
+  return copied;
 }
 
 /**

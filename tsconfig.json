@@ -4,7 +4,7 @@
     "module": "es2015",
     "noEmit": true,
     "strict": true,
-    "lib": ["dom", "es2021"],
+    "lib": ["dom", "es2022"],
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,

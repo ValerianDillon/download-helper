@@ -121,23 +121,26 @@ export type AssetInput = {
  */
 export type AssetCardFragment = {
     readonly key: AssetKey;
-    readonly kind: AssetKind;
-    /** 元のファイル名 (拡張子を含まない)。プレースホルダーに出す */
-    readonly originalName: string;
-    /** 元の拡張子 (先頭ドットを含む、または空文字列)。プレースホルダーに出す */
-    readonly extension: string;
-    readonly body: readonly HtmlFragment[];
+    readonly body: readonly CardBodyFragment[];
+};
+/**
+ * カードの中身の断片
+ *
+ * `assetRef` はアセットへの参照で、finalize 時に allocator が割り当てた archive path へ解決する。
+ * 参照はカードの中にしか置けない。カードの外に置けると、カードごとプレースホルダーへ差し替えても
+ * 参照だけが残り、除外したはずのアセットを指す `src` / `href` が出力に出てしまう。
+ * 参照先はそのカードの `key` に限る (`setHtml` が検証する)。
+ */
+export type CardBodyFragment = string | {
+    readonly assetRef: AssetKey;
 };
 /**
  * 投稿 HTML の断片
  *
- * 文字列はそのまま出力する。`assetRef` はアセットへの参照で、finalize 時に
- * allocator が割り当てた archive path へ解決する。`assetCard` はアセット 1 件のカード全体で、
+ * 文字列はそのまま出力する。`assetCard` はアセット 1 件のカード全体で、
  * 選択条件で除外されたときにプレースホルダーへ差し替える単位になる。
  */
 export type HtmlFragment = string | {
-    readonly assetRef: AssetKey;
-} | {
     readonly assetCard: AssetCardFragment;
 };
 /**
@@ -161,14 +164,39 @@ export type Selection = {
  * @param extension `FileObj.extension` (先頭ドット付き、または空文字列)
  */
 export declare function normalizeExtension(extension: string): string;
-/** `download-manifest.json` に書き出すアセットの記述 */
+/**
+ * `download-manifest.json` に書き出すアセットの記述
+ *
+ * `assetId` はカバー以外に付く (カバーは投稿に高々 1 つで id を持たない)。
+ * `kind` と併せてアセットを投稿内で一意に指す
+ */
 export type ManifestAsset = {
-    readonly postId: string;
-    readonly kind: AssetKind;
     readonly originalName: string;
     readonly extension: string;
-    /** 含めたアセットにだけ付く。除外したアセットは ZIP に存在しないので持たない */
-    readonly archiveName?: string;
+} & ({
+    readonly kind: 'cover';
+} | {
+    readonly kind: BodyAssetKind;
+    readonly assetId: string;
+});
+/**
+ * 含めたアセットの記述。ZIP に入るので archive 名を持つ
+ */
+export type IncludedManifestAsset = ManifestAsset & {
+    readonly archiveName: string;
+};
+/**
+ * manifest に記録する投稿 1 件分
+ *
+ * アセットは投稿にネストする。postId の一意性を保証しない以上、アセットを平坦に並べると
+ * 同じ postId の投稿が 2 件あったときにどちらのものか分からなくなる
+ */
+export type ManifestPost = {
+    readonly postId: string;
+    readonly archiveDirectory: string;
+    readonly included: readonly IncludedManifestAsset[];
+    /** 除外したアセットは ZIP に存在しないので archive 名を持たない */
+    readonly excluded: readonly ManifestAsset[];
 };
 /**
  * ZIP ルートに書き出す `download-manifest.json` の内容
@@ -187,19 +215,12 @@ export type DownloadManifest = {
         readonly extensions: readonly string[];
         readonly includeCover: boolean;
     };
-    readonly included: {
-        readonly posts: readonly {
-            readonly postId: string;
-            readonly archiveDirectory: string;
-        }[];
-        readonly assets: readonly ManifestAsset[];
-    };
-    readonly excluded: {
-        readonly posts: readonly {
-            readonly postId: string;
-        }[];
-        readonly assets: readonly ManifestAsset[];
-    };
+    /** 選択された投稿。収集順。含めた / 除外したアセットをこの下に持つ */
+    readonly posts: readonly ManifestPost[];
+    /** 投稿ごと除外された投稿。アセットは個別に載せない (投稿単位で除外と分かる) */
+    readonly excludedPosts: readonly {
+        readonly postId: string;
+    }[];
 };
 /**
  * 断片列を区切り文字で連結する。
@@ -372,6 +393,7 @@ export declare function createNameKeyedDictionary<T>(): Record<string, T>;
  * 名前と並び順だけなので、入力側も型で閉じる。
  */
 export type ReadonlyPostObj = {
+    readonly postId: string;
     readonly name: string;
     readonly info: string;
     readonly files: readonly Readonly<BodyFileObj>[];
@@ -564,6 +586,14 @@ export declare class PostObject {
      */
     private assertAllocationCoversAssets;
     /**
+     * HTML のカードが、投稿が実際に持つアセットだけを参照していることを確かめる。
+     *
+     * 参照先が無いカードを除外扱いにしてプレースホルダーで描くと、「選択条件で外した」のか
+     * 「アセットを登録し忘れた」のか区別できなくなる。後者は実装の誤りなので止める
+     * @param assetByKey 投稿の全アセット (カバーを含む)
+     */
+    private assertHtmlReferencesKnownAssets;
+    /**
      * 断片列を HTML 文字列に解決する。
      *
      * 選択条件で除外されたアセットのカードはプレースホルダーに差し替える。カードごと消さないのは、
@@ -576,8 +606,10 @@ export declare class PostObject {
     /**
      * 選択条件で除外されたアセットのプレースホルダーを描く。
      *
-     * 「取得に失敗した」とは別の状態なので文言を分ける。URL は残さない
-     * @param assetCard 除外されたアセットのカード
+     * 「取得に失敗した」とは別の状態なので文言を分ける。URL は残さない。
+     * 種別と名前は登録済みのアセットから取る。カードに持たせると、実在する key に偽の
+     * メタデータを付けたカードで誤った表示ができてしまう
+     * @param asset 除外されたアセット
      */
     private renderExcludedAsset;
 }

@@ -1344,6 +1344,36 @@ describe('isDownloadJsonObj', () => {
       });
     });
 
+    describe('疎配列・細工した配列', () => {
+      // every / some / reduce は hole を飛ばすので、疎配列はどんな述語でも通ってしまう
+      test('manifest.posts が疎配列 → 例外ではなく false', () => {
+        const manifest = { ...validManifest(), posts: new Array(validManifest().posts.length) };
+        const obj = { ...createValidObj(), manifest };
+        expect(() => helper.isDownloadJsonObj(obj)).not.toThrow();
+        expect(helper.isDownloadJsonObj(obj)).toBe(false);
+      });
+
+      test('included が疎配列 → 例外ではなく false', () => {
+        const manifest = validManifest();
+        const posts = [{ ...manifest.posts[0], included: new Array(1) }];
+        const obj = { ...createValidObj(), manifest: { ...manifest, posts } };
+        expect(() => helper.isDownloadJsonObj(obj)).not.toThrow();
+        expect(helper.isDownloadJsonObj(obj)).toBe(false);
+      });
+
+      test('selection.postIds が疎配列 → false', () => {
+        const selection = { ...validManifest().selection, postIds: new Array(1) };
+        expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest: { ...validManifest(), selection } })).toBe(
+          false,
+        );
+      });
+
+      test('excludedPosts が疎配列 → false', () => {
+        const manifest = { ...validManifest(), excludedPosts: new Array(1) };
+        expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest })).toBe(false);
+      });
+    });
+
     test('manifest の投稿数が JSON の投稿数と合わない → false', () => {
       const manifest = { ...validManifest(), posts: [] };
       expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest })).toBe(false);
@@ -3354,6 +3384,22 @@ describe('DownloadHelper.downloadZip', () => {
       expect(text).not.toContain('leak.example');
       // 既知のフィールドは書かれている
       expect(text).toContain('"schemaVersion": 1');
+    });
+
+    // 入力配列の map / iterator を呼ぶと、Array の派生クラスで写し先に細工を混ぜられる
+    test('manifest の配列が map を差し替えた派生クラスでも、書き出しは素の値になる', async () => {
+      class HostileArray<T> extends Array<T> {
+        override map<U>(_fn: (value: T, index: number, array: T[]) => U): U[] {
+          return [{ leaked: 'https://leak.example/map' } as unknown as U];
+        }
+      }
+      const base = createValidObj();
+      const hostile = HostileArray.from(base.manifest.posts) as unknown as DownloadManifest['posts'];
+      const obj = { ...base, manifest: { ...base.manifest, posts: hostile } };
+      expect(helper.isDownloadJsonObj(obj)).toBe(true);
+      const text = new TextDecoder().decode(await runDownloadZip(obj));
+      expect(text).not.toContain('leak.example');
+      expect(text).toContain('"archiveDirectory"');
     });
 
     test('download-manifest.json が ZIP ルートに書かれる', async () => {

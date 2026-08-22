@@ -110,7 +110,9 @@ ZIP ルートに `download-manifest.json` を書き出す (`schemaVersion` / `cr
 
 `isDownloadJsonObj` は `unknown` を受ける型ガードなので、**manifest の検証は投稿の型検証を通してから行う**。先に行うと、壊れた `posts` / `cover` を参照して例外を投げてしまう。
 
-未知のプロパティは拒否しないが、**書き出すのは検証済みのフィールドだけを写した canonical な manifest である**。受け取ったオブジェクトをそのまま直列化すると、URL を持たせた入力がそのまま `download-manifest.json` に残る (getter や `toJSON` も同じ経路で効く)。
+未知のプロパティは拒否しないが、**書き出すのは検証済みのフィールドだけを写した canonical な manifest である**。受け取ったオブジェクトをそのまま直列化すると、URL を持たせた入力がそのまま `download-manifest.json` に残る (getter や `toJSON` も同じ経路で効く)。写すときは入力配列の `map` や iterator を呼ばず index で読む — `Array` の派生クラスで `map` を差し替えられると、写した先に細工を混ぜられるため。
+
+配列は `isDenseArray` で hole が無いことを確かめてから要素を見る。`every` / `some` / `reduce` は hole を飛ばすので、`new Array(3)` のような疎配列はどんな述語でも通ってしまい、書き出すと `[null, null, null]` になる。
 
 ZIP ルート直下の固定ファイル名 (`index.html` / `download-manifest.json`) と同名の投稿ディレクトリは `downloadZip` が拒否する。比較は大文字小文字を畳み、末尾の空白とピリオドを落としてから行う (Windows と既定の macOS は大文字小文字を区別せず、Windows は末尾の空白とピリオドを取り除いて解釈するため、完全一致だけでは `INDEX.HTML` や `index.html.` がすり抜ける)。同じパスがファイルとディレクトリの両方になり、展開できない ZIP になるため。legacy allocator の名前衝突 (同名グループの採番など) を許容するのとは扱いが違う — あちらは「1 ファイルだけ影に入った ZIP」で済むが、こちらはアーカイブ全体が壊れる。`index.html` の衝突は #42 以前からある欠陥で、ここで併せて塞いだ。
 

@@ -203,10 +203,8 @@ export class DownloadObject {
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
     assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
     const posts = [];
-    const includedPosts = [];
+    const manifestPosts = [];
     const excludedPosts = [];
-    const includedAssets = [];
-    const excludedAssets = [];
     const presentTags = new Set;
     let fileCount = 0;
     this.downloadObj.posts.forEach((postObj, index) => {
@@ -215,44 +213,35 @@ export class DownloadObject {
         return;
       }
       const includedKeys = new Set;
-      const describe = (file) => ({
-        postId: postObj.postId,
-        kind: file.key.kind,
-        originalName: file.name,
-        extension: file.extension
-      });
       for (const file of postObj.files) {
         if (selection.extensions.has(normalizeExtension(file.extension))) {
           includedKeys.add(assetKeyToString(file.key));
-        } else {
-          excludedAssets.push(describe(file));
         }
       }
-      if (postObj.cover) {
-        if (selection.includeCover) {
-          includedKeys.add("cover");
-        } else {
-          excludedAssets.push(describe(postObj.cover));
-        }
+      if (postObj.cover && selection.includeCover) {
+        includedKeys.add("cover");
       }
       const projected = this.orderedPosts[index].projectPost(directoryNames[index], this.allocator, includedKeys);
       posts.push(projected.json);
-      includedPosts.push({ postId: postObj.postId, archiveDirectory: directoryNames[index] });
       for (const tag of postObj.tags) {
         presentTags.add(tag);
       }
       fileCount += projected.json.files.length;
-      for (const file of postObj.files) {
-        if (includedKeys.has(assetKeyToString(file.key))) {
-          includedAssets.push({
-            ...describe(file),
-            archiveName: projected.archiveNames.get(assetKeyToString(file.key))
-          });
+      const included = [];
+      const excluded = [];
+      const assets = postObj.cover ? [...postObj.files, postObj.cover] : [...postObj.files];
+      for (const file of assets) {
+        const key = assetKeyToString(file.key);
+        const identity = file.key.kind === "cover" ? { kind: "cover" } : { kind: file.key.kind, assetId: file.key.assetId };
+        const describe = { ...identity, originalName: file.name, extension: file.extension };
+        const archiveName = projected.archiveNames.get(key);
+        if (includedKeys.has(key) && archiveName !== undefined) {
+          included.push({ ...describe, archiveName });
+        } else {
+          excluded.push(describe);
         }
       }
-      if (postObj.cover && includedKeys.has("cover")) {
-        includedAssets.push({ ...describe(postObj.cover), archiveName: projected.archiveNames.get("cover") });
-      }
+      manifestPosts.push({ postId: postObj.postId, archiveDirectory: directoryNames[index], included, excluded });
     });
     const downloadJson = {
       posts,
@@ -270,8 +259,8 @@ export class DownloadObject {
           extensions: [...selection.extensions].sort(),
           includeCover: selection.includeCover
         },
-        included: { posts: includedPosts, assets: includedAssets },
-        excluded: { posts: excludedPosts, assets: excludedAssets }
+        posts: manifestPosts,
+        excludedPosts
       }
     };
     return downloadJson;
@@ -296,32 +285,22 @@ export class DownloadObject {
 function freezeFragment(fragment) {
   if (typeof fragment === "string")
     return fragment;
-  if ("assetCard" in fragment) {
-    const assetCard = fragment.assetCard;
-    return Object.freeze({
-      assetCard: Object.freeze({
-        key: freezeAssetKey(assetCard.key),
-        kind: assetCard.kind,
-        originalName: assetCard.originalName,
-        extension: assetCard.extension,
-        body: Object.freeze(assetCard.body.map((it) => freezeFragment(it)))
-      })
-    });
-  }
-  return Object.freeze({ assetRef: freezeAssetKey(fragment.assetRef) });
+  const assetCard = fragment.assetCard;
+  const cardKey = assetKeyToString(assetCard.key);
+  const body = assetCard.body.map((it) => {
+    if (typeof it === "string")
+      return it;
+    if (assetKeyToString(it.assetRef) !== cardKey) {
+      throw new Error(`カードの中の参照が別のアセットを指しています: ${assetKeyToString(it.assetRef)} (card: ${cardKey})`);
+    }
+    return Object.freeze({ assetRef: freezeAssetKey(it.assetRef) });
+  });
+  return Object.freeze({
+    assetCard: Object.freeze({ key: freezeAssetKey(assetCard.key), body: Object.freeze(body) })
+  });
 }
 function card(fileObject, body) {
-  return [
-    {
-      assetCard: {
-        key: fileObject.getKey(),
-        kind: fileObject.getKey().kind,
-        originalName: fileObject.getOriginalName(),
-        extension: fileObject.getOriginalExtension(),
-        body
-      }
-    }
-  ];
+  return [{ assetCard: { key: fileObject.getKey(), body } }];
 }
 
 export class PostObject {
@@ -454,6 +433,10 @@ export class PostObject {
     const allocation = allocator.allocateAssetPaths(this.postObj);
     const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it]));
     this.assertAllocationCoversAssets(allocation, fileByKey);
+    const assetByKey = new Map(fileByKey);
+    if (this.postObj.cover) {
+      assetByKey.set("cover", this.postObj.cover);
+    }
     const pathByKey = new Map;
     for (const { key, archiveName } of allocation.files) {
       pathByKey.set(assetKeyToString(key), archiveName);
@@ -462,17 +445,18 @@ export class PostObject {
       pathByKey.set("cover", allocation.coverArchiveName);
     }
     const cover = this.postObj.cover && includedKeys.has("cover") ? { url: this.postObj.cover.url, name: allocation.coverArchiveName } : undefined;
+    this.assertHtmlReferencesKnownAssets(assetByKey);
     return {
       json: {
         originalName: this.postObj.name,
         encodedName: directoryName,
         informationText: this.postObj.info,
-        htmlText: this.resolveHtml(pathByKey, includedKeys),
+        htmlText: this.resolveHtml(pathByKey, includedKeys, assetByKey),
         files: allocation.files.filter(({ key }) => includedKeys.has(assetKeyToString(key))).map(({ key, archiveName }) => {
           const file = fileByKey.get(assetKeyToString(key));
           return { url: file.url, originalName: file.name, encodedName: archiveName };
         }),
-        tags: this.postObj.tags,
+        tags: [...this.postObj.tags],
         cover,
         publishedDatetime: this.postObj.publishedDatetime
       },
@@ -503,25 +487,42 @@ export class PostObject {
       throw new Error(this.postObj.cover === undefined ? "allocator がカバーの無い投稿に coverArchiveName を返しました" : "allocator がカバーのある投稿に coverArchiveName を返しませんでした");
     }
   }
-  resolveHtml(pathByKey, includedKeys) {
-    const render = (fragments) => fragments.map((fragment) => {
+  assertHtmlReferencesKnownAssets(assetByKey) {
+    for (const fragment of this.postObj.html) {
+      if (typeof fragment === "string")
+        continue;
+      const key = assetKeyToString(fragment.assetCard.key);
+      if (!assetByKey.has(key)) {
+        throw new Error(`HTML が投稿に存在しないアセットを参照しています: ${key}`);
+      }
+    }
+  }
+  resolveHtml(pathByKey, includedKeys, assetByKey) {
+    const renderBody = (fragments) => fragments.map((fragment) => {
       if (typeof fragment === "string")
         return fragment;
-      if ("assetCard" in fragment) {
-        const assetCard = fragment.assetCard;
-        return includedKeys.has(assetKeyToString(assetCard.key)) ? render(assetCard.body) : this.renderExcludedAsset(assetCard);
-      }
       const archiveName = pathByKey.get(assetKeyToString(fragment.assetRef));
       if (archiveName === undefined) {
         throw new Error(`archive path is not allocated: ${assetKeyToString(fragment.assetRef)}`);
       }
       return this.utils.escapeHtml(`./${this.utils.encodeURI(archiveName)}`);
     }).join("");
-    return render(this.postObj.html);
+    return this.postObj.html.map((fragment) => {
+      if (typeof fragment === "string")
+        return fragment;
+      const key = assetKeyToString(fragment.assetCard.key);
+      if (includedKeys.has(key))
+        return renderBody(fragment.assetCard.body);
+      const asset = assetByKey.get(key);
+      if (asset === undefined) {
+        throw new Error(`HTML が投稿に存在しないアセットを参照しています: ${key}`);
+      }
+      return this.renderExcludedAsset(asset);
+    }).join("");
   }
-  renderExcludedAsset(assetCard) {
-    const label = assetCard.kind === "cover" ? "カバー画像" : assetCard.kind === "image" ? "画像" : "添付ファイル";
-    const name = this.utils.escapeHtml(assetCard.originalName + assetCard.extension);
+  renderExcludedAsset(asset) {
+    const label = asset.key.kind === "cover" ? "カバー画像" : asset.key.kind === "image" ? "画像" : "添付ファイル";
+    const name = this.utils.escapeHtml(asset.name + asset.extension);
     return `<div class="post card text-center excluded-asset"><p class="pt-2">
 ` + `選択条件により除外しました
 <br>
@@ -915,25 +916,173 @@ function assertValidZipEntryNameByteLength(nameBytes, name, method) {
     throw new Error(`ZipWriter.${method}: エントリ名が長すぎます (UTF-8 ${nameBytes.length} bytes, 上限 65535 bytes): ${JSON.stringify(name)}`);
   }
 }
-function isDownloadManifest(value) {
+function isDownloadManifest(value, downloadObj) {
   if (typeof value !== "object" || value === null)
     return false;
   const m = value;
   if (m.schemaVersion !== 1)
     return false;
-  if (typeof m.creatorId !== "string" || typeof m.generatedAt !== "string")
+  if (typeof m.generatedAt !== "string")
+    return false;
+  if (typeof m.creatorId !== "string" || m.creatorId !== downloadObj.id)
     return false;
   const selection = m.selection;
-  if (typeof selection !== "object" || selection === null || !Array.isArray(selection.postIds) || !Array.isArray(selection.extensions) || typeof selection.includeCover !== "boolean") {
+  if (typeof selection !== "object" || selection === null || !isStringArray(selection.postIds) || !isStringArray(selection.extensions) || typeof selection.includeCover !== "boolean") {
     return false;
   }
-  const hasGroups = (group) => {
-    if (typeof group !== "object" || group === null)
+  if (!isDenseArray(m.posts) || !isDenseArray(m.excludedPosts))
+    return false;
+  for (const it of m.excludedPosts) {
+    if (!isRecordWithStringKeys(it, ["postId"]))
       return false;
-    const g = group;
-    return Array.isArray(g.posts) && Array.isArray(g.assets);
+  }
+  const jsonPosts = isDenseArray(downloadObj.posts) ? downloadObj.posts : [];
+  if (m.posts.length !== jsonPosts.length)
+    return false;
+  if (downloadObj.postCount !== jsonPosts.length)
+    return false;
+  let totalFiles = 0;
+  for (const it of jsonPosts) {
+    totalFiles += Array.isArray(it?.files) ? it.files.length : 0;
+  }
+  if (downloadObj.fileCount !== totalFiles)
+    return false;
+  const selectedPostIds = new Set(selection.postIds);
+  const selectedExtensions = new Set(selection.extensions);
+  const includeCover = selection.includeCover;
+  for (const it of m.excludedPosts) {
+    if (selectedPostIds.has(it.postId))
+      return false;
+  }
+  for (let index = 0;index < m.posts.length; index++) {
+    const post = m.posts[index];
+    if (!isRecordWithStringKeys(post, ["postId", "archiveDirectory"]))
+      return false;
+    const p = post;
+    const jsonPost = jsonPosts[index];
+    if (p.archiveDirectory !== jsonPost?.encodedName)
+      return false;
+    if (!isManifestAssetArray(p.included, true) || !isManifestAssetArray(p.excluded, false))
+      return false;
+    if (!selectedPostIds.has(p.postId))
+      return false;
+    if (!isManifestSelectionConsistent(p, selectedExtensions, includeCover))
+      return false;
+    if (!isManifestPostConsistent(p, jsonPost))
+      return false;
+  }
+  return true;
+}
+function isManifestSelectionConsistent(manifestPost, selectedExtensions, includeCover) {
+  const included = manifestPost.included;
+  const excluded = manifestPost.excluded;
+  const hasCover = (assets) => assets.some((it) => it.kind === "cover");
+  if (includeCover ? hasCover(excluded) : hasCover(included))
+    return false;
+  const matchesExtension = (asset) => selectedExtensions.has(normalizeExtension(asset.extension));
+  if (!included.filter((it) => it.kind !== "cover").every(matchesExtension))
+    return false;
+  return !excluded.filter((it) => it.kind !== "cover").some(matchesExtension);
+}
+function isManifestPostConsistent(manifestPost, jsonPost) {
+  const included = manifestPost.included;
+  const excluded = manifestPost.excluded;
+  const identities = [...included, ...excluded].map((it) => `${it.kind}:${it.assetId ?? ""}`);
+  if (new Set(identities).size !== identities.length)
+    return false;
+  const cover = jsonPost.cover;
+  const includedCovers = included.filter((it) => it.kind === "cover");
+  if (cover === undefined) {
+    if (includedCovers.length !== 0)
+      return false;
+  } else if (includedCovers.length !== 1 || includedCovers[0].archiveName !== cover.name) {
+    return false;
+  }
+  const files = isDenseArray(jsonPost.files) ? [...jsonPost.files] : [];
+  const includedFiles = included.filter((it) => it.kind !== "cover");
+  if (includedFiles.length !== files.length)
+    return false;
+  for (const entry of includedFiles) {
+    const index = files.findIndex((it) => it.encodedName === entry.archiveName && it.originalName === entry.originalName);
+    if (index < 0)
+      return false;
+    files.splice(index, 1);
+  }
+  return true;
+}
+function isDenseArray(value) {
+  if (!Array.isArray(value))
+    return false;
+  for (let index = 0;index < value.length; index++) {
+    if (!Object.hasOwn(value, index))
+      return false;
+  }
+  return true;
+}
+function isStringArray(value) {
+  if (!isDenseArray(value))
+    return false;
+  for (const it of value) {
+    if (typeof it !== "string")
+      return false;
+  }
+  return true;
+}
+function isRecordWithStringKeys(value, keys) {
+  if (typeof value !== "object" || value === null)
+    return false;
+  const record = value;
+  return keys.every((key) => typeof record[key] === "string");
+}
+function isManifestAssetArray(value, requireArchiveName) {
+  if (!isDenseArray(value))
+    return false;
+  return value.every((it) => {
+    if (!isRecordWithStringKeys(it, ["originalName", "extension"]))
+      return false;
+    const asset = it;
+    if (asset.kind !== "cover" && asset.kind !== "image" && asset.kind !== "file")
+      return false;
+    if (asset.kind === "cover" ? asset.assetId !== undefined : typeof asset.assetId !== "string")
+      return false;
+    return requireArchiveName ? typeof asset.archiveName === "string" : asset.archiveName === undefined;
+  });
+}
+const RESERVED_ROOT_ENTRY_NAMES = ["index.html", "download-manifest.json"];
+function normalizeForReservedComparison(name) {
+  return name.replace(/[ .]+$/, "").toLowerCase();
+}
+function toCanonicalManifest(manifest) {
+  const identity = (asset) => asset.kind === "cover" ? { kind: "cover" } : { kind: asset.kind, assetId: asset.assetId };
+  const asset = (it) => ({
+    ...identity(it),
+    originalName: it.originalName,
+    extension: it.extension
+  });
+  return {
+    schemaVersion: 1,
+    creatorId: manifest.creatorId,
+    generatedAt: manifest.generatedAt,
+    selection: {
+      postIds: copyArray(manifest.selection.postIds, (it) => it),
+      extensions: copyArray(manifest.selection.extensions, (it) => it),
+      includeCover: manifest.selection.includeCover
+    },
+    posts: copyArray(manifest.posts, (post) => ({
+      postId: post.postId,
+      archiveDirectory: post.archiveDirectory,
+      included: copyArray(post.included, (it) => ({ ...asset(it), archiveName: it.archiveName })),
+      excluded: copyArray(post.excluded, asset)
+    })),
+    excludedPosts: copyArray(manifest.excludedPosts, (it) => ({ postId: it.postId }))
   };
-  return hasGroups(m.included) && hasGroups(m.excluded);
+}
+function copyArray(source, project) {
+  const copied = [];
+  for (let index = 0;index < source.length; index++) {
+    copied.push(project(source[index]));
+  }
+  return copied;
 }
 function pad2(n) {
   return `00${n}`.slice(-2);
@@ -1086,6 +1235,9 @@ export class DownloadHelper {
       if (seenEncodedNames.has(post.encodedName)) {
         throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
       }
+      if (RESERVED_ROOT_ENTRY_NAMES.includes(normalizeForReservedComparison(post.encodedName))) {
+        throw new Error(`downloadZip: post.encodedName がルートの予約名と衝突しています (${post.encodedName})`);
+      }
       seenEncodedNames.add(post.encodedName);
       if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
         throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
@@ -1125,7 +1277,7 @@ export class DownloadHelper {
       }, undefined);
       await zip.addDirectory(`${encodedId}/`, rootDate);
       await enqueue([this.createRootHtmlFromPosts(downloadObj)], "index.html", rootDate);
-      await enqueue([JSON.stringify(downloadObj.manifest, null, 2)], "download-manifest.json", rootDate);
+      await enqueue([JSON.stringify(toCanonicalManifest(downloadObj.manifest), null, 2)], "download-manifest.json", rootDate);
       let postCount = 0;
       postLoop:
         for (const post of downloadObj.posts) {
@@ -1227,11 +1379,8 @@ export class DownloadHelper {
       case !Array.isArray(t.tags):
         console.error("ダウンロード用オブジェクトの型が不正(tagsが配列でない)", t.tags);
         return false;
-      case !isDownloadManifest(t.manifest):
-        console.error("ダウンロード用オブジェクトの型が不正(manifestが無いか形式が違う)", t.manifest);
-        return false;
     }
-    return !t.posts.some((it) => {
+    const postsInvalid = t.posts.some((it) => {
       if (typeof it !== "object" || it === null) {
         console.error("ダウンロード用オブジェクトの型が不正(postsの値にobjectでないものが含まれる)", it, t.posts);
         return true;
@@ -1293,6 +1442,13 @@ export class DownloadHelper {
       }
       return false;
     });
+    if (postsInvalid)
+      return false;
+    if (!isDownloadManifest(t.manifest, t)) {
+      console.error("ダウンロード用オブジェクトの型が不正(manifestが無いか形式が違う)", t.manifest);
+      return false;
+    }
+    return true;
   }
   createRootHtmlFromPosts(downloadObj) {
     const escapedId = this.utils.escapeHtml(downloadObj.id);
