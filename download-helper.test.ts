@@ -3317,6 +3317,10 @@ describe('DownloadHelper.downloadZip', () => {
     test.each([
       'index.html',
       'download-manifest.json',
+      'INDEX.HTML',
+      'index.html.',
+      'DOWNLOAD-MANIFEST.JSON',
+      'download-manifest.json ',
     ])('投稿ディレクトリ名がルートの予約名 %s と衝突する → 例外', async (reserved) => {
       // 同じパスがファイルとディレクトリの両方になり、展開できない ZIP になる
       const base = createValidObj();
@@ -3329,6 +3333,27 @@ describe('DownloadHelper.downloadZip', () => {
         },
       };
       await expect(runDownloadZip(obj)).rejects.toThrow('ルートの予約名と衝突');
+    });
+
+    // 検証は必須フィールドしか見ないので、未知のプロパティを付けた manifest も入力としては通る。
+    // それをそのまま直列化すると URL を持たせた入力が ZIP に残ってしまう
+    test('manifest の未知プロパティは ZIP に書き出されない', async () => {
+      const base = createValidObj();
+      const manifest = {
+        ...base.manifest,
+        unexpectedUrl: 'https://leak.example/root',
+        posts: base.manifest.posts.map((post) => ({
+          ...post,
+          included: post.included.map((it) => ({ ...it, url: 'https://leak.example/asset' })),
+        })),
+      } as unknown as DownloadManifest;
+      const obj = { ...base, manifest };
+      // 入力としては受理される (未知プロパティは拒否しない)
+      expect(helper.isDownloadJsonObj(obj)).toBe(true);
+      const text = new TextDecoder().decode(await runDownloadZip(obj));
+      expect(text).not.toContain('leak.example');
+      // 既知のフィールドは書かれている
+      expect(text).toContain('"schemaVersion": 1');
     });
 
     test('download-manifest.json が ZIP ルートに書かれる', async () => {

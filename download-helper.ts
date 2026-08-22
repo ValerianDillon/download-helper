@@ -2230,6 +2230,56 @@ function isManifestAssetArray(value: unknown, requireArchiveName: boolean): bool
 const RESERVED_ROOT_ENTRY_NAMES = ['index.html', 'download-manifest.json'];
 
 /**
+ * 予約名と比較するための正規化。
+ *
+ * Windows と既定の macOS は大文字小文字を区別せず、Windows は末尾の空白とピリオドを
+ * 取り除いてから解釈する。完全一致だけで比べると `INDEX.HTML` や `index.html.` が
+ * すり抜けて、それらの環境で展開できない ZIP になる
+ * @param name 投稿ディレクトリ名
+ * @internal
+ */
+function normalizeForReservedComparison(name: string): string {
+  return name.replace(/[ .]+$/, '').toLowerCase();
+}
+
+/**
+ * 検証済みのフィールドだけから manifest を組み直す。
+ *
+ * 検証は必須フィールドの有無と型しか見ないので、未知のプロパティはそのまま残る。
+ * 受け取った manifest をそのまま直列化すると、URL を持たせた入力がそのまま
+ * `download-manifest.json` に書き出されてしまう (getter や toJSON も同じ経路で効く)。
+ * schema が定めるフィールドだけを写して書く
+ * @param manifest 検証済みの manifest
+ * @internal
+ */
+function toCanonicalManifest(manifest: DownloadManifest): DownloadManifest {
+  const identity = (asset: ManifestAsset) =>
+    asset.kind === 'cover' ? ({ kind: 'cover' } as const) : { kind: asset.kind, assetId: asset.assetId };
+  const asset = (it: ManifestAsset): ManifestAsset => ({
+    ...identity(it),
+    originalName: it.originalName,
+    extension: it.extension,
+  });
+  return {
+    schemaVersion: 1,
+    creatorId: manifest.creatorId,
+    generatedAt: manifest.generatedAt,
+    selection: {
+      postIds: [...manifest.selection.postIds],
+      extensions: [...manifest.selection.extensions],
+      includeCover: manifest.selection.includeCover,
+    },
+    posts: manifest.posts.map((post) => ({
+      postId: post.postId,
+      archiveDirectory: post.archiveDirectory,
+      included: post.included.map((it) => ({ ...asset(it), archiveName: it.archiveName })),
+      excluded: post.excluded.map(asset),
+    })),
+    excludedPosts: manifest.excludedPosts.map((it) => ({ postId: it.postId })),
+  };
+}
+
+/**
  * 2桁ゼロ埋め
  * @internal
  */
@@ -2432,7 +2482,7 @@ export class DownloadHelper {
       }
       // ルート直下の固定ファイルと同名の投稿ディレクトリを作ると、同じパスがファイルと
       // ディレクトリの両方になり展開できない ZIP になる
-      if (RESERVED_ROOT_ENTRY_NAMES.includes(post.encodedName)) {
+      if (RESERVED_ROOT_ENTRY_NAMES.includes(normalizeForReservedComparison(post.encodedName))) {
         throw new Error(`downloadZip: post.encodedName がルートの予約名と衝突しています (${post.encodedName})`);
       }
       seenEncodedNames.add(post.encodedName);
@@ -2491,7 +2541,11 @@ export class DownloadHelper {
       await enqueue([this.createRootHtmlFromPosts(downloadObj)], 'index.html', rootDate);
       // 選択条件と、含めた / 除外した対象の記録。info JSON (FANBOX の投稿メタデータ) とは
       // 出所が違うので混ぜない
-      await enqueue([JSON.stringify(downloadObj.manifest, null, 2)], 'download-manifest.json', rootDate);
+      await enqueue(
+        [JSON.stringify(toCanonicalManifest(downloadObj.manifest), null, 2)],
+        'download-manifest.json',
+        rootDate,
+      );
       // 投稿処理
       let postCount = 0;
       postLoop: for (const post of downloadObj.posts) {
