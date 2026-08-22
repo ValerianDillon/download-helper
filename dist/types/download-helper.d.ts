@@ -597,6 +597,16 @@ export declare class PostObject {
      */
     projectPost(directoryName: string, allocator: ArchivePathAllocator, includedKeys: ReadonlySet<string>): ProjectedPost;
     /**
+     * allocator にこの投稿のアセットを割り当てさせ、契約を満たしていることを確かめる
+     * @param allocator 投稿内アセットの割り当て器
+     */
+    private allocateAssets;
+    /**
+     * 出力に使わない投稿についても allocator の契約を確かめる
+     * @param allocator 投稿内アセットの割り当て器
+     */
+    assertAllocatorContract(allocator: ArchivePathAllocator): void;
+    /**
      * allocator の結果が投稿のアセットと 1 対 1 に対応していることを確かめる。
      *
      * 取りこぼしはファイルの欠落、重複や余分は参照先の取り違えになるが、どちらも出力を見ただけでは

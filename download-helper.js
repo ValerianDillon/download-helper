@@ -209,6 +209,7 @@ export class DownloadObject {
     let fileCount = 0;
     this.downloadObj.posts.forEach((postObj, index) => {
       if (!selection.postIds.has(postObj.postId)) {
+        this.orderedPosts[index].assertAllocatorContract(this.allocator);
         excludedPosts.push({ postId: postObj.postId });
         return;
       }
@@ -430,9 +431,7 @@ export class PostObject {
     ]);
   }
   projectPost(directoryName, allocator, includedKeys) {
-    const allocation = allocator.allocateAssetPaths(this.postObj);
-    const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it]));
-    this.assertAllocationCoversAssets(allocation, fileByKey);
+    const { allocation, fileByKey } = this.allocateAssets(allocator);
     const assetByKey = new Map(fileByKey);
     if (this.postObj.cover) {
       assetByKey.set("cover", this.postObj.cover);
@@ -462,6 +461,15 @@ export class PostObject {
       },
       archiveNames: pathByKey
     };
+  }
+  allocateAssets(allocator) {
+    const allocation = allocator.allocateAssetPaths(this.postObj);
+    const fileByKey = new Map(this.postObj.files.map((it) => [assetKeyToString(it.key), it]));
+    this.assertAllocationCoversAssets(allocation, fileByKey);
+    return { allocation, fileByKey };
+  }
+  assertAllocatorContract(allocator) {
+    this.allocateAssets(allocator);
   }
   assertAllocationCoversAssets(allocation, fileByKey) {
     const expected = new Set(fileByKey.keys());
@@ -1484,8 +1492,8 @@ export class DownloadHelper {
       case !Array.isArray(t.posts):
         console.error("ダウンロード用オブジェクトの型が不正(postsが配列でない)", t.posts);
         return false;
-      case !Array.isArray(t.tags):
-        console.error("ダウンロード用オブジェクトの型が不正(tagsが配列でない)", t.tags);
+      case !isStringArray(t.tags):
+        console.error("ダウンロード用オブジェクトの型が不正(tagsが文字列の配列でない)", t.tags);
         return false;
     }
     const postsInvalid = t.posts.some((it) => {
@@ -1504,8 +1512,11 @@ export class DownloadHelper {
         case !Array.isArray(p.files):
           console.error("ダウンロード用オブジェクトの型が不正(postsの値にfilesが配列でないものが含まれる)", p.files, t.posts);
           return true;
-        case !Array.isArray(p.tags):
-          console.error("ダウンロード用オブジェクトの型が不正(postsの値にtagsが配列でないものが含まれる)", p.tags, t.posts);
+        case !isStringArray(p.tags):
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にtagsが文字列の配列でないものが含まれる)", p.tags, t.posts);
+          return true;
+        case typeof p.originalName !== "string":
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にoriginalNameが文字列でないものが含まれる)", p.originalName, t.posts);
           return true;
         case p.files.some((f) => {
           if (typeof f !== "object" || f === null) {

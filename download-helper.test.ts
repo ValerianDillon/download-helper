@@ -1039,6 +1039,20 @@ describe('projection', () => {
     });
   });
 
+  // 選択された投稿でだけ検査すると、壊れた allocator が選択次第で素通りする
+  test('選択されなかった投稿でも allocator の契約を確かめる', () => {
+    const broken: ArchivePathAllocator = {
+      allocatePostDirectoryNames: (posts) => posts.map((_, index) => `post${index}`),
+      allocateAssetPaths: () => ({ files: [] }),
+    };
+    const d = new DownloadObject('creator', utils, broken);
+    const post = d.addPost('p1', 'post');
+    post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+    expect(() => d.project({ postIds: new Set(), extensions: new Set(), includeCover: false }, { now: NOW })).toThrow(
+      'allocator が返したアセット数が投稿と一致しません',
+    );
+  });
+
   test('返り値の tags を書き換えても入力に逆流しない', () => {
     const d = build();
     const first = project(d, d.selectAll());
@@ -1462,6 +1476,20 @@ describe('isDownloadJsonObj', () => {
       const manifest = { ...validManifest(), posts: [] };
       expect(helper.isDownloadJsonObj({ ...createValidObj(), manifest })).toBe(false);
     });
+  });
+
+  test.each([['tags の要素が文字列でない', { tags: [1] }]])('%s → false', (_label, override) => {
+    expect(helper.isDownloadJsonObj({ ...createValidObj(), ...override })).toBe(false);
+  });
+
+  // originalName / tags は escapeHtml や JSON.stringify に渡るので、文字列でないと ZIP 生成中に落ちる
+  test.each([
+    ['originalName が文字列でない', { originalName: 1 }],
+    ['tags の要素が文字列でない', { tags: [1] }],
+  ])('posts の %s → false', (_label, override) => {
+    const base = createValidObj();
+    const obj = { ...base, posts: [{ ...base.posts[0], ...override }] };
+    expect(helper.isDownloadJsonObj(obj)).toBe(false);
   });
 
   test('cover が undefined → true (省略可)', () => {
