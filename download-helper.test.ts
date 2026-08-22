@@ -505,6 +505,31 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     );
   });
 
+  // 旧実装は name と url の一致でアセットを同定していたため (FileObject.equals)、両方の参照が
+  // a_1.png に解決し a_2.png は ZIP に入るのに誰からも参照されなかった。AssetKey は両者を区別する
+  test('name も url も同じで assetId が異なるアセットは、それぞれの archive path を参照する', () => {
+    const json = build((d) => {
+      const post = d.addPost('post');
+      const a = post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'same' });
+      const b = post.addFile({ key: imageKey('i2'), name: 'a', extension: 'png', url: 'same' });
+      post.setHtml([...post.getImageLinkTag(a), ...post.getImageLinkTag(b)]);
+    });
+    expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['a_1.png', 'a_2.png']);
+    const hrefs = [...json.posts[0].htmlText.matchAll(/href="\.\/([^"]*)"/g)].map((it) => it[1]);
+    expect(hrefs).toEqual(['a_1.png', 'a_2.png']);
+  });
+
+  // 旧実装は投稿名でグループ化した辞書を列挙していたため ['A','C','B'] になっていた。
+  // 収集順のほうが説明可能で、fanbox-collector は applyTags() で明示設定するのでこの既定は通らない
+  test('setTags が呼ばれていなければタグは収集順に集まる', () => {
+    const json = build((d) => {
+      d.addPost('same').setTags(['A']);
+      d.addPost('other').setTags(['B']);
+      d.addPost('same').setTags(['C']);
+    });
+    expect(json.tags).toEqual(['A', 'B', 'C']);
+  });
+
   test('postCount / fileCount は投稿とアセットの総数になる', () => {
     const json = build((d) => {
       const p1 = d.addPost('p1');

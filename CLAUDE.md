@@ -60,7 +60,11 @@ archive path (ZIP 内の名前) を決めるのは `ArchivePathAllocator` だけ
 - `PostObj.html` は文字列ではなく `HtmlFragment[]` (文字列と `{ assetRef: AssetKey }` の列)。`getImageLinkTag` などのリンクタグ生成はパス文字列を埋め込まず、`assetRef` を持つ断片を返す
 - 断片から archive path への解決は `stringify()` (finalize) の時点で行う。したがって HTML 内の参照と `DownloadJsonObj` の `files[].encodedName` / `cover.name` は、定義上ずれない
 - 従来この 2 つが一致していたのは「同名グループへの `addFile` がすべて終わってから HTML を生成する」という `addByPostInfo` の呼び出し順序に依存していたためで、契約としては書かれていなかった
+従来の出力から変わるのは次の 3 点だけで、いずれも壊れていた出力を直すものである。それ以外は `DownloadJsonObj` の内容・キー順・`posts[].files` の並び順・投稿ディレクトリの採番を含めて変わらない。
+
 - カバーの割り当て名は `encodeFileName` を通す。従来は情報 JSON の `cover.name` だけが未エンコードで、HTML 側の参照はエンコード済みだったため、`/` を含む拡張子のような入力で両者がずれていた (ZIP の事前検証で落ちる)。割り当てを 1 箇所にまとめる以上どちらかに寄せる必要があり、参照先が実在する側に揃えた
+- `name` と `url` がどちらも同じで `assetId` が異なるアセットが同一投稿内にあると、HTML の参照が変わる。従来は `FileObject.equals` が `name` と `url` の一致でアセットを同定していたため、両方の参照が先頭の archive path に解決し、2 つ目のファイルは ZIP に入るのに誰からも参照されなかった。`AssetKey` は両者を区別する
+- `setTags` を呼ばずに `stringify()` したときのタグの並びが、投稿名でグループ化した辞書の列挙順から収集順に変わる。`fanbox-collector` は `applyTags()` で明示設定するので、FANBOX の収集経路はこの既定を通らない
 - アセットの付随メタデータ (`size` / `width` / `height`) と投稿タイプ (`PostObj.postType`) は内部表現に保持するが `DownloadJsonObj` には出さない。利用側の絞り込み条件のために持つ
 
 `fanbox-collector` 側の検証も変わる。
