@@ -379,6 +379,24 @@ export function createNameKeyedDictionary<T>(): Record<string, T> {
   return Object.create(null);
 }
 /**
+ * allocator に渡す投稿の読み取り専用ビュー
+ *
+ * 「引数を変更しない」は実装者が守る契約だが、可変の `PostObj` をそのまま渡すと
+ * `post.files.reverse()` のような書き換えが型検査を素通りする。allocator が決めてよいのは
+ * 名前と並び順だけなので、入力側も型で閉じる。
+ */
+export type ReadonlyPostObj = {
+  readonly name: string;
+  readonly info: string;
+  readonly files: readonly Readonly<BodyFileObj>[];
+  readonly html: readonly HtmlFragment[];
+  readonly tags: readonly string[];
+  readonly cover?: Readonly<FileObj>;
+  readonly publishedDatetime?: string;
+  readonly postType?: string;
+};
+
+/**
  * 1 投稿分の archive path 割り当て結果
  */
 export type AllocatedAssetPaths = {
@@ -425,12 +443,12 @@ export interface ArchivePathAllocator {
    * @param posts 収集順の投稿
    * @returns posts と同じ長さ・同じ順序のディレクトリ名
    */
-  allocatePostDirectoryNames(posts: readonly PostObj[]): string[];
+  allocatePostDirectoryNames(posts: readonly ReadonlyPostObj[]): string[];
   /**
    * 1 投稿内のアセットの archive path を割り当てる
    * @param post 対象の投稿
    */
-  allocateAssetPaths(post: PostObj): AllocatedAssetPaths;
+  allocateAssetPaths(post: ReadonlyPostObj): AllocatedAssetPaths;
 }
 
 /**
@@ -447,7 +465,7 @@ export interface ArchivePathAllocator {
  */
 export function createLegacyArchivePathAllocator(utils: DownloadUtils): ArchivePathAllocator {
   return {
-    allocatePostDirectoryNames(posts: readonly PostObj[]): string[] {
+    allocatePostDirectoryNames(posts: readonly ReadonlyPostObj[]): string[] {
       // キーは投稿名 (外部入力) なので '__proto__' がありうる。通常の {} だとプロトタイプへの
       // 代入になり、そのグループが黙って消える
       const groups = createNameKeyedDictionary<number[]>();
@@ -468,8 +486,8 @@ export function createLegacyArchivePathAllocator(utils: DownloadUtils): ArchiveP
       }
       return names;
     },
-    allocateAssetPaths(post: PostObj): AllocatedAssetPaths {
-      const groups = createNameKeyedDictionary<BodyFileObj[]>();
+    allocateAssetPaths(post: ReadonlyPostObj): AllocatedAssetPaths {
+      const groups = createNameKeyedDictionary<Readonly<BodyFileObj>[]>();
       for (const file of post.files) {
         const key = utils.encodeFileName(file.name);
         const group = groups[key];
@@ -513,19 +531,16 @@ function assertPostDirectoryNames(names: string[], postCount: number, utils: Dow
       `allocator が返した投稿ディレクトリ名の数が投稿と一致しません (期待 ${postCount}, 実際 ${names.length})`,
     );
   }
-  const seen = new Set<string>();
   for (let index = 0; index < postCount; index++) {
     const name = names[index];
     if (typeof name !== 'string') {
       throw new Error(`allocator が返した投稿ディレクトリ名が文字列ではありません (index ${index})`);
     }
     assertNormalizedArchiveName(name, utils, `投稿ディレクトリ名 (index ${index})`);
-    // downloadZip も重複を弾くが、そちらは showSaveFilePicker より後なので finalize でも見る
-    if (seen.has(name)) {
-      throw new Error(`allocator が返した投稿ディレクトリ名が重複しています: ${JSON.stringify(name)}`);
-    }
-    seen.add(name);
   }
+  // 重複はここでは見ない。legacy allocator 自身が衝突を作れる (投稿名 a, a, a_1 で a_1 が 2 つ) ため、
+  // 例外にすると現実的な入力で stringify が落ちる。downloadZip の事前検証が
+  // showSaveFilePicker より前に弾くので、早期失敗にもならない
 }
 
 /**
@@ -844,7 +859,10 @@ export class PostObject {
       }
       assertNormalizedArchiveName(archiveName, this.utils, `archive 名 (${assetKeyToString(key)})`);
     }
-    if (typeof allocation.coverArchiveName === 'string') {
+    if (allocation.coverArchiveName !== undefined) {
+      if (typeof allocation.coverArchiveName !== 'string') {
+        throw new Error('allocator が返したカバーの archive 名が文字列ではありません');
+      }
       assertNormalizedArchiveName(allocation.coverArchiveName, this.utils, 'カバーの archive 名');
     }
     if ((this.postObj.cover !== undefined) !== (allocation.coverArchiveName !== undefined)) {

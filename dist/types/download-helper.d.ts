@@ -263,6 +263,23 @@ export declare class DownloadUtils {
  */
 export declare function createNameKeyedDictionary<T>(): Record<string, T>;
 /**
+ * allocator に渡す投稿の読み取り専用ビュー
+ *
+ * 「引数を変更しない」は実装者が守る契約だが、可変の `PostObj` をそのまま渡すと
+ * `post.files.reverse()` のような書き換えが型検査を素通りする。allocator が決めてよいのは
+ * 名前と並び順だけなので、入力側も型で閉じる。
+ */
+export type ReadonlyPostObj = {
+    readonly name: string;
+    readonly info: string;
+    readonly files: readonly Readonly<BodyFileObj>[];
+    readonly html: readonly HtmlFragment[];
+    readonly tags: readonly string[];
+    readonly cover?: Readonly<FileObj>;
+    readonly publishedDatetime?: string;
+    readonly postType?: string;
+};
+/**
  * 1 投稿分の archive path 割り当て結果
  */
 export type AllocatedAssetPaths = {
@@ -311,12 +328,12 @@ export interface ArchivePathAllocator {
      * @param posts 収集順の投稿
      * @returns posts と同じ長さ・同じ順序のディレクトリ名
      */
-    allocatePostDirectoryNames(posts: readonly PostObj[]): string[];
+    allocatePostDirectoryNames(posts: readonly ReadonlyPostObj[]): string[];
     /**
      * 1 投稿内のアセットの archive path を割り当てる
      * @param post 対象の投稿
      */
-    allocateAssetPaths(post: PostObj): AllocatedAssetPaths;
+    allocateAssetPaths(post: ReadonlyPostObj): AllocatedAssetPaths;
 }
 /**
  * 従来の採番規則をそのまま実装した allocator

@@ -159,17 +159,12 @@ function assertPostDirectoryNames(names, postCount, utils) {
   if (names.length !== postCount) {
     throw new Error(`allocator が返した投稿ディレクトリ名の数が投稿と一致しません (期待 ${postCount}, 実際 ${names.length})`);
   }
-  const seen = new Set;
   for (let index = 0;index < postCount; index++) {
     const name = names[index];
     if (typeof name !== "string") {
       throw new Error(`allocator が返した投稿ディレクトリ名が文字列ではありません (index ${index})`);
     }
     assertNormalizedArchiveName(name, utils, `投稿ディレクトリ名 (index ${index})`);
-    if (seen.has(name)) {
-      throw new Error(`allocator が返した投稿ディレクトリ名が重複しています: ${JSON.stringify(name)}`);
-    }
-    seen.add(name);
   }
 }
 function assertNormalizedArchiveName(name, utils, context) {
@@ -399,7 +394,10 @@ export class PostObject {
       }
       assertNormalizedArchiveName(archiveName, this.utils, `archive 名 (${assetKeyToString(key)})`);
     }
-    if (typeof allocation.coverArchiveName === "string") {
+    if (allocation.coverArchiveName !== undefined) {
+      if (typeof allocation.coverArchiveName !== "string") {
+        throw new Error("allocator が返したカバーの archive 名が文字列ではありません");
+      }
       assertNormalizedArchiveName(allocation.coverArchiveName, this.utils, "カバーの archive 名");
     }
     if (this.postObj.cover !== undefined !== (allocation.coverArchiveName !== undefined)) {

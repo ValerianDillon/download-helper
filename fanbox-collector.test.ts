@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import type { ArchivePathAllocator, PostObj } from './download-helper';
+import type { ArchivePathAllocator, ReadonlyPostObj } from './download-helper';
 import {
   addByPostInfo,
   DownloadManage,
@@ -790,7 +790,7 @@ describe('addByPostInfo - 内部表現に保持する情報', () => {
    * metadata / postType は DownloadJsonObj に出さない (出力を変えない) ため、ここで確認する
    */
   const captureManage = () => {
-    const captured: PostObj[] = [];
+    const captured: ReadonlyPostObj[] = [];
     const allocator: ArchivePathAllocator = {
       allocatePostDirectoryNames: (posts) => posts.map((_, index) => `post${index}`),
       allocateAssetPaths: (post) => {

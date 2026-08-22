@@ -25,7 +25,7 @@ import {
   joinHtmlFragments,
   MAX_ZIP_ENTRY_COUNT,
   MAX_ZIP_UINT32_FIELD_VALUE,
-  type PostObj,
+  type ReadonlyPostObj,
   toDosTimeDate,
   ZipWriter,
 } from './download-helper';
@@ -577,7 +577,7 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
   describe('allocator の契約違反は finalize で止める', () => {
     /** legacy allocator の結果を加工して契約を破る allocator を作る */
     const brokenAllocator = (
-      transform: (allocation: AllocatedAssetPaths, post: PostObj) => AllocatedAssetPaths,
+      transform: (allocation: AllocatedAssetPaths, post: ReadonlyPostObj) => AllocatedAssetPaths,
     ): ArchivePathAllocator => {
       const legacy = createLegacyArchivePathAllocator(utils);
       return {
@@ -667,18 +667,15 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       ).toThrow('allocator が返した archive 名が文字列ではありません');
     });
 
-    // downloadZip も重複を弾くが、そちらは showSaveFilePicker より後なので finalize でも見る
-    test('投稿ディレクトリ名が重複すると例外になる', () => {
-      const same: ArchivePathAllocator = {
-        allocatePostDirectoryNames: (posts) => posts.map(() => 'same'),
-        allocateAssetPaths: () => ({ files: [] }),
-      };
+    test('カバーの archive 名が文字列でないと例外になる', () => {
       expect(() =>
-        build((d) => {
-          d.addPost('a');
-          d.addPost('b');
-        }, same),
-      ).toThrow('allocator が返した投稿ディレクトリ名が重複しています');
+        build(
+          (d) => {
+            d.addPost('post').setCover('cover', 'png', 'u1');
+          },
+          brokenAllocator((a) => ({ ...a, coverArchiveName: 42 as unknown as string })),
+        ),
+      ).toThrow('allocator が返したカバーの archive 名が文字列ではありません');
     });
 
     test('カバーのある投稿に coverArchiveName を返さないと例外になる', () => {
@@ -717,6 +714,17 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
         post.addFile({ key: imageKey('i3'), name: 'a_1', extension: 'png', url: 'u3' });
       });
       expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['a_1.png', 'a_2.png', 'a_1.png']);
+    });
+
+    // 投稿ディレクトリ名も同様に衝突しうる。finalize では止めない (downloadZip の事前検証が
+    // showSaveFilePicker より前に弾くので、finalize で止めても早期失敗にならない)
+    test('投稿ディレクトリ名が衝突する', () => {
+      const json = build((d) => {
+        d.addPost('a');
+        d.addPost('a');
+        d.addPost('a_1');
+      });
+      expect(json.posts.map((it) => it.encodedName)).toEqual(['a_2', 'a_1', 'a_1']);
     });
 
     test('カバー名と同名の添付が衝突する', () => {
