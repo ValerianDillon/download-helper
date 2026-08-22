@@ -19,7 +19,7 @@ export type DownloadObj = {
 export type PostObj = {
     name: string;
     info: string;
-    files: FileObj[];
+    files: BodyFileObj[];
     html: HtmlFragment[];
     tags: string[];
     cover?: FileObj;
@@ -82,6 +82,10 @@ export type FileObj = {
     extension: string;
     key: AssetKey;
     metadata: AssetMetadata;
+};
+/** 本文中のアセット。カバーの sentinel は持たない (addFile の型の境界を allocator まで通す) */
+export type BodyFileObj = FileObj & {
+    readonly key: BodyAssetKey;
 };
 /**
  * PostObject.addFile に渡すアセット
@@ -270,7 +274,7 @@ export type AllocatedAssetPaths = {
      * 同じ鍵のまま中身を差し替えたオブジェクトを返して出力を書き換えられる
      */
     files: {
-        key: AssetKey;
+        key: BodyAssetKey;
         archiveName: string;
     }[];
     /** カバー画像の割り当て名。カバーが無ければ undefined */

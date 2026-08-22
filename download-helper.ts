@@ -17,7 +17,7 @@ export type DownloadObj = { posts: PostObj[]; id: string };
 export type PostObj = {
   name: string;
   info: string;
-  files: FileObj[];
+  files: BodyFileObj[];
   html: HtmlFragment[];
   tags: string[];
   cover?: FileObj;
@@ -55,8 +55,10 @@ export type AssetKey = { readonly kind: 'cover' } | BodyAssetKey;
  * 追加後に書き換えられて、重複検査を通り抜けた 2 つのアセットが同じ archive path へ
  * 解決しうる。型の readonly は実行時には効かないので複製して凍結する。
  */
-function freezeAssetKey(key: AssetKey): AssetKey {
-  return Object.freeze(key.kind === 'cover' ? { kind: 'cover' as const } : { kind: key.kind, assetId: key.assetId });
+function freezeAssetKey<T extends AssetKey>(key: T): T {
+  return Object.freeze(
+    key.kind === 'cover' ? { kind: 'cover' as const } : { kind: key.kind, assetId: key.assetId },
+  ) as T;
 }
 
 /**
@@ -96,6 +98,9 @@ export type FileObj = {
   key: AssetKey;
   metadata: AssetMetadata;
 };
+
+/** 本文中のアセット。カバーの sentinel は持たない (addFile の型の境界を allocator まで通す) */
+export type BodyFileObj = FileObj & { readonly key: BodyAssetKey };
 
 /**
  * PostObject.addFile に渡すアセット
@@ -384,7 +389,7 @@ export type AllocatedAssetPaths = {
    * URL や元ファイル名は投稿が持つ値をそのまま出す。`FileObj` を返せる形にすると、
    * 同じ鍵のまま中身を差し替えたオブジェクトを返して出力を書き換えられる
    */
-  files: { key: AssetKey; archiveName: string }[];
+  files: { key: BodyAssetKey; archiveName: string }[];
   /** カバー画像の割り当て名。カバーが無ければ undefined */
   coverArchiveName?: string;
 };
@@ -464,7 +469,7 @@ export function createLegacyArchivePathAllocator(utils: DownloadUtils): ArchiveP
       return names;
     },
     allocateAssetPaths(post: PostObj): AllocatedAssetPaths {
-      const groups = createNameKeyedDictionary<FileObj[]>();
+      const groups = createNameKeyedDictionary<BodyFileObj[]>();
       for (const file of post.files) {
         const key = utils.encodeFileName(file.name);
         const group = groups[key];
@@ -502,16 +507,44 @@ export function createLegacyArchivePathAllocator(utils: DownloadUtils): ArchiveP
  * @param postCount 投稿数
  * @internal
  */
-function assertPostDirectoryNames(names: string[], postCount: number): void {
+function assertPostDirectoryNames(names: string[], postCount: number, utils: DownloadUtils): void {
   if (names.length !== postCount) {
     throw new Error(
       `allocator が返した投稿ディレクトリ名の数が投稿と一致しません (期待 ${postCount}, 実際 ${names.length})`,
     );
   }
+  const seen = new Set<string>();
   for (let index = 0; index < postCount; index++) {
-    if (typeof names[index] !== 'string') {
+    const name = names[index];
+    if (typeof name !== 'string') {
       throw new Error(`allocator が返した投稿ディレクトリ名が文字列ではありません (index ${index})`);
     }
+    assertNormalizedArchiveName(name, utils, `投稿ディレクトリ名 (index ${index})`);
+    // downloadZip も重複を弾くが、そちらは showSaveFilePicker より後なので finalize でも見る
+    if (seen.has(name)) {
+      throw new Error(`allocator が返した投稿ディレクトリ名が重複しています: ${JSON.stringify(name)}`);
+    }
+    seen.add(name);
+  }
+}
+
+/**
+ * archive 名が正規化済み (encodeFileName を通した結果と同じ) であることを確かめる。
+ *
+ * JSON と ZIP のパスは archive 名をそのまま使うのに対し、HTML の参照は encodeURI を通る。
+ * encodeURI は URI 予約文字の百分率符号化だけでなく encodeFileName (全角置換と trim) も行うため、
+ * 正規化されていない名前を許すと両者がずれる (例: `' a '` は JSON では `' a '`、HTML では `a`)。
+ * encodeFileName は冪等なので、正規化済みの名前なら encodeURI の置換部分が恒等になり両者が一致する。
+ * @param name 検証対象の archive 名
+ * @param utils 正規化に使うユーティリティ
+ * @param context エラーメッセージに含める対象の説明
+ * @internal
+ */
+function assertNormalizedArchiveName(name: string, utils: DownloadUtils, context: string): void {
+  if (utils.encodeFileName(name) !== name) {
+    throw new Error(
+      `allocator が返した${context}が正規化されていません (encodeFileName を通した結果と異なります): ${JSON.stringify(name)}`,
+    );
   }
 }
 
@@ -541,7 +574,7 @@ export class DownloadObject {
     // archive path はここ (finalize) で初めて確定する。投稿ディレクトリ名は投稿をまたぐ採番なので
     // 全投稿を渡して一度に割り当てる
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
-    assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length);
+    assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
     const downloadJson: DownloadJsonObj = {
       posts: this.orderedPosts.map((it, index) => it.toJsonObj(directoryNames[index], this.allocator)),
       id: this.downloadObj.id,
@@ -661,7 +694,7 @@ export class PostObject {
     if (duplicated) {
       throw new Error(`asset key is duplicated: ${assetKeyToString(asset.key)}`);
     }
-    const fileObj: FileObj = {
+    const fileObj: BodyFileObj = {
       name: asset.name,
       extension: asset.extension ? `.${asset.extension}` : '',
       url: asset.url,
@@ -800,12 +833,19 @@ export class PostObject {
         `allocator が返したアセット数が投稿と一致しません (期待 ${this.postObj.files.length}, 実際 ${allocation.files.length})`,
       );
     }
-    for (const { key } of allocation.files) {
+    for (const { key, archiveName } of allocation.files) {
       if (!expected.delete(assetKeyToString(key))) {
         throw new Error(
           `allocator が投稿に属さないアセット、または重複したアセットを返しました: ${assetKeyToString(key)}`,
         );
       }
+      if (typeof archiveName !== 'string') {
+        throw new Error(`allocator が返した archive 名が文字列ではありません: ${assetKeyToString(key)}`);
+      }
+      assertNormalizedArchiveName(archiveName, this.utils, `archive 名 (${assetKeyToString(key)})`);
+    }
+    if (typeof allocation.coverArchiveName === 'string') {
+      assertNormalizedArchiveName(allocation.coverArchiveName, this.utils, 'カバーの archive 名');
     }
     if ((this.postObj.cover !== undefined) !== (allocation.coverArchiveName !== undefined)) {
       throw new Error(

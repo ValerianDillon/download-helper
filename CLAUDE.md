@@ -65,6 +65,8 @@ archive path (ZIP 内の名前) を決めるのは `ArchivePathAllocator` だけ
 - カバーの割り当て名は `encodeFileName` を通す。従来は情報 JSON の `cover.name` だけが未エンコードで、HTML 側の参照はエンコード済みだったため、`/` を含む拡張子のような入力で両者がずれていた (ZIP の事前検証で落ちる)。割り当てを 1 箇所にまとめる以上どちらかに寄せる必要があり、参照先が実在する側に揃えた
 - `name` と `url` がどちらも同じで `assetId` が異なるアセットが同一投稿内にあると、HTML の参照が変わる。従来は `FileObject.equals` が `name` と `url` の一致でアセットを同定していたため、両方の参照が先頭の archive path に解決し、2 つ目のファイルは ZIP に入るのに誰からも参照されなかった。`AssetKey` は両者を区別する
 - `setTags` を呼ばずに `stringify()` したときのタグの並びが、投稿名でグループ化した辞書の列挙順から収集順に変わる。`fanbox-collector` は `applyTags()` で明示設定するので、FANBOX の収集経路はこの既定を通らない
+
+legacy allocator には既知の名前衝突がある。投稿内で archive 名が重複しうる (`a` が 2 件と `a_1` が 1 件あると `a_1.png` が 2 つできる。カバーは常に `cover.<ext>` なので、同名の添付や `cover` というタイトルの image 投稿と衝突する)。採番規則そのものの欠陥で、直すと出力が変わるため、archive path を postId 由来に変える段階で扱う。finalize では検出しない — 例外にすると現実的な入力でダウンロード全体が落ち、いま得られている「1 ファイルだけ影に入った ZIP」より悪くなるため。`downloadZip` が既に弾く投稿ディレクトリ名の重複だけは finalize でも検出する (`showSaveFilePicker` より前に落とせるので早いほうがよい)
 - アセットの付随メタデータ (`size` / `width` / `height`) と投稿タイプ (`PostObj.postType`) は内部表現に保持するが `DownloadJsonObj` には出さない。利用側の絞り込み条件のために持つ
 
 `fanbox-collector` 側の検証も変わる。

@@ -155,14 +155,26 @@ export function createLegacyArchivePathAllocator(utils) {
     }
   };
 }
-function assertPostDirectoryNames(names, postCount) {
+function assertPostDirectoryNames(names, postCount, utils) {
   if (names.length !== postCount) {
     throw new Error(`allocator が返した投稿ディレクトリ名の数が投稿と一致しません (期待 ${postCount}, 実際 ${names.length})`);
   }
+  const seen = new Set;
   for (let index = 0;index < postCount; index++) {
-    if (typeof names[index] !== "string") {
+    const name = names[index];
+    if (typeof name !== "string") {
       throw new Error(`allocator が返した投稿ディレクトリ名が文字列ではありません (index ${index})`);
     }
+    assertNormalizedArchiveName(name, utils, `投稿ディレクトリ名 (index ${index})`);
+    if (seen.has(name)) {
+      throw new Error(`allocator が返した投稿ディレクトリ名が重複しています: ${JSON.stringify(name)}`);
+    }
+    seen.add(name);
+  }
+}
+function assertNormalizedArchiveName(name, utils, context) {
+  if (utils.encodeFileName(name) !== name) {
+    throw new Error(`allocator が返した${context}が正規化されていません (encodeFileName を通した結果と異なります): ${JSON.stringify(name)}`);
   }
 }
 
@@ -180,7 +192,7 @@ export class DownloadObject {
   }
   stringify() {
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
-    assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length);
+    assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
     const downloadJson = {
       posts: this.orderedPosts.map((it, index) => it.toJsonObj(directoryNames[index], this.allocator)),
       id: this.downloadObj.id,
@@ -378,10 +390,17 @@ export class PostObject {
     if (allocation.files.length !== this.postObj.files.length) {
       throw new Error(`allocator が返したアセット数が投稿と一致しません (期待 ${this.postObj.files.length}, 実際 ${allocation.files.length})`);
     }
-    for (const { key } of allocation.files) {
+    for (const { key, archiveName } of allocation.files) {
       if (!expected.delete(assetKeyToString(key))) {
         throw new Error(`allocator が投稿に属さないアセット、または重複したアセットを返しました: ${assetKeyToString(key)}`);
       }
+      if (typeof archiveName !== "string") {
+        throw new Error(`allocator が返した archive 名が文字列ではありません: ${assetKeyToString(key)}`);
+      }
+      assertNormalizedArchiveName(archiveName, this.utils, `archive 名 (${assetKeyToString(key)})`);
+    }
+    if (typeof allocation.coverArchiveName === "string") {
+      assertNormalizedArchiveName(allocation.coverArchiveName, this.utils, "カバーの archive 名");
     }
     if (this.postObj.cover !== undefined !== (allocation.coverArchiveName !== undefined)) {
       throw new Error(this.postObj.cover === undefined ? "allocator がカバーの無い投稿に coverArchiveName を返しました" : "allocator がカバーのある投稿に coverArchiveName を返しませんでした");

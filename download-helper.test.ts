@@ -634,6 +634,53 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
       ).toThrow('allocator が返した投稿ディレクトリ名が文字列ではありません');
     });
 
+    test('正規化されていない archive 名は例外になる (HTML 側だけ再正規化されてずれるため)', () => {
+      expect(() =>
+        build(
+          withTwoFiles,
+          brokenAllocator((a) => ({ ...a, files: [{ ...a.files[0], archiveName: ' a ' }, a.files[1]] })),
+        ),
+      ).toThrow('が正規化されていません');
+    });
+
+    test('正規化されていない投稿ディレクトリ名は例外になる', () => {
+      const raw: ArchivePathAllocator = {
+        allocatePostDirectoryNames: () => [' post '],
+        allocateAssetPaths: () => ({ files: [] }),
+      };
+      expect(() =>
+        build((d) => {
+          d.addPost('post');
+        }, raw),
+      ).toThrow('投稿ディレクトリ名 (index 0)が正規化されていません');
+    });
+
+    test('archive 名が文字列でないと例外になる', () => {
+      expect(() =>
+        build(
+          withTwoFiles,
+          brokenAllocator((a) => ({
+            ...a,
+            files: [{ ...a.files[0], archiveName: undefined as unknown as string }, a.files[1]],
+          })),
+        ),
+      ).toThrow('allocator が返した archive 名が文字列ではありません');
+    });
+
+    // downloadZip も重複を弾くが、そちらは showSaveFilePicker より後なので finalize でも見る
+    test('投稿ディレクトリ名が重複すると例外になる', () => {
+      const same: ArchivePathAllocator = {
+        allocatePostDirectoryNames: (posts) => posts.map(() => 'same'),
+        allocateAssetPaths: () => ({ files: [] }),
+      };
+      expect(() =>
+        build((d) => {
+          d.addPost('a');
+          d.addPost('b');
+        }, same),
+      ).toThrow('allocator が返した投稿ディレクトリ名が重複しています');
+    });
+
     test('カバーのある投稿に coverArchiveName を返さないと例外になる', () => {
       expect(() =>
         build(
@@ -654,6 +701,32 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
           brokenAllocator((a) => ({ ...a, coverArchiveName: 'stray.png' })),
         ),
       ).toThrow('allocator がカバーの無い投稿に coverArchiveName を返しました');
+    });
+  });
+
+  // legacy allocator は投稿内で archive 名が衝突しうる (既知の欠陥)。
+  // #41 は採番規則を移動するだけで規則自体は変えないため、ここでは現状を固定するに留める。
+  // finalize で例外にすると、投稿タイトルが 'cover' の投稿のような現実的な入力で
+  // ダウンロード全体が落ちる。名前の付け方そのものは archive path を postId 由来にする段階で直す
+  describe('legacy allocator の既知の名前衝突 (この Issue では直さない)', () => {
+    test('別グループの採番が既存の名前と衝突する', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        post.addFile({ key: imageKey('i1'), name: 'a', extension: 'png', url: 'u1' });
+        post.addFile({ key: imageKey('i2'), name: 'a', extension: 'png', url: 'u2' });
+        post.addFile({ key: imageKey('i3'), name: 'a_1', extension: 'png', url: 'u3' });
+      });
+      expect(json.posts[0].files.map((it) => it.encodedName)).toEqual(['a_1.png', 'a_2.png', 'a_1.png']);
+    });
+
+    test('カバー名と同名の添付が衝突する', () => {
+      const json = build((d) => {
+        const post = d.addPost('post');
+        post.setCover('cover', 'png', 'cu');
+        post.addFile({ key: imageKey('i1'), name: 'cover', extension: 'png', url: 'u1' });
+      });
+      expect(json.posts[0].cover?.name).toBe('cover.png');
+      expect(json.posts[0].files[0].encodedName).toBe('cover.png');
     });
   });
 
