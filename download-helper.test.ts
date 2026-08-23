@@ -3445,6 +3445,7 @@ describe('DownloadHelper.downloadZip', () => {
   async function runDownloadZip(
     downloadObj: unknown,
     optionsOverride?: Partial<DownloadZipOptions>,
+    helperOverride?: DownloadHelper,
   ): Promise<Uint8Array> {
     const mock = new MockWritableStream();
     const handle = {
@@ -3453,7 +3454,7 @@ describe('DownloadHelper.downloadZip', () => {
       },
     };
     const fetchFile = async () => new Blob([new Uint8Array([1, 2, 3])]);
-    await helper.downloadZip(
+    await (helperOverride ?? helper).downloadZip(
       downloadObj,
       () => {},
       () => {},
@@ -4282,6 +4283,301 @@ describe('DownloadHelper.downloadZip', () => {
       ).rejects.toThrow(remainTimeError);
       expect(mock.aborted).toBe(true);
       expect(mock.closed).toBe(false);
+    });
+  });
+
+  /**
+   * showSaveFilePicker は解決した時点で対象ファイルの中身を空にする。
+   * 利用側が自分で picker を呼ぶ場合、入力の不備をその前に検出できなければ、
+   * 書くものが無いまま利用者のファイルだけが空になる。
+   */
+  describe('preflight (picker より前の検証)', () => {
+    test('検証を通った入力そのものと manifest の写しを返す', () => {
+      const obj = createValidObj();
+      const result = helper.preflight(obj);
+
+      expect(result.json).toBe(obj);
+      expect(result.manifest).toEqual(obj.manifest);
+      // 写しであって同じオブジェクトではない (以降の getter の読み直しから切り離す)
+      expect(result.manifest).not.toBe(obj.manifest);
+    });
+
+    // legacy allocator は投稿タイトルが a / a / a_1 のとき a_2 / a_1 / a_1 を割り当てうる。
+    // isDownloadJsonObj は通るので、この検証が無いと picker を開いた後で初めて落ちる
+    test('isDownloadJsonObj を通る入力でも、投稿ディレクトリ名が重複していれば落ちる', () => {
+      const base = createValidObj();
+      const obj = withManifest({
+        ...base,
+        posts: base.posts.map((post) => ({ ...post, encodedName: 'a_1' })),
+      });
+
+      expect(helper.isDownloadJsonObj(obj)).toBe(true);
+      expect(() => helper.preflight(obj)).toThrow('post.encodedName が重複しています');
+    });
+
+    /**
+     * `downloadZip` が `encodedId` を計算し直さないことを固定する。
+     *
+     * 計算し直すと、検証したのとは別の値でルートディレクトリを作りうる。
+     * 観測手段として呼び出しごとに違う名前を返す `DownloadUtils` を使うが、これは契約外の実装である
+     * (`DownloadHelper` の constructor は名前が決定的であることを要求する)。ここで確かめているのは
+     * 「再計算していない」ことであって、非決定的な utils に対する保証ではない。
+     */
+    test('検証を通った encodedId を書き出しに使う', async () => {
+      class DriftingUtils extends DownloadUtils {
+        private idReads = 0;
+        override encodeFileName(name: string): string {
+          if (name !== 'creator-id') return super.encodeFileName(name);
+          this.idReads += 1;
+          return this.idReads === 1 ? 'creator-id' : '..';
+        }
+      }
+      const drifting = new DownloadHelper(new DriftingUtils());
+
+      const buf = await runDownloadZip(createValidObj(), undefined, drifting);
+
+      const names = parseCentralDirectory(buf).entries.map((entry) => entry.name);
+      expect(names).not.toContain('../');
+      expect(names).toContain('creator-id/');
+    });
+
+    /**
+     * archive path に使う情報ファイル名は、検証を通った値をそのまま書くことを固定する。
+     *
+     * `downloadZip` は本文を得るために `createInformationFile` を書き込み時にも呼ぶが、
+     * その戻り値の `name` は archive path に使わない (使うと preflight が長さと衝突を検査したのとは
+     * 別の名前で書くことになる)。観測手段は `encodedId` のテストと同じで、契約外の utils を注入する。
+     */
+    test('検証を通った情報ファイル名を書き出しに使う', async () => {
+      // 変動させるのは createInformationFile 自身にする。encodeFileName だけを変動させると、
+      // 書き込み時の informationFile.name を素通しで archive path に使う退行を検出できない
+      // (その退行では常に 'info.json' が返るため)
+      class DriftingInfoUtils extends DownloadUtils {
+        private reads = 0;
+        override createInformationFile(informationText: string): { name: string; content: BlobPart[] } {
+          this.reads += 1;
+          // preflight で投稿数ぶん呼ばれ、書き込み時にもう一巡する
+          return { name: this.reads <= 2 ? 'info.json' : '..', content: [informationText] };
+        }
+      }
+      const drifting = new DownloadHelper(new DriftingInfoUtils());
+
+      const buf = await runDownloadZip(createValidObj(), undefined, drifting);
+
+      const names = parseCentralDirectory(buf).entries.map((entry) => entry.name);
+      expect(names).not.toContain('creator-id/post2/..');
+      expect(names).toContain('creator-id/post2/info.json');
+    });
+
+    // DownloadUtils は constructor で差し替えられるので、情報ファイル名も入力として検証する。
+    // 同じパスに 2 エントリ入るとどちらかが失われるので、投稿ディレクトリ直下の他の名前との衝突も見る
+    test.each([
+      ['パスセグメントとして不正', '..', '情報ファイル名が不正な値です'],
+      ['index.html と衝突', 'INDEX.HTML', '情報ファイル名が同じ投稿の index.html と衝突しています'],
+      ['添付名と衝突', 'A.PNG', '情報ファイル名が同じ投稿の a.png と衝突しています'],
+    ])('情報ファイル名が %s なら picker より前に落ちる', (_label, informationFileName, message) => {
+      class CustomNameUtils extends DownloadUtils {
+        override createInformationFile(informationText: string): { name: string; content: BlobPart[] } {
+          return { name: informationFileName, content: [informationText] };
+        }
+      }
+      const custom = new DownloadHelper(new CustomNameUtils());
+
+      expect(() => custom.preflight(createValidObj())).toThrow(message);
+    });
+
+    test('情報ファイル名がカバー名と衝突しても picker より前に落ちる', () => {
+      class CustomNameUtils extends DownloadUtils {
+        override createInformationFile(informationText: string): { name: string; content: BlobPart[] } {
+          return { name: 'cover.png', content: [informationText] };
+        }
+      }
+      const custom = new DownloadHelper(new CustomNameUtils());
+      const base = createValidObj();
+      const obj = withManifest({
+        ...base,
+        posts: [{ ...base.posts[0], cover: { url: 'https://example.com/c.png', name: 'cover.png' } }, base.posts[1]],
+      });
+
+      expect(() => custom.preflight(obj)).toThrow('情報ファイル名が同じ投稿の cover.png と衝突しています');
+    });
+
+    // extra field と本体のバイト数は加算方向にしか効かないので、名前だけで積んだ下限が上限を
+    // 超えるなら実際の書き込みでも必ず超える
+    test('必ず書かれるエントリだけで central directory の上限を超える入力を弾く', () => {
+      const base = createValidObj();
+      const id = 'a'.repeat(65500);
+      // 3 + 3N 件、1 件あたり 46 + 名前長 bytes。N=21843 で 65532 件 (エントリ数の上限内) に対し
+      // central directory は 4.29 GiB を超える
+      const posts = Array.from({ length: 21843 }, (_unused, index) => ({
+        ...base.posts[0],
+        originalName: `post${index}`,
+        encodedName: `post${index}`,
+        files: [],
+      }));
+      const obj = withManifest({ ...base, id, posts, postCount: posts.length, fileCount: 0 });
+
+      expect(() => helper.preflight({ ...obj, manifest: { ...obj.manifest, creatorId: id } })).toThrow(
+        'preflight で見積もった central directory',
+      );
+    });
+
+    // manifest の不整合は isDownloadJsonObj が先に弾くので、専用の文言には到達しない。
+    // preflight 内の isDownloadManifest は写しと元の値が食い違う入力のためにある
+    // (「検証の途中で値を変える getter がある manifest」のテストを参照)
+    test.each([
+      ['manifest を持たない', (base: DownloadJsonObj) => ({ ...base, manifest: undefined })],
+      [
+        'manifest が入力の投稿と対応していない',
+        (base: DownloadJsonObj) => ({ ...base, manifest: { ...base.manifest, posts: [] } }),
+      ],
+      [
+        'manifest の creatorId が入力の id と違う',
+        (base: DownloadJsonObj) => ({ ...base, manifest: { ...base.manifest, creatorId: 'other' } }),
+      ],
+    ])('%s 入力を型検証で弾く', (_label, build) => {
+      expect(() => helper.preflight(build(createValidObj()))).toThrow('ダウンロード対象オブジェクトの型が不正');
+    });
+
+    // preflight → picker → downloadZip という実際の経路を、同じオブジェクトで通す。
+    // build() を 2 回呼ぶ形のテストでは、同一入力を 2 度通したときの挙動を確かめられない
+    test('同じオブジェクトを preflight に通してから downloadZip に渡せる', async () => {
+      const obj = createValidObj();
+      const checked = helper.preflight(obj);
+
+      expect(checked.encodedId).toBe('creator-id');
+      await expect(runDownloadZip(checked.json)).resolves.toBeInstanceOf(Uint8Array);
+    });
+
+    // downloadZip が picker より前に弾く条件は preflight にすべて入っている必要がある。
+    // 片方にしか無い条件が生まれると、利用側が preflight を通しても picker の後で落ちる
+    test.each([
+      [
+        'id が不正',
+        () => {
+          const base = createValidObj();
+          // creatorId は id と一致していないと manifest の検証で先に落ちる
+          return { ...base, id: '..', manifest: { ...base.manifest, creatorId: '..' } } as DownloadJsonObj;
+        },
+        'id が不正な値です',
+      ],
+      [
+        '投稿ディレクトリ名がルートの予約名と衝突',
+        () => {
+          const base = createValidObj();
+          return withManifest({
+            ...base,
+            posts: [{ ...base.posts[0], encodedName: 'index.html' }, base.posts[1]],
+          });
+        },
+        'ルートの予約名と衝突',
+      ],
+      [
+        '投稿ディレクトリ名が不正',
+        () => {
+          const base = createValidObj();
+          return withManifest({ ...base, posts: [{ ...base.posts[0], encodedName: 'a/b' }, base.posts[1]] });
+        },
+        'post.encodedName が不正な値です',
+      ],
+      [
+        '投稿ディレクトリ名が重複',
+        () => {
+          const base = createValidObj();
+          return withManifest({
+            ...base,
+            posts: base.posts.map((post) => ({ ...post, encodedName: 'same' })),
+          });
+        },
+        'post.encodedName が重複しています',
+      ],
+      [
+        'カバー名が不正',
+        () => {
+          const base = createValidObj();
+          return withManifest({
+            ...base,
+            posts: [{ ...base.posts[0], cover: { url: 'https://example.com/c.png', name: '..' } }, base.posts[1]],
+          });
+        },
+        'post.cover.name が不正な値です',
+      ],
+      [
+        'カバー名が投稿ディレクトリの予約名と衝突',
+        () => {
+          const base = createValidObj();
+          return withManifest({
+            ...base,
+            posts: [
+              { ...base.posts[0], cover: { url: 'https://example.com/c.png', name: 'info.json' } },
+              base.posts[1],
+            ],
+          });
+        },
+        '予約名',
+      ],
+      [
+        'アセット名が不正',
+        () => {
+          const base = createValidObj();
+          return withManifest({
+            ...base,
+            posts: [
+              {
+                ...base.posts[0],
+                files: [{ url: 'https://example.com/a.png', originalName: 'a/b.png', encodedName: 'a/b.png' }],
+              },
+              base.posts[1],
+            ],
+          });
+        },
+        'file.encodedName が不正な値です',
+      ],
+      [
+        'エントリ名が UTF-8 で 65535 bytes を超える',
+        () => {
+          const base = createValidObj();
+          // ルートディレクトリのエントリ名は `${encodedId}/` なので、id が 65535 文字で 65536 bytes になる
+          const id = 'a'.repeat(65535);
+          return { ...base, id, manifest: { ...base.manifest, creatorId: id } } as DownloadJsonObj;
+        },
+        'エントリ名が長すぎます',
+      ],
+      [
+        'アセットなしでもエントリ数の下限が上限を超える',
+        () => {
+          const base = createValidObj();
+          // ルート 3 件 + 投稿ごと 3 件。21844 投稿で 3 + 65532 = 65535 件となり上限 (65534) を超える
+          const posts = Array.from({ length: 21844 }, (_unused, index) => ({
+            ...base.posts[0],
+            originalName: `post${index}`,
+            encodedName: `post${index}`,
+            files: [],
+          }));
+          return withManifest({ ...base, posts, postCount: posts.length, fileCount: 0 });
+        },
+        'エントリ数が上限を超えます',
+      ],
+      [
+        'アセット名が投稿ディレクトリの予約名と衝突',
+        () => {
+          const base = createValidObj();
+          return withManifest({
+            ...base,
+            posts: [
+              {
+                ...base.posts[0],
+                files: [{ url: 'https://example.com/a.png', originalName: 'index.html', encodedName: 'index.html' }],
+              },
+              base.posts[1],
+            ],
+          });
+        },
+        '予約名',
+      ],
+    ])('%s な入力は preflight と downloadZip の両方が同じ理由で落ちる', async (_label, build, message) => {
+      expect(() => helper.preflight(build())).toThrow(message);
+      await expect(runDownloadZip(build())).rejects.toThrow(message);
     });
   });
 });

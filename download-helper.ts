@@ -1606,6 +1606,18 @@ function concatBytes(parts: Uint8Array<ArrayBuffer>[]): Uint8Array<ArrayBuffer> 
 export const MAX_ZIP_ENTRY_COUNT = 0xfffe;
 
 /**
+ * local file header の固定部のバイト数。
+ * 1 エントリが占めるバイト数は これ + 名前長 + extra field 長 + 本体長 になる
+ */
+export const ZIP_LOCAL_HEADER_FIXED_BYTES = 30;
+
+/**
+ * central directory の 1 エントリの固定部のバイト数。
+ * 1 エントリが占めるバイト数は これ + 名前長 + extra field 長 になる
+ */
+export const ZIP_CENTRAL_HEADER_FIXED_BYTES = 46;
+
+/**
  * LFH / CD の size フィールドと CD / EOCD の offset フィールド (いずれも uint32) が
  * 取り得る値の上限 (Issue #15)。`0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値であり、
  * ZipWriter は ZIP64 Extended Information Extra Field を書かないため、この値以上になると
@@ -1768,7 +1780,7 @@ export class ZipWriter {
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
 
       // Local File Header (30 bytes + name length + extra field length)
-      const header = new ArrayBuffer(30);
+      const header = new ArrayBuffer(ZIP_LOCAL_HEADER_FIXED_BYTES);
       const view = new DataView(header);
       view.setUint32(0, 0x04034b50, true); // signature
       view.setUint16(4, 20, true); // version needed (2.0)
@@ -1845,7 +1857,7 @@ export class ZipWriter {
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
 
       // Local File Header (30 bytes + name length + extra field length)。CRC / size は常に 0、データ本体は書かない
-      const header = new ArrayBuffer(30);
+      const header = new ArrayBuffer(ZIP_LOCAL_HEADER_FIXED_BYTES);
       const view = new DataView(header);
       view.setUint32(0, 0x04034b50, true); // signature
       view.setUint16(4, 20, true); // version needed (2.0)
@@ -1914,13 +1926,13 @@ export class ZipWriter {
       // entries は確定済みなので、実際の書き込みと同じ計算を先取りしてよい
       let predictedCdSize = 0;
       for (const entry of this.entries) {
-        predictedCdSize += 46 + entry.name.length + entry.extraCd.length;
+        predictedCdSize += ZIP_CENTRAL_HEADER_FIXED_BYTES + entry.name.length + entry.extraCd.length;
       }
       // EOCD の cdSize フィールド (offset 12, uint32) が収まるかを CD を書く前に検証する (Issue #15)
       assertZipUint32FieldWithinLimit(predictedCdSize, 'close の central directory size (cdSize)');
 
       for (const entry of this.entries) {
-        const cdHeader = new ArrayBuffer(46);
+        const cdHeader = new ArrayBuffer(ZIP_CENTRAL_HEADER_FIXED_BYTES);
         const view = new DataView(cdHeader);
         view.setUint32(0, 0x02014b50, true); // signature
         view.setUint16(4, 20, true); // version made by
@@ -2096,6 +2108,115 @@ export class ZipWriter {
     }
   }
 }
+
+/**
+ * ZIP の上限のうち、入力の構造と archive 名から超過が確定するものを検出する。
+ *
+ * `ZipWriter` はエントリ名の UTF-8 バイト長・エントリ数・central directory の offset / size を
+ * 書き込み時に検査するが、そこまで進むと既に picker が対象ファイルを空にしている。
+ * 入力から超過が確定するぶんだけを先に弾く。
+ *
+ * 数えるのは**中断せずに完走した場合に必ず書かれるエントリ**である。ルートの 3 件
+ * (ディレクトリ / `index.html` / `download-manifest.json`) と、投稿ごとの 3 件
+ * (ディレクトリ / 情報ファイル / `index.html`)。カバーと添付は取得に失敗すれば書かれないので
+ * 数えない。上限側で数えて弾くと、一部の取得が失敗すれば収まるダウンロードまで拒否することになる。
+ *
+ * offset と size は**名前と固定ヘッダだけで積んだ下限**で見る。extra field と本体のバイト数は
+ * 加算方向にしか効かないので、それらを 0 として積んだ値が上限を超えるなら実際の書き込みでも必ず超える。
+ * 逆に下限が収まっていても実際には超えうる。固定で書かれる本文と日時 extra は入力から確定するが、
+ * 積まない (理由は `preflight` の JSDoc 参照)。
+ * @param plan preflight が組み立てた書き込み計画
+ * @internal
+ */
+function assertZipLimitsFromInput(plan: PreflightResult): void {
+  const encoder = new TextEncoder();
+  const byteLength = (value: string) => encoder.encode(value).length;
+  // 完成形のパス文字列は組み立てない。病的な入力では 64 KiB 級の文字列がエントリ数ぶん必要になり、
+  // 検査そのものがメモリを食い潰す。区切りの '/' を挟む連結なのでサロゲート対が分断されることはなく、
+  // 部分ごとのバイト長を足した値は連結後のバイト長と一致する
+  const idBytes = byteLength(plan.encodedId);
+  const separator = 1;
+
+  let entryCount = 0;
+  let localBytesLowerBound = 0;
+  let centralBytesLowerBound = 0;
+
+  const assertNameLength = (nameBytes: number, describe: () => string) => {
+    if (nameBytes > 0xffff) {
+      throw new Error(
+        `downloadZip: エントリ名が長すぎます (UTF-8 ${nameBytes} bytes, 上限 65535 bytes): ${JSON.stringify(describe())}`,
+      );
+    }
+  };
+
+  const account = (nameBytes: number, describe: () => string) => {
+    assertNameLength(nameBytes, describe);
+    entryCount++;
+    localBytesLowerBound += ZIP_LOCAL_HEADER_FIXED_BYTES + nameBytes;
+    centralBytesLowerBound += ZIP_CENTRAL_HEADER_FIXED_BYTES + nameBytes;
+  };
+
+  account(idBytes + separator, () => `${plan.encodedId}/`);
+  account(idBytes + separator + byteLength('index.html'), () => `${plan.encodedId}/index.html`);
+  account(idBytes + separator + byteLength('download-manifest.json'), () => `${plan.encodedId}/download-manifest.json`);
+  for (const post of plan.posts) {
+    const dirBytes = idBytes + separator + byteLength(post.directory);
+    const dir = () => `${plan.encodedId}/${post.directory}`;
+    account(dirBytes + separator, () => `${dir()}/`);
+    account(dirBytes + separator + byteLength(post.informationFileName), () => `${dir()}/${post.informationFileName}`);
+    account(dirBytes + separator + byteLength('index.html'), () => `${dir()}/index.html`);
+    // カバーと添付は取得に失敗すれば書かれないので件数とバイト数には積まない。長さだけ検査する
+    if (post.coverName !== undefined) {
+      const coverName = post.coverName;
+      assertNameLength(dirBytes + separator + byteLength(coverName), () => `${dir()}/${coverName}`);
+    }
+    for (const fileName of post.fileNames) {
+      assertNameLength(dirBytes + separator + byteLength(fileName), () => `${dir()}/${fileName}`);
+    }
+  }
+
+  if (entryCount > MAX_ZIP_ENTRY_COUNT) {
+    throw new Error(`downloadZip: エントリ数が上限を超えます (最低 ${entryCount} 件、上限 ${MAX_ZIP_ENTRY_COUNT} 件)`);
+  }
+  // 判定は ZipWriter が使うのと同じ関数に委ねる。ここで比較を書き直すと、0xFFFFFFFF 自体を
+  // ZIP64 の sentinel として拒否する境界 (>=) と食い違い、ちょうど上限の入力だけが picker 後に落ちる
+  assertZipUint32FieldWithinLimit(localBytesLowerBound, 'preflight で見積もった central directory offset の下限');
+  assertZipUint32FieldWithinLimit(centralBytesLowerBound, 'preflight で見積もった central directory size の下限');
+}
+
+/**
+ * 投稿 1 件分の書き込み計画
+ *
+ * `preflight` が検証した archive 名をそのまま持ち、`downloadZip` はここから読んで書き込む。
+ * 名前を組み立て直さないので、`DownloadUtils` が呼び出しごとに違う値を返しても書き出しは変わらない。
+ *
+ * ただし `downloadZip` は `json` 本体 (投稿の並び・本文・URL) を picker の待機後にも読むので、
+ * **待機中に呼び出し側が `json` を書き換えた場合まで守れるわけではない** (Issue #53)。
+ */
+export type PostWritePlan = {
+  /** 投稿ディレクトリ名 (ZIP ルート直下) */
+  readonly directory: string;
+  /** 情報ファイル名 (`createInformationFile` の名前を `encodeFileName` に通したもの) */
+  readonly informationFileName: string;
+  /** カバーの archive 名。カバーが無ければ undefined */
+  readonly coverName?: string;
+  /** 添付の archive 名。`json.posts[].files` と同じ並び */
+  readonly fileNames: readonly string[];
+};
+
+/**
+ * `preflight` の結果
+ */
+export type PreflightResult = {
+  /** 検証を通った入力。渡したオブジェクトと同一で、型だけが確定している */
+  readonly json: DownloadJsonObj;
+  /** 検証を通った manifest の写し。書き出しにはこの写しだけを使う */
+  readonly manifest: DownloadManifest;
+  /** 検証を通った ZIP ルートのディレクトリ名 (`encodeFileName(json.id)`) */
+  readonly encodedId: string;
+  /** `json.posts` と同じ並びの書き込み計画 */
+  readonly posts: readonly PostWritePlan[];
+};
 
 /**
  * downloadZip の挙動を差し替えるためのオプション
@@ -2648,6 +2769,16 @@ function formatRemain(seconds: number): string {
 export class DownloadHelper {
   private readonly utils: DownloadUtils;
 
+  /**
+   * @param utils ダウンロード用ユーティリティ。
+   *   **`encodeFileName` と `createInformationFile` が返す名前は決定的でなければならない**
+   *   (同じ引数には同じ名前を返し、副作用を持たず、有効な入力で例外を投げない)。
+   *   利用側が自分で picker を開く経路では `preflight` が 2 回走る (利用側の事前実行と `downloadZip`
+   *   冒頭の実行)。呼び出しごとに違う名前を返す実装を渡すと 2 回の結果が食い違い、事前検証を通った
+   *   のに保存先を確保した後で初めて失敗する。
+   *   通信やスリープを行う他のメソッド (`httpGetAs` / `fetchWithLimit` / `sleep` / `embedScript`) は
+   *   この要求の対象外である
+   */
   constructor(utils: DownloadUtils) {
     this.utils = utils;
   }
@@ -2791,7 +2922,7 @@ export class DownloadHelper {
    * 型上は渡せてしまうが、呼び出しを await しないので、返された Promise の rejection はこのメソッドの
    * catch (ストリームの abort) に到達せず、未処理 rejection のまま ZIP 生成が継続する。
    * 同期的に throw した場合は catch に入り、書き込み途中ならストリームを abort して再スローする。
-   * @param downloadObj ダウンロード対象オブジェクト
+   * @param input ダウンロード対象オブジェクト (`DownloadObject.project()` の出力)
    * @param progress 進捗率出力関数 (同期)
    * @param log ログ出力関数 (同期)
    * @param remainTime 終了予測出力関数 (同期)
@@ -2799,56 +2930,18 @@ export class DownloadHelper {
    * @returns 処理結果 (Issue #13)。各件数の定義は DownloadZipResult のコメントを参照
    */
   async downloadZip(
-    downloadObj: unknown,
+    input: unknown,
     progress: (n: number) => void,
     log: (s: string) => void,
     remainTime: (r: string) => void,
     options?: DownloadZipOptions,
   ): Promise<DownloadZipResult> {
-    if (!this.isDownloadJsonObj(downloadObj)) throw new Error('ダウンロード対象オブジェクトの型が不正');
+    // 入力だけで判定できる失敗はすべてここで出す。picker より前に置くのは、
+    // showSaveFilePicker が解決した時点で対象ファイルの中身が空になるため (preflight 参照)。
+    // 型の確定した入力を preflight から受け取るのは、ここで検証をやり直すと getter を仕込んだ
+    // 入力を 2 回読むことになり「検証した値と書き出す値が同じ」が崩れるため
+    const { json: downloadObj, manifest, encodedId, posts: postPlans } = this.preflight(input);
     const utils = this.utils;
-    const encodedId = utils.encodeFileName(downloadObj.id);
-
-    // handle (showSaveFilePicker) 取得より前に入力を検証する。
-    // ファイル選択 UI を表示してから失敗させることになるため、handle 取得前に置く。
-    if (!isValidPathSegment(encodedId)) {
-      throw new Error(`downloadZip: id が不正な値です (encode 後: ${JSON.stringify(encodedId)})`);
-    }
-    // manifest は一度だけ読んで素の値に写し、以降はその写しだけを検証・書き出しに使う。
-    // 検証と書き出しで別々に読むと、値を返す getter を仕込まれたときに「検証を通った値」と
-    // 「書き出される値」が食い違う
-    const manifest = snapshotManifest(downloadObj.manifest);
-    if (!isDownloadManifest(manifest, downloadObj as unknown as Record<string, unknown>)) {
-      throw new Error('downloadZip: manifest が不正です (projection を経ていない可能性があります)');
-    }
-
-    const seenEncodedNames = new Set<string>();
-    for (const post of downloadObj.posts) {
-      if (!isValidPathSegment(post.encodedName)) {
-        throw new Error(`downloadZip: post.encodedName が不正な値です (${JSON.stringify(post.encodedName)})`);
-      }
-      if (seenEncodedNames.has(post.encodedName)) {
-        throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
-      }
-      // ルート直下の固定ファイルと同名の投稿ディレクトリを作ると、同じパスがファイルと
-      // ディレクトリの両方になり展開できない ZIP になる
-      if (RESERVED_ROOT_ENTRY_NAMES.includes(normalizeForReservedComparison(post.encodedName))) {
-        throw new Error(`downloadZip: post.encodedName がルートの予約名と衝突しています (${post.encodedName})`);
-      }
-      seenEncodedNames.add(post.encodedName);
-      if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
-        throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
-      }
-      for (const file of post.files) {
-        if (!isValidPathSegment(file.encodedName)) {
-          throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
-        }
-        assertNotReservedPostEntryName(file.encodedName, 'file.encodedName');
-      }
-      if (post.cover !== undefined) {
-        assertNotReservedPostEntryName(post.cover.name, 'post.cover.name');
-      }
-    }
 
     const handle = options?.handle ?? (await showSaveFilePicker({ suggestedName: `${encodedId}.zip` }));
     const writable = await handle.createWritable();
@@ -2898,33 +2991,33 @@ export class DownloadHelper {
       await enqueue([JSON.stringify(toCanonicalManifest(manifest), null, 2)], 'download-manifest.json', rootDate);
       // 投稿処理
       let postCount = 0;
-      postLoop: for (const post of downloadObj.posts) {
+      postLoop: for (const [postIndex, post] of downloadObj.posts.entries()) {
         if (options?.signal?.aborted) {
           aborted = true;
           break;
         }
+        // archive 名は preflight が検証したものをそのまま使う。ここで組み立て直すと、
+        // 検証した名前と実際に書く名前が別々に決まる
+        const plan = postPlans[postIndex];
         log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
         const postDate = parsePublishedDate(post.publishedDatetime);
         // 投稿ディレクトリ (配下ファイルより前に書く)
-        await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
+        await zip.addDirectory(`${encodedId}/${plan.directory}/`, postDate);
         // 投稿情報+html
         const informationFile = utils.createInformationFile(post.informationText);
-        await enqueue(
-          informationFile.content,
-          `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`,
-          postDate,
-        );
+        await enqueue(informationFile.content, `${plan.directory}/${plan.informationFileName}`, postDate);
         await enqueue(
           [this.createHtmlFromBody(post.originalName, post.htmlText)],
-          `${post.encodedName}/index.html`,
+          `${plan.directory}/index.html`,
           postDate,
         );
         // カバー画像
-        if (post.cover) {
-          log(`download ${post.cover.name}`);
-          const blob = await fetchFile(post.cover.url, post.cover.name, { kind: 'cover' });
+        if (post.cover && plan.coverName !== undefined) {
+          const coverName = plan.coverName;
+          log(`download ${coverName}`);
+          const blob = await fetchFile(post.cover.url, coverName, { kind: 'cover' });
           if (blob) {
-            await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
+            await enqueue([blob], `${plan.directory}/${coverName}`, postDate);
             writtenFileCount++;
           } else if (options?.signal?.aborted) {
             // 中断による null は通信失敗ではないので failedFileCount に数えない。
@@ -2933,21 +3026,22 @@ export class DownloadHelper {
             break;
           } else {
             failedFileCount++;
-            console.error(`${post.cover.name}(${post.cover.url})のダウンロードに失敗、読み飛ばすよ`);
-            log(`${post.cover.name}のダウンロードに失敗`);
+            console.error(`${coverName}(${post.cover.url})のダウンロードに失敗、読み飛ばすよ`);
+            log(`${coverName}のダウンロードに失敗`);
           }
         }
         // ファイル処理
         let fileCount = 0;
-        for (const file of post.files) {
+        for (const [fileIndex, file] of post.files.entries()) {
           if (options?.signal?.aborted) {
             aborted = true;
             break postLoop;
           }
-          log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-          const blob = await fetchFile(file.url, file.encodedName, { kind: 'file' });
+          const fileName = plan.fileNames[fileIndex];
+          log(`download ${fileName} (${++fileCount}/${post.files.length})`);
+          const blob = await fetchFile(file.url, fileName, { kind: 'file' });
           if (blob) {
-            await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
+            await enqueue([blob], `${plan.directory}/${fileName}`, postDate);
             writtenFileCount++;
           } else if (options?.signal?.aborted) {
             // 中断による null は通信失敗ではないので failedFileCount に数えない
@@ -2955,8 +3049,8 @@ export class DownloadHelper {
             break postLoop;
           } else {
             failedFileCount++;
-            console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
-            log(`${file.encodedName}のダウンロードに失敗`);
+            console.error(`${fileName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
+            log(`${fileName}のダウンロードに失敗`);
           }
           count++;
           const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
@@ -2987,6 +3081,120 @@ export class DownloadHelper {
       await zip.abort(e);
       throw e;
     }
+  }
+
+  /**
+   * ZIP 生成の前に、入力の構造と archive 名から判定できる失敗を洗い出す。
+   *
+   * **`showSaveFilePicker` は解決した時点で対象ファイルの中身を空にする。** 新規なら 0 バイトで
+   * 作成し、既存ファイルを選べばその内容を消す (File System Access 仕様 3.4 の
+   * "Set entry's binary data to an empty byte sequence")。保存先を確保してから入力の不備で
+   * 落ちると、書くものが無いまま利用者のファイルだけが空になる。
+   *
+   * 見るのは、型・パスセグメント・予約名・衝突・エントリ名のバイト長・固定で書かれるエントリ数、
+   * および名前と固定ヘッダだけを積んだ central directory の offset / size の下限である。
+   * **生成物の本文サイズと日時 extra field は積まない** ので、名前は収まるのに本文の大きさで
+   * ZIP32 の上限に達する入力は通ってしまう。積まないのは、本文まで見積もり始めると生成物を丸ごと
+   * 保持する形 (Issue #53 の snapshot 化) へ踏み込むことになり、この API の役割を超えるためである。
+   *
+   * `downloadZip` は自分で picker を開く場合にそれより前でこれを実行するが、`options.handle` を
+   * 渡す利用側は自分で picker を呼ぶので、その前に自分でこれを呼ぶ必要がある。
+   * その経路では **`preflight` は 2 回走る** (利用側の事前実行と、`downloadZip` 冒頭の実行)。
+   * 2 回の結果が一致することは、入力が素の値であることと、utils が返す名前が決定的であることに依る。
+   *
+   * 入力を変更しない。`downloadZip` の冒頭からも呼ぶので、利用側が呼び忘れても検証は抜けない。
+   * 逆に、利用側が事前に通した結果を `downloadZip` へ渡して検証を省く口は用意しない。
+   * 結果に発行元の印を付けても、`json` の中身が `preflight` の後に書き換えられていないことまでは
+   * 確かめられない。省ける形にすると、検証を通っていない値をそのまま ZIP にする経路ができる。
+   * 入力は `project()` の出力である契約 (素の値) なので、同じ入力に対する再実行は同じ結果になる。
+   *
+   * **picker の待機中に入力そのものが書き換えられた場合までは守れない** (Issue #53)。
+   * `downloadZip` は待機の後にも投稿の並び・本文・URL を読む。
+   * @param downloadObj `DownloadObject.project()` の出力
+   * @returns 検証を通った入力と manifest の写し
+   * @throws {Error} ZIP 入力として受け付けられない場合
+   */
+  preflight(downloadObj: unknown): PreflightResult {
+    if (!this.isDownloadJsonObj(downloadObj)) throw new Error('ダウンロード対象オブジェクトの型が不正');
+    const encodedId = this.utils.encodeFileName(downloadObj.id);
+    if (!isValidPathSegment(encodedId)) {
+      throw new Error(`downloadZip: id が不正な値です (encode 後: ${JSON.stringify(encodedId)})`);
+    }
+    // 写しを取ったら元の manifest は読み直さず、以降は写しだけを検証・書き出しに使う。
+    // 検証と書き出しで別々に読むと、値を返す getter を仕込まれたときに「検証を通った値」と
+    // 「書き出される値」が食い違う (isDownloadJsonObj が既に 1 回読んでいるので、
+    // 「入力を通して 1 回しか読まない」ことまでは保証しない)
+    const manifest = snapshotManifest(downloadObj.manifest);
+    if (!isDownloadManifest(manifest, downloadObj as unknown as Record<string, unknown>)) {
+      throw new Error('downloadZip: manifest が不正です (projection を経ていない可能性があります)');
+    }
+
+    const seenEncodedNames = new Set<string>();
+    const posts: PostWritePlan[] = [];
+    for (const post of downloadObj.posts) {
+      if (!isValidPathSegment(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName が不正な値です (${JSON.stringify(post.encodedName)})`);
+      }
+      if (seenEncodedNames.has(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
+      }
+      // ルート直下の固定ファイルと同名の投稿ディレクトリを作ると、同じパスがファイルと
+      // ディレクトリの両方になり展開できない ZIP になる
+      if (RESERVED_ROOT_ENTRY_NAMES.includes(normalizeForReservedComparison(post.encodedName))) {
+        throw new Error(`downloadZip: post.encodedName がルートの予約名と衝突しています (${post.encodedName})`);
+      }
+      seenEncodedNames.add(post.encodedName);
+      if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
+        throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
+      }
+      for (const file of post.files) {
+        if (!isValidPathSegment(file.encodedName)) {
+          throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
+        }
+        assertNotReservedPostEntryName(file.encodedName, 'file.encodedName');
+      }
+      if (post.cover !== undefined) {
+        assertNotReservedPostEntryName(post.cover.name, 'post.cover.name');
+      }
+      // 情報ファイル名は DownloadUtils が決めるので、アセット名と同じようにここで検証する。
+      // constructor で差し替えられる以上、'info.json' / 'info.txt' 以外が返る可能性は型では塞げない。
+      // 予約名の検査 (assertNotReservedPostEntryName) は掛けない。この名前自身が予約されている側なので必ず落ちる
+      const informationFileName = this.utils.encodeFileName(
+        this.utils.createInformationFile(post.informationText).name,
+      );
+      if (!isValidPathSegment(informationFileName)) {
+        throw new Error(`downloadZip: 情報ファイル名が不正な値です (${JSON.stringify(informationFileName)})`);
+      }
+      // 投稿ディレクトリ直下の他の名前と衝突すると、同じパスに 2 エントリ入ってどちらかが失われる。
+      // アセット名が 'info.json' などに寄る向きは assertNotReservedPostEntryName が既に塞いでいるので、
+      // ここでは情報ファイル名が他へ寄る向きだけを見る。
+      // アセット同士の衝突は legacy allocator が作りうるものとして許容しているのでここでは扱わない
+      const normalizedInformationFileName = normalizeForReservedComparison(informationFileName);
+      const siblingNames = [
+        'index.html',
+        ...(post.cover !== undefined ? [post.cover.name] : []),
+        ...post.files.map((file) => file.encodedName),
+      ];
+      for (const sibling of siblingNames) {
+        if (normalizeForReservedComparison(sibling) === normalizedInformationFileName) {
+          throw new Error(
+            `downloadZip: 情報ファイル名が同じ投稿の ${sibling} と衝突しています (${informationFileName})`,
+          );
+        }
+      }
+      // 検証した名前をそのまま計画に載せる。downloadZip 側で組み立て直すと、
+      // 検証した名前と実際に書く名前が別々に決まることになる
+      posts.push({
+        directory: post.encodedName,
+        informationFileName,
+        ...(post.cover !== undefined ? { coverName: post.cover.name } : {}),
+        fileNames: post.files.map((file) => file.encodedName),
+      });
+    }
+
+    const result: PreflightResult = { json: downloadObj, manifest, encodedId, posts };
+    assertZipLimitsFromInput(result);
+    return result;
   }
 
   /**
