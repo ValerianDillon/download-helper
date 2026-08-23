@@ -701,6 +701,8 @@ function concatBytes(parts) {
   return out;
 }
 export const MAX_ZIP_ENTRY_COUNT = 65534;
+export const ZIP_LOCAL_HEADER_FIXED_BYTES = 30;
+export const ZIP_CENTRAL_HEADER_FIXED_BYTES = 46;
 export const MAX_ZIP_UINT32_FIELD_VALUE = 4294967295;
 export function assertZipEntryCountWithinLimit(currentEntryCount, method) {
   if (currentEntryCount >= MAX_ZIP_ENTRY_COUNT) {
@@ -741,7 +743,7 @@ export class ZipWriter {
       const localHeaderOffset = this.offset;
       assertZipUint32FieldWithinLimit(localHeaderOffset, `addFile ("${name}") の local header offset`);
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
-      const header = new ArrayBuffer(30);
+      const header = new ArrayBuffer(ZIP_LOCAL_HEADER_FIXED_BYTES);
       const view = new DataView(header);
       view.setUint32(0, 67324752, true);
       view.setUint16(4, 20, true);
@@ -788,7 +790,7 @@ export class ZipWriter {
       const localHeaderOffset = this.offset;
       assertZipUint32FieldWithinLimit(localHeaderOffset, `addDirectory ("${dirName}") の local header offset`);
       const { dosTime, dosDate, extraLfh, extraCd } = buildDateFields(date);
-      const header = new ArrayBuffer(30);
+      const header = new ArrayBuffer(ZIP_LOCAL_HEADER_FIXED_BYTES);
       const view = new DataView(header);
       view.setUint32(0, 67324752, true);
       view.setUint16(4, 20, true);
@@ -830,11 +832,11 @@ export class ZipWriter {
       assertZipUint32FieldWithinLimit(cdOffset, "close の central directory offset (cdOffset)");
       let predictedCdSize = 0;
       for (const entry of this.entries) {
-        predictedCdSize += 46 + entry.name.length + entry.extraCd.length;
+        predictedCdSize += ZIP_CENTRAL_HEADER_FIXED_BYTES + entry.name.length + entry.extraCd.length;
       }
       assertZipUint32FieldWithinLimit(predictedCdSize, "close の central directory size (cdSize)");
       for (const entry of this.entries) {
-        const cdHeader = new ArrayBuffer(46);
+        const cdHeader = new ArrayBuffer(ZIP_CENTRAL_HEADER_FIXED_BYTES);
         const view = new DataView(cdHeader);
         view.setUint32(0, 33639248, true);
         view.setUint16(4, 20, true);
@@ -919,6 +921,48 @@ export class ZipWriter {
       await this.writable.abort(reason);
     } catch {}
   }
+}
+function assertZipLimitsFromInput(plan) {
+  const encoder = new TextEncoder;
+  const byteLength = (value) => encoder.encode(value).length;
+  const idBytes = byteLength(plan.encodedId);
+  const separator = 1;
+  let entryCount = 0;
+  let localBytesLowerBound = 0;
+  let centralBytesLowerBound = 0;
+  const assertNameLength = (nameBytes, describe) => {
+    if (nameBytes > 65535) {
+      throw new Error(`downloadZip: エントリ名が長すぎます (UTF-8 ${nameBytes} bytes, 上限 65535 bytes): ${JSON.stringify(describe())}`);
+    }
+  };
+  const account = (nameBytes, describe) => {
+    assertNameLength(nameBytes, describe);
+    entryCount++;
+    localBytesLowerBound += ZIP_LOCAL_HEADER_FIXED_BYTES + nameBytes;
+    centralBytesLowerBound += ZIP_CENTRAL_HEADER_FIXED_BYTES + nameBytes;
+  };
+  account(idBytes + separator, () => `${plan.encodedId}/`);
+  account(idBytes + separator + byteLength("index.html"), () => `${plan.encodedId}/index.html`);
+  account(idBytes + separator + byteLength("download-manifest.json"), () => `${plan.encodedId}/download-manifest.json`);
+  for (const post of plan.posts) {
+    const dirBytes = idBytes + separator + byteLength(post.directory);
+    const dir = () => `${plan.encodedId}/${post.directory}`;
+    account(dirBytes + separator, () => `${dir()}/`);
+    account(dirBytes + separator + byteLength(post.informationFileName), () => `${dir()}/${post.informationFileName}`);
+    account(dirBytes + separator + byteLength("index.html"), () => `${dir()}/index.html`);
+    if (post.coverName !== undefined) {
+      const coverName = post.coverName;
+      assertNameLength(dirBytes + separator + byteLength(coverName), () => `${dir()}/${coverName}`);
+    }
+    for (const fileName of post.fileNames) {
+      assertNameLength(dirBytes + separator + byteLength(fileName), () => `${dir()}/${fileName}`);
+    }
+  }
+  if (entryCount > MAX_ZIP_ENTRY_COUNT) {
+    throw new Error(`downloadZip: エントリ数が上限を超えます (最低 ${entryCount} 件、上限 ${MAX_ZIP_ENTRY_COUNT} 件)`);
+  }
+  assertZipUint32FieldWithinLimit(localBytesLowerBound, "preflight で見積もった central directory offset の下限");
+  assertZipUint32FieldWithinLimit(centralBytesLowerBound, "preflight で見積もった central directory size の下限");
 }
 function isValidPathSegment(value) {
   if (typeof value !== "string" || value.length === 0)
@@ -1346,43 +1390,9 @@ export class DownloadHelper {
       }
     };
   }
-  async downloadZip(downloadObj, progress, log, remainTime, options) {
-    if (!this.isDownloadJsonObj(downloadObj))
-      throw new Error("ダウンロード対象オブジェクトの型が不正");
+  async downloadZip(input, progress, log, remainTime, options) {
+    const { json: downloadObj, manifest, encodedId, posts: postPlans } = this.preflight(input);
     const utils = this.utils;
-    const encodedId = utils.encodeFileName(downloadObj.id);
-    if (!isValidPathSegment(encodedId)) {
-      throw new Error(`downloadZip: id が不正な値です (encode 後: ${JSON.stringify(encodedId)})`);
-    }
-    const manifest = snapshotManifest(downloadObj.manifest);
-    if (!isDownloadManifest(manifest, downloadObj)) {
-      throw new Error("downloadZip: manifest が不正です (projection を経ていない可能性があります)");
-    }
-    const seenEncodedNames = new Set;
-    for (const post of downloadObj.posts) {
-      if (!isValidPathSegment(post.encodedName)) {
-        throw new Error(`downloadZip: post.encodedName が不正な値です (${JSON.stringify(post.encodedName)})`);
-      }
-      if (seenEncodedNames.has(post.encodedName)) {
-        throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
-      }
-      if (RESERVED_ROOT_ENTRY_NAMES.includes(normalizeForReservedComparison(post.encodedName))) {
-        throw new Error(`downloadZip: post.encodedName がルートの予約名と衝突しています (${post.encodedName})`);
-      }
-      seenEncodedNames.add(post.encodedName);
-      if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
-        throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
-      }
-      for (const file of post.files) {
-        if (!isValidPathSegment(file.encodedName)) {
-          throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
-        }
-        assertNotReservedPostEntryName(file.encodedName, "file.encodedName");
-      }
-      if (post.cover !== undefined) {
-        assertNotReservedPostEntryName(post.cover.name, "post.cover.name");
-      }
-    }
     const handle = options?.handle ?? await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
     const writable = await handle.createWritable();
     const zip = new ZipWriter(writable);
@@ -1415,50 +1425,53 @@ export class DownloadHelper {
       await enqueue([JSON.stringify(toCanonicalManifest(manifest), null, 2)], "download-manifest.json", rootDate);
       let postCount = 0;
       postLoop:
-        for (const post of downloadObj.posts) {
+        for (const [postIndex, post] of downloadObj.posts.entries()) {
           if (options?.signal?.aborted) {
             aborted = true;
             break;
           }
+          const plan = postPlans[postIndex];
           log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
           const postDate = parsePublishedDate(post.publishedDatetime);
-          await zip.addDirectory(`${encodedId}/${post.encodedName}/`, postDate);
+          await zip.addDirectory(`${encodedId}/${plan.directory}/`, postDate);
           const informationFile = utils.createInformationFile(post.informationText);
-          await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`, postDate);
-          await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`, postDate);
-          if (post.cover) {
-            log(`download ${post.cover.name}`);
-            const blob = await fetchFile(post.cover.url, post.cover.name, { kind: "cover" });
+          await enqueue(informationFile.content, `${plan.directory}/${plan.informationFileName}`, postDate);
+          await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${plan.directory}/index.html`, postDate);
+          if (post.cover && plan.coverName !== undefined) {
+            const coverName = plan.coverName;
+            log(`download ${coverName}`);
+            const blob = await fetchFile(post.cover.url, coverName, { kind: "cover" });
             if (blob) {
-              await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
+              await enqueue([blob], `${plan.directory}/${coverName}`, postDate);
               writtenFileCount++;
             } else if (options?.signal?.aborted) {
               aborted = true;
               break;
             } else {
               failedFileCount++;
-              console.error(`${post.cover.name}(${post.cover.url})のダウンロードに失敗、読み飛ばすよ`);
-              log(`${post.cover.name}のダウンロードに失敗`);
+              console.error(`${coverName}(${post.cover.url})のダウンロードに失敗、読み飛ばすよ`);
+              log(`${coverName}のダウンロードに失敗`);
             }
           }
           let fileCount = 0;
-          for (const file of post.files) {
+          for (const [fileIndex, file] of post.files.entries()) {
             if (options?.signal?.aborted) {
               aborted = true;
               break postLoop;
             }
-            log(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-            const blob = await fetchFile(file.url, file.encodedName, { kind: "file" });
+            const fileName = plan.fileNames[fileIndex];
+            log(`download ${fileName} (${++fileCount}/${post.files.length})`);
+            const blob = await fetchFile(file.url, fileName, { kind: "file" });
             if (blob) {
-              await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
+              await enqueue([blob], `${plan.directory}/${fileName}`, postDate);
               writtenFileCount++;
             } else if (options?.signal?.aborted) {
               aborted = true;
               break postLoop;
             } else {
               failedFileCount++;
-              console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
-              log(`${file.encodedName}のダウンロードに失敗`);
+              console.error(`${fileName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
+              log(`${fileName}のダウンロードに失敗`);
             }
             count++;
             const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
@@ -1488,6 +1501,68 @@ export class DownloadHelper {
       await zip.abort(e);
       throw e;
     }
+  }
+  preflight(downloadObj) {
+    if (!this.isDownloadJsonObj(downloadObj))
+      throw new Error("ダウンロード対象オブジェクトの型が不正");
+    const encodedId = this.utils.encodeFileName(downloadObj.id);
+    if (!isValidPathSegment(encodedId)) {
+      throw new Error(`downloadZip: id が不正な値です (encode 後: ${JSON.stringify(encodedId)})`);
+    }
+    const manifest = snapshotManifest(downloadObj.manifest);
+    if (!isDownloadManifest(manifest, downloadObj)) {
+      throw new Error("downloadZip: manifest が不正です (projection を経ていない可能性があります)");
+    }
+    const seenEncodedNames = new Set;
+    const posts = [];
+    for (const post of downloadObj.posts) {
+      if (!isValidPathSegment(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName が不正な値です (${JSON.stringify(post.encodedName)})`);
+      }
+      if (seenEncodedNames.has(post.encodedName)) {
+        throw new Error(`downloadZip: post.encodedName が重複しています (${post.encodedName})`);
+      }
+      if (RESERVED_ROOT_ENTRY_NAMES.includes(normalizeForReservedComparison(post.encodedName))) {
+        throw new Error(`downloadZip: post.encodedName がルートの予約名と衝突しています (${post.encodedName})`);
+      }
+      seenEncodedNames.add(post.encodedName);
+      if (post.cover !== undefined && !isValidPathSegment(post.cover.name)) {
+        throw new Error(`downloadZip: post.cover.name が不正な値です (${JSON.stringify(post.cover.name)})`);
+      }
+      for (const file of post.files) {
+        if (!isValidPathSegment(file.encodedName)) {
+          throw new Error(`downloadZip: file.encodedName が不正な値です (${JSON.stringify(file.encodedName)})`);
+        }
+        assertNotReservedPostEntryName(file.encodedName, "file.encodedName");
+      }
+      if (post.cover !== undefined) {
+        assertNotReservedPostEntryName(post.cover.name, "post.cover.name");
+      }
+      const informationFileName = this.utils.encodeFileName(this.utils.createInformationFile(post.informationText).name);
+      if (!isValidPathSegment(informationFileName)) {
+        throw new Error(`downloadZip: 情報ファイル名が不正な値です (${JSON.stringify(informationFileName)})`);
+      }
+      const normalizedInformationFileName = normalizeForReservedComparison(informationFileName);
+      const siblingNames = [
+        "index.html",
+        ...post.cover !== undefined ? [post.cover.name] : [],
+        ...post.files.map((file) => file.encodedName)
+      ];
+      for (const sibling of siblingNames) {
+        if (normalizeForReservedComparison(sibling) === normalizedInformationFileName) {
+          throw new Error(`downloadZip: 情報ファイル名が同じ投稿の ${sibling} と衝突しています (${informationFileName})`);
+        }
+      }
+      posts.push({
+        directory: post.encodedName,
+        informationFileName,
+        ...post.cover !== undefined ? { coverName: post.cover.name } : {},
+        fileNames: post.files.map((file) => file.encodedName)
+      });
+    }
+    const result = { json: downloadObj, manifest, encodedId, posts };
+    assertZipLimitsFromInput(result);
+    return result;
   }
   isDownloadJsonObj(target) {
     if (typeof target !== "object" || target === null) {

@@ -785,6 +785,16 @@ export declare function buildExtTimestampCd(date: Date): Uint8Array<ArrayBuffer>
  */
 export declare const MAX_ZIP_ENTRY_COUNT = 65534;
 /**
+ * local file header の固定部のバイト数。
+ * 1 エントリが占めるバイト数は これ + 名前長 + extra field 長 + 本体長 になる
+ */
+export declare const ZIP_LOCAL_HEADER_FIXED_BYTES = 30;
+/**
+ * central directory の 1 エントリの固定部のバイト数。
+ * 1 エントリが占めるバイト数は これ + 名前長 + extra field 長 になる
+ */
+export declare const ZIP_CENTRAL_HEADER_FIXED_BYTES = 46;
+/**
  * LFH / CD の size フィールドと CD / EOCD の offset フィールド (いずれも uint32) が
  * 取り得る値の上限 (Issue #15)。`0xFFFFFFFF` は APPNOTE 4.4.1.4 が定める ZIP64 の sentinel 値であり、
  * ZipWriter は ZIP64 Extended Information Extra Field を書かないため、この値以上になると
@@ -1008,6 +1018,38 @@ export declare class ZipWriter {
     private abortOnFailure;
 }
 /**
+ * 投稿 1 件分の書き込み計画
+ *
+ * `preflight` が検証した archive 名をそのまま持ち、`downloadZip` はここから読んで書き込む。
+ * 名前を組み立て直さないので、`DownloadUtils` が呼び出しごとに違う値を返しても書き出しは変わらない。
+ *
+ * ただし `downloadZip` は `json` 本体 (投稿の並び・本文・URL) を picker の待機後にも読むので、
+ * **待機中に呼び出し側が `json` を書き換えた場合まで守れるわけではない** (Issue #53)。
+ */
+export type PostWritePlan = {
+    /** 投稿ディレクトリ名 (ZIP ルート直下) */
+    readonly directory: string;
+    /** 情報ファイル名 (`createInformationFile` の名前を `encodeFileName` に通したもの) */
+    readonly informationFileName: string;
+    /** カバーの archive 名。カバーが無ければ undefined */
+    readonly coverName?: string;
+    /** 添付の archive 名。`json.posts[].files` と同じ並び */
+    readonly fileNames: readonly string[];
+};
+/**
+ * `preflight` の結果
+ */
+export type PreflightResult = {
+    /** 検証を通った入力。渡したオブジェクトと同一で、型だけが確定している */
+    readonly json: DownloadJsonObj;
+    /** 検証を通った manifest の写し。書き出しにはこの写しだけを使う */
+    readonly manifest: DownloadManifest;
+    /** 検証を通った ZIP ルートのディレクトリ名 (`encodeFileName(json.id)`) */
+    readonly encodedId: string;
+    /** `json.posts` と同じ並びの書き込み計画 */
+    readonly posts: readonly PostWritePlan[];
+};
+/**
  * downloadZip の挙動を差し替えるためのオプション
  */
 export type DownloadZipOptions = {
@@ -1053,6 +1095,16 @@ export type DownloadZipResult = {
  */
 export declare class DownloadHelper {
     private readonly utils;
+    /**
+     * @param utils ダウンロード用ユーティリティ。
+     *   **`encodeFileName` と `createInformationFile` が返す名前は決定的でなければならない**
+     *   (同じ引数には同じ名前を返し、副作用を持たず、有効な入力で例外を投げない)。
+     *   利用側が自分で picker を開く経路では `preflight` が 2 回走る (利用側の事前実行と `downloadZip`
+     *   冒頭の実行)。呼び出しごとに違う名前を返す実装を渡すと 2 回の結果が食い違い、事前検証を通った
+     *   のに保存先を確保した後で初めて失敗する。
+     *   通信やスリープを行う他のメソッド (`httpGetAs` / `fetchWithLimit` / `sleep` / `embedScript`) は
+     *   この要求の対象外である
+     */
     constructor(utils: DownloadUtils);
     /**
      * bootstrapのCSS情報
@@ -1080,14 +1132,46 @@ export declare class DownloadHelper {
      * 型上は渡せてしまうが、呼び出しを await しないので、返された Promise の rejection はこのメソッドの
      * catch (ストリームの abort) に到達せず、未処理 rejection のまま ZIP 生成が継続する。
      * 同期的に throw した場合は catch に入り、書き込み途中ならストリームを abort して再スローする。
-     * @param downloadObj ダウンロード対象オブジェクト
+     * @param input ダウンロード対象オブジェクト (`DownloadObject.project()` の出力)
      * @param progress 進捗率出力関数 (同期)
      * @param log ログ出力関数 (同期)
      * @param remainTime 終了予測出力関数 (同期)
      * @param options handle/signal/fetchFile を差し替えるためのオプション (省略時は従来どおりの挙動)
      * @returns 処理結果 (Issue #13)。各件数の定義は DownloadZipResult のコメントを参照
      */
-    downloadZip(downloadObj: unknown, progress: (n: number) => void, log: (s: string) => void, remainTime: (r: string) => void, options?: DownloadZipOptions): Promise<DownloadZipResult>;
+    downloadZip(input: unknown, progress: (n: number) => void, log: (s: string) => void, remainTime: (r: string) => void, options?: DownloadZipOptions): Promise<DownloadZipResult>;
+    /**
+     * ZIP 生成の前に、入力の構造と archive 名から判定できる失敗を洗い出す。
+     *
+     * **`showSaveFilePicker` は解決した時点で対象ファイルの中身を空にする。** 新規なら 0 バイトで
+     * 作成し、既存ファイルを選べばその内容を消す (File System Access 仕様 3.4 の
+     * "Set entry's binary data to an empty byte sequence")。保存先を確保してから入力の不備で
+     * 落ちると、書くものが無いまま利用者のファイルだけが空になる。
+     *
+     * 見るのは、型・パスセグメント・予約名・衝突・エントリ名のバイト長・固定で書かれるエントリ数、
+     * および名前と固定ヘッダだけを積んだ central directory の offset / size の下限である。
+     * **生成物の本文サイズと日時 extra field は積まない** ので、名前は収まるのに本文の大きさで
+     * ZIP32 の上限に達する入力は通ってしまう。積まないのは、本文まで見積もり始めると生成物を丸ごと
+     * 保持する形 (Issue #53 の snapshot 化) へ踏み込むことになり、この API の役割を超えるためである。
+     *
+     * `downloadZip` は自分で picker を開く場合にそれより前でこれを実行するが、`options.handle` を
+     * 渡す利用側は自分で picker を呼ぶので、その前に自分でこれを呼ぶ必要がある。
+     * その経路では **`preflight` は 2 回走る** (利用側の事前実行と、`downloadZip` 冒頭の実行)。
+     * 2 回の結果が一致することは、入力が素の値であることと、utils が返す名前が決定的であることに依る。
+     *
+     * 入力を変更しない。`downloadZip` の冒頭からも呼ぶので、利用側が呼び忘れても検証は抜けない。
+     * 逆に、利用側が事前に通した結果を `downloadZip` へ渡して検証を省く口は用意しない。
+     * 結果に発行元の印を付けても、`json` の中身が `preflight` の後に書き換えられていないことまでは
+     * 確かめられない。省ける形にすると、検証を通っていない値をそのまま ZIP にする経路ができる。
+     * 入力は `project()` の出力である契約 (素の値) なので、同じ入力に対する再実行は同じ結果になる。
+     *
+     * **picker の待機中に入力そのものが書き換えられた場合までは守れない** (Issue #53)。
+     * `downloadZip` は待機の後にも投稿の並び・本文・URL を読む。
+     * @param downloadObj `DownloadObject.project()` の出力
+     * @returns 検証を通った入力と manifest の写し
+     * @throws {Error} ZIP 入力として受け付けられない場合
+     */
+    preflight(downloadObj: unknown): PreflightResult;
     /**
      * 型検証
      * @param target 検証対象
