@@ -2257,6 +2257,42 @@ export type DownloadZipResult = {
   writtenFileCount: number;
   failedFileCount: number;
   aborted: boolean;
+  /**
+   * 選択されたアセット 1 件ごとの結果 (Issue #54)。
+   *
+   * 件数フィールドから導けない「どれを書けたか」を利用側が記録できるようにする。
+   * 選択された全アセットに対して 1 件ずつ、`json.posts` の並び (投稿ごとにカバー → 添付) で入る。
+   * 選択条件で除外された対象は `downloadZip` に渡っていないので現れない (manifest の `excluded` 側)。
+   */
+  assets: readonly AssetWriteResult[];
+};
+
+/**
+ * アセット 1 件の書き込み結果
+ *
+ * - `written`: ZIP に書けた
+ * - `failed`: 取得に失敗した (中断由来ではない。`failedFileCount` と同じ数え方)
+ * - `skipped`: 中断のため書けなかった。
+ *   取得の途中で中断されたものと、そこまで到達しなかったものを区別しない (どちらも保存できていない)
+ */
+export type AssetWriteOutcome = 'written' | 'failed' | 'skipped';
+
+/**
+ * アセット 1 件の書き込み結果 (Issue #54)
+ *
+ * **`AssetKey` ではなく archive path で指す。**
+ * `downloadZip` は書き込み時に identity を持っていない。
+ * `DownloadJsonObj` 側 (`encodedName`) と `DownloadManifest` 側 (`assetId`) を突き合わせる手段は `(encodedName, originalName)` の組による多重集合の対応しかなく、legacy allocator が投稿内で archive 名を衝突させうる以上、これは一意性が保証された写像ではない。
+ * そこで実際に知っていること (どのパスに書けたか) だけを報告する。
+ * `AssetKey` への対応付けは、allocator を決めた利用側が行う。
+ */
+export type AssetWriteResult = {
+  /** `json.posts` での位置。`manifest.posts` も同じ並びなので postId はそこから引ける */
+  readonly postIndex: number;
+  readonly kind: 'cover' | 'file';
+  /** 投稿ディレクトリからの相対名。`preflight` が検証した archive 名そのもの */
+  readonly archiveName: string;
+  readonly outcome: AssetWriteOutcome;
 };
 
 /**
@@ -2968,6 +3004,30 @@ export class DownloadHelper {
         return Number.isFinite(d.getTime()) ? d : undefined;
       };
 
+      // 選択された全アセットぶんを先に skipped で並べ、書けた / 失敗したものだけ上書きする。
+      // 到達しなかった対象も結果として残るので、利用側は「結果が無い」を件数から推測せずに済む
+      const assetResults: {
+        postIndex: number;
+        kind: 'cover' | 'file';
+        archiveName: string;
+        outcome: AssetWriteOutcome;
+      }[] = [];
+      const assetResultIndex = new Map<string, number>();
+      for (const [postIndex, plan] of postPlans.entries()) {
+        if (plan.coverName !== undefined) {
+          assetResultIndex.set(`${postIndex}:cover`, assetResults.length);
+          assetResults.push({ postIndex, kind: 'cover', archiveName: plan.coverName, outcome: 'skipped' });
+        }
+        for (const [fileIndex, archiveName] of plan.fileNames.entries()) {
+          assetResultIndex.set(`${postIndex}:file:${fileIndex}`, assetResults.length);
+          assetResults.push({ postIndex, kind: 'file', archiveName, outcome: 'skipped' });
+        }
+      }
+      const recordAsset = (key: string, outcome: AssetWriteOutcome) => {
+        const index = assetResultIndex.get(key);
+        if (index !== undefined) assetResults[index].outcome = outcome;
+      };
+
       const startTime = Math.floor(Date.now() / 1000);
       let count = 0;
       let writtenFileCount = 0;
@@ -3019,6 +3079,7 @@ export class DownloadHelper {
           if (blob) {
             await enqueue([blob], `${plan.directory}/${coverName}`, postDate);
             writtenFileCount++;
+            recordAsset(`${postIndex}:cover`, 'written');
           } else if (options?.signal?.aborted) {
             // 中断による null は通信失敗ではないので failedFileCount に数えない。
             // この投稿はカバーを書き終えていないので completedPostCount にも含めない
@@ -3026,6 +3087,7 @@ export class DownloadHelper {
             break;
           } else {
             failedFileCount++;
+            recordAsset(`${postIndex}:cover`, 'failed');
             console.error(`${coverName}(${post.cover.url})のダウンロードに失敗、読み飛ばすよ`);
             log(`${coverName}のダウンロードに失敗`);
           }
@@ -3043,12 +3105,14 @@ export class DownloadHelper {
           if (blob) {
             await enqueue([blob], `${plan.directory}/${fileName}`, postDate);
             writtenFileCount++;
+            recordAsset(`${postIndex}:file:${fileIndex}`, 'written');
           } else if (options?.signal?.aborted) {
             // 中断による null は通信失敗ではないので failedFileCount に数えない
             aborted = true;
             break postLoop;
           } else {
             failedFileCount++;
+            recordAsset(`${postIndex}:file:${fileIndex}`, 'failed');
             console.error(`${fileName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
             log(`${fileName}のダウンロードに失敗`);
           }
@@ -3076,6 +3140,7 @@ export class DownloadHelper {
         writtenFileCount,
         failedFileCount,
         aborted,
+        assets: assetResults,
       };
     } catch (e) {
       await zip.abort(e);

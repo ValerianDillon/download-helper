@@ -1089,6 +1089,40 @@ export type DownloadZipResult = {
     writtenFileCount: number;
     failedFileCount: number;
     aborted: boolean;
+    /**
+     * 選択されたアセット 1 件ごとの結果 (Issue #54)。
+     *
+     * 件数フィールドから導けない「どれを書けたか」を利用側が記録できるようにする。
+     * 選択された全アセットに対して 1 件ずつ、`json.posts` の並び (投稿ごとにカバー → 添付) で入る。
+     * 選択条件で除外された対象は `downloadZip` に渡っていないので現れない (manifest の `excluded` 側)。
+     */
+    assets: readonly AssetWriteResult[];
+};
+/**
+ * アセット 1 件の書き込み結果
+ *
+ * - `written`: ZIP に書けた
+ * - `failed`: 取得に失敗した (中断由来ではない。`failedFileCount` と同じ数え方)
+ * - `skipped`: 中断のため書けなかった。
+ *   取得の途中で中断されたものと、そこまで到達しなかったものを区別しない (どちらも保存できていない)
+ */
+export type AssetWriteOutcome = 'written' | 'failed' | 'skipped';
+/**
+ * アセット 1 件の書き込み結果 (Issue #54)
+ *
+ * **`AssetKey` ではなく archive path で指す。**
+ * `downloadZip` は書き込み時に identity を持っていない。
+ * `DownloadJsonObj` 側 (`encodedName`) と `DownloadManifest` 側 (`assetId`) を突き合わせる手段は `(encodedName, originalName)` の組による多重集合の対応しかなく、legacy allocator が投稿内で archive 名を衝突させうる以上、これは一意性が保証された写像ではない。
+ * そこで実際に知っていること (どのパスに書けたか) だけを報告する。
+ * `AssetKey` への対応付けは、allocator を決めた利用側が行う。
+ */
+export type AssetWriteResult = {
+    /** `json.posts` での位置。`manifest.posts` も同じ並びなので postId はそこから引ける */
+    readonly postIndex: number;
+    readonly kind: 'cover' | 'file';
+    /** 投稿ディレクトリからの相対名。`preflight` が検証した archive 名そのもの */
+    readonly archiveName: string;
+    readonly outcome: AssetWriteOutcome;
 };
 /**
  * ダウンロード用のヘルパー

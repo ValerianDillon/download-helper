@@ -4016,6 +4016,72 @@ describe('DownloadHelper.downloadZip', () => {
         writtenFileCount: 4, // cover x2 + file x2
         failedFileCount: 0,
         aborted: false,
+        assets: [
+          { postIndex: 0, kind: 'cover', archiveName: 'cover.png', outcome: 'written' },
+          { postIndex: 0, kind: 'file', archiveName: 'file.png', outcome: 'written' },
+          { postIndex: 1, kind: 'cover', archiveName: 'cover.png', outcome: 'written' },
+          { postIndex: 1, kind: 'file', archiveName: 'file.png', outcome: 'written' },
+        ],
+      });
+    });
+
+    /**
+     * 対象単位の結果 (Issue #54)。件数フィールドからは「どれを書けたか」が分からない。
+     *
+     * 選択された全アセットに対して 1 件ずつ返し、中断で到達しなかったものも `skipped` として残す。
+     * 結果が無いことを「保存できていない」の代わりにすると、利用側が件数から推測することになる。
+     */
+    describe('対象単位の結果 (Issue #54)', () => {
+      test('取得に失敗した対象だけが failed になり、他は written のまま残る', async () => {
+        const obj = createObjWithCovers();
+        const fetchFile = async (url: string) => (url.includes('p2-file') ? null : new Blob([new Uint8Array([1])]));
+        const result = await runForResult(obj, fetchFile);
+
+        expect(result.assets).toEqual([
+          { postIndex: 0, kind: 'cover', archiveName: 'cover.png', outcome: 'written' },
+          { postIndex: 0, kind: 'file', archiveName: 'file.png', outcome: 'written' },
+          { postIndex: 1, kind: 'cover', archiveName: 'cover.png', outcome: 'written' },
+          { postIndex: 1, kind: 'file', archiveName: 'file.png', outcome: 'failed' },
+        ]);
+        expect(result.failedFileCount).toBe(1);
+      });
+
+      test('中断で到達しなかった対象は skipped として残る', async () => {
+        const obj = createObjWithCovers();
+        const controller = new AbortController();
+        // 最初のカバーを書いた直後に中断する。以降の 3 件は到達しない
+        const fetchFile = async () => {
+          const blob = new Blob([new Uint8Array([1])]);
+          controller.abort();
+          return blob;
+        };
+        const result = await runForResult(obj, fetchFile, controller.signal);
+
+        expect(result.assets).toEqual([
+          { postIndex: 0, kind: 'cover', archiveName: 'cover.png', outcome: 'written' },
+          { postIndex: 0, kind: 'file', archiveName: 'file.png', outcome: 'skipped' },
+          { postIndex: 1, kind: 'cover', archiveName: 'cover.png', outcome: 'skipped' },
+          { postIndex: 1, kind: 'file', archiveName: 'file.png', outcome: 'skipped' },
+        ]);
+        expect(result.aborted).toBe(true);
+        // 中断由来の欠落は failedFileCount には数えない (既存の意味論)
+        expect(result.failedFileCount).toBe(0);
+      });
+
+      test('カバーを持たない投稿は cover の結果を持たない', async () => {
+        const base = createObjWithCovers();
+        const obj = withManifest({
+          ...base,
+          posts: [{ ...base.posts[0], cover: undefined }, base.posts[1]],
+        });
+        const fetchFile = async () => new Blob([new Uint8Array([1])]);
+        const result = await runForResult(obj, fetchFile);
+
+        expect(result.assets).toEqual([
+          { postIndex: 0, kind: 'file', archiveName: 'file.png', outcome: 'written' },
+          { postIndex: 1, kind: 'cover', archiveName: 'cover.png', outcome: 'written' },
+          { postIndex: 1, kind: 'file', archiveName: 'file.png', outcome: 'written' },
+        ]);
       });
     });
 
@@ -4076,6 +4142,13 @@ describe('DownloadHelper.downloadZip', () => {
       expect(result.failedFileCount).toBe(0); // 中断由来の null は失敗として数えない
       expect(result.completedPostCount).toBe(0); // post1 はカバーのみ完了、添付未完了のため未完了扱い
       expect(result.writtenFileCount).toBe(1); // post1 の cover のみ
+      // 中断で落ちた対象を failed に更新する回帰を塞ぐ (Issue #54)
+      expect(result.assets).toEqual([
+        { postIndex: 0, kind: 'cover', archiveName: 'cover.png', outcome: 'written' },
+        { postIndex: 0, kind: 'file', archiveName: 'file.png', outcome: 'skipped' },
+        { postIndex: 1, kind: 'cover', archiveName: 'cover.png', outcome: 'skipped' },
+        { postIndex: 1, kind: 'file', archiveName: 'file.png', outcome: 'skipped' },
+      ]);
     });
 
     test('ファイルループ先頭の中断チェックで打ち切られる場合、未着手のファイルは fetchFile が呼ばれない', async () => {
@@ -4120,6 +4193,12 @@ describe('DownloadHelper.downloadZip', () => {
       expect(result.totalPostCount).toBe(1);
       expect(result.writtenFileCount).toBe(2); // cover + file1
       expect(result.failedFileCount).toBe(0);
+      // 複数添付の並びがずれる回帰を塞ぐ (Issue #54)
+      expect(result.assets).toEqual([
+        { postIndex: 0, kind: 'cover', archiveName: 'cover.png', outcome: 'written' },
+        { postIndex: 0, kind: 'file', archiveName: 'file1.png', outcome: 'written' },
+        { postIndex: 0, kind: 'file', archiveName: 'file2.png', outcome: 'skipped' },
+      ]);
     });
 
     test('カバー取得が中断により null を返す場合、failedFileCount に数えず投稿は completedPostCount に含めない', async () => {
@@ -4139,6 +4218,13 @@ describe('DownloadHelper.downloadZip', () => {
       expect(result.completedPostCount).toBe(0); // post1 はカバーすら書けていないため未完了
       expect(result.totalPostCount).toBe(2);
       expect(result.writtenFileCount).toBe(0);
+      // カバー取得中の中断でも failed にしない (Issue #54)
+      expect(result.assets).toEqual([
+        { postIndex: 0, kind: 'cover', archiveName: 'cover.png', outcome: 'skipped' },
+        { postIndex: 0, kind: 'file', archiveName: 'file.png', outcome: 'skipped' },
+        { postIndex: 1, kind: 'cover', archiveName: 'cover.png', outcome: 'skipped' },
+        { postIndex: 1, kind: 'file', archiveName: 'file.png', outcome: 'skipped' },
+      ]);
     });
 
     test('全データを書き終えたあと (最終 zip.close() 実行中) に signal.aborted になった場合、aborted は false のまま', async () => {
