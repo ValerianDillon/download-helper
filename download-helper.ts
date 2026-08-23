@@ -27,7 +27,7 @@ export type PostObj = {
   files: BodyFileObj[];
   html: HtmlFragment[];
   tags: string[];
-  cover?: FileObj;
+  cover?: CoverFileObj;
   publishedDatetime?: string;
   /** FANBOX の投稿タイプ。収集結果の絞り込み条件として利用側が読む (この層では使わない) */
   postType?: string;
@@ -52,8 +52,11 @@ export type AssetKind = 'cover' | BodyAssetKind;
  */
 export type BodyAssetKey = { readonly kind: BodyAssetKind; readonly assetId: string };
 
+/** カバーを指す鍵。投稿に高々 1 つなので、識別子を持たない sentinel 1 種類しかない */
+export type CoverAssetKey = { readonly kind: 'cover' };
+
 /** 投稿内でアセットを一意に指す鍵。カバーは投稿に高々 1 つなので sentinel で表す */
-export type AssetKey = { readonly kind: 'cover' } | BodyAssetKey;
+export type AssetKey = CoverAssetKey | BodyAssetKey;
 
 /**
  * AssetKey を凍結した複製にする。
@@ -108,6 +111,9 @@ export type FileObj = {
 
 /** 本文中のアセット。カバーの sentinel は持たない (addFile の型の境界を allocator まで通す) */
 export type BodyFileObj = FileObj & { readonly key: BodyAssetKey };
+
+/** カバー画像。鍵は sentinel に限る (カバーの席に本文アセットを置けないようにする) */
+export type CoverFileObj = FileObj & { readonly key: CoverAssetKey };
 
 /**
  * PostObject.addFile に渡すアセット
@@ -181,6 +187,72 @@ export type Selection = {
  */
 export function normalizeExtension(extension: string): string {
   return extension.toLowerCase();
+}
+
+/**
+ * 選択 UI 向けのアセットの読み取りビュー
+ *
+ * `FileObj` をそのまま返さない。URL は projection と ZIP 生成だけが使う値で、選択の提示には
+ * 要らない。返すのは「どのアセットが、どういう名前と拡張子で、どれだけの大きさか」だけにする。
+ */
+export type AssetSummary<K extends AssetKey = AssetKey> = {
+  /** アセットの identity。`FileObj.key` と同一の凍結済みオブジェクト */
+  readonly key: K;
+  /** 元のファイル名 (`encodeFileName` を通す前) */
+  readonly name: string;
+  /** `normalizeExtension` を通した拡張子。`Selection.extensions` とそのまま突き合わせられる */
+  readonly extension: string;
+  /**
+   * 付随メタデータの複製。
+   *
+   * どのフィールドが入るかは `AssetMetadata` の型では区別されない。`fanbox-collector` が
+   * 組み立てる値では `size` が file 系に、`width` / `height` が image 系に付く (実測 2026-08-22)。
+   */
+  readonly metadata: AssetMetadata;
+};
+
+/** 本文中のアセットの読み取りビュー。カバーの sentinel は持たない */
+export type BodyAssetSummary = AssetSummary<BodyAssetKey>;
+
+/** カバー画像の読み取りビュー。鍵は sentinel に限る */
+export type CoverAssetSummary = AssetSummary<CoverAssetKey>;
+
+/**
+ * 選択 UI 向けの投稿の読み取りビュー
+ *
+ * カバーを `files` に混ぜないのは `Selection` の意味論に合わせるためである。拡張子の選択は
+ * `files` にだけ効き、カバーは `includeCover` だけで決まる。混ぜて返すと利用側が毎回 `kind` で
+ * 振り分けることになり、振り分け忘れがそのまま選択条件の誤りになる。
+ *
+ * `html` / `info` / `url` は含めない。選択の提示に使わない値を公開 API に載せると、利用側が
+ * 収集結果をもう一部保持することになる (`info` は投稿 1 件分の情報ファイルの中身そのものなので
+ * 特に大きい)。
+ */
+export type PostSummary = {
+  readonly postId: string;
+  readonly name: string;
+  readonly tags: readonly string[];
+  readonly files: readonly BodyAssetSummary[];
+  readonly cover?: CoverAssetSummary;
+  readonly publishedDatetime?: string;
+  readonly postType?: string;
+};
+
+/**
+ * `FileObj` を読み取りビューに写す。
+ *
+ * `key` は `freezeAssetKey` を通った凍結済みオブジェクトなので共有してよいが、`metadata` は
+ * `addFile` の呼び出し側が渡したオブジェクトをそのまま保持している (`asset.metadata ?? {}`) ため
+ * 複製する。
+ * @param file 写す対象のアセット
+ */
+function summarizeAsset<T extends FileObj>(file: T): AssetSummary<T['key']> {
+  return {
+    key: file.key,
+    name: file.name,
+    extension: normalizeExtension(file.extension),
+    metadata: { ...file.metadata },
+  };
 }
 
 /**
@@ -535,7 +607,7 @@ export type ReadonlyPostObj = {
   readonly files: readonly Readonly<BodyFileObj>[];
   readonly html: readonly HtmlFragment[];
   readonly tags: readonly string[];
-  readonly cover?: Readonly<FileObj>;
+  readonly cover?: Readonly<CoverFileObj>;
   readonly publishedDatetime?: string;
   readonly postType?: string;
 };
@@ -753,6 +825,28 @@ export class DownloadObject {
   }
 
   /**
+   * 収集済みの投稿を選択 UI 向けの読み取りビューとして返す。
+   *
+   * 収集順で、内部表現の複製を返す。`PostObj` / `FileObj` をそのまま返すと、`readonly` を外した
+   * 参照から収集結果を書き換えられ、`project()` の出力が UI の提示と食い違いうる。
+   *
+   * 呼び出しごとに新しい配列とオブジェクトを作る。`project()` と違って allocator を通さないので
+   * archive path は含まれない (選択の提示に archive path は要らず、含めると選択のたびに
+   * 採番を走らせることになる)。
+   */
+  listPosts(): PostSummary[] {
+    return this.downloadObj.posts.map((post) => ({
+      postId: post.postId,
+      name: post.name,
+      tags: [...post.tags],
+      files: post.files.map((file) => summarizeAsset(file)),
+      ...(post.cover ? { cover: summarizeAsset(post.cover) } : {}),
+      ...(post.publishedDatetime !== undefined ? { publishedDatetime: post.publishedDatetime } : {}),
+      ...(post.postType !== undefined ? { postType: post.postType } : {}),
+    }));
+  }
+
+  /**
    * 選択条件からダウンロード対象を導出する。
    *
    * 入力は変更しない。同じ入力と `Selection` に対して決定的である
@@ -954,7 +1048,7 @@ export class PostObject {
   }
 
   setCover(name: string, extension: string, url: string): FileObject {
-    const fileObj: FileObj = {
+    const fileObj: CoverFileObj = {
       name,
       extension: extension ? `.${extension}` : '',
       url,
