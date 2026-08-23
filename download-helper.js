@@ -1407,6 +1407,23 @@ export class DownloadHelper {
         const d = new Date(iso);
         return Number.isFinite(d.getTime()) ? d : undefined;
       };
+      const assetResults = [];
+      const assetResultIndex = new Map;
+      for (const [postIndex, plan] of postPlans.entries()) {
+        if (plan.coverName !== undefined) {
+          assetResultIndex.set(`${postIndex}:cover`, assetResults.length);
+          assetResults.push({ postIndex, kind: "cover", archiveName: plan.coverName, outcome: "skipped" });
+        }
+        for (const [fileIndex, archiveName] of plan.fileNames.entries()) {
+          assetResultIndex.set(`${postIndex}:file:${fileIndex}`, assetResults.length);
+          assetResults.push({ postIndex, kind: "file", archiveName, outcome: "skipped" });
+        }
+      }
+      const recordAsset = (key, outcome) => {
+        const index = assetResultIndex.get(key);
+        if (index !== undefined)
+          assetResults[index].outcome = outcome;
+      };
       const startTime = Math.floor(Date.now() / 1000);
       let count = 0;
       let writtenFileCount = 0;
@@ -1444,11 +1461,13 @@ export class DownloadHelper {
             if (blob) {
               await enqueue([blob], `${plan.directory}/${coverName}`, postDate);
               writtenFileCount++;
+              recordAsset(`${postIndex}:cover`, "written");
             } else if (options?.signal?.aborted) {
               aborted = true;
               break;
             } else {
               failedFileCount++;
+              recordAsset(`${postIndex}:cover`, "failed");
               console.error(`${coverName}(${post.cover.url})のダウンロードに失敗、読み飛ばすよ`);
               log(`${coverName}のダウンロードに失敗`);
             }
@@ -1465,11 +1484,13 @@ export class DownloadHelper {
             if (blob) {
               await enqueue([blob], `${plan.directory}/${fileName}`, postDate);
               writtenFileCount++;
+              recordAsset(`${postIndex}:file:${fileIndex}`, "written");
             } else if (options?.signal?.aborted) {
               aborted = true;
               break postLoop;
             } else {
               failedFileCount++;
+              recordAsset(`${postIndex}:file:${fileIndex}`, "failed");
               console.error(`${fileName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
               log(`${fileName}のダウンロードに失敗`);
             }
@@ -1495,7 +1516,8 @@ export class DownloadHelper {
         totalPostCount: downloadObj.posts.length,
         writtenFileCount,
         failedFileCount,
-        aborted
+        aborted,
+        assets: assetResults
       };
     } catch (e) {
       await zip.abort(e);

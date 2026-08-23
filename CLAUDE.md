@@ -161,6 +161,27 @@ extra field と本体のバイト数も積まない。加算方向にしか効�
 利用側が事前に通した結果を `downloadZip` へ渡して検証を省く口は用意しない。
 渡された結果が本当にその入力から得たものかを `downloadZip` 側で確かめられず、「検証済み」を利用側の申告で信じることになる。
 
+## 対象単位の書き込み結果 (Issue #54)
+
+`DownloadZipResult.assets` が、選択されたアセット 1 件ごとの結果を返す。
+件数フィールドからは「どれを書けたか」が分からず、利用側 (差分ダウンロード) が保存実績を記録できない。
+
+**`AssetKey` ではなく archive path で指す。**
+`downloadZip` は書き込み時に identity を持っておらず、`DownloadJsonObj` 側 (`encodedName`) と `DownloadManifest` 側 (`assetId`) を突き合わせる手段は `(encodedName, originalName)` の組による多重集合の対応しかない。
+legacy allocator が投稿内で archive 名を衝突させうる以上、これは一意性が保証された写像ではないので、実際に知っていること (どのパスに書けたか) だけを報告する。
+`AssetKey` への対応付けは、allocator を決めた利用側が自分の allocator を逆に引いて行う。
+
+`AssetKey` を `DownloadJsonObj` にも載せる案は採らない。
+`manifest.included[].assetId` と同じ値を 2 箇所に置くことになり、identity の重複として退けた形と同じになる。
+
+**結果は入力に対して網羅的にする。**
+中断で到達しなかった対象も `skipped` として残す。
+結果が無いことを「保存できていない」の代わりにすると、利用側が件数から推測することになる。
+
+既存の件数フィールドは残す。対象単位の結果から導けるが、利用側が既に読んでいる。
+
+必須フィールドの追加なので、`DownloadZipResult` を**構築している**利用側 (モックや fixture) は型エラーになる。読むだけの利用側と実行時の互換性には影響しないが、公開型なのでメジャーで出す。
+
 ## ZIP のパス衝突
 
 ルート直下の固定ファイル名 (`index.html` / `download-manifest.json`) と同名の投稿ディレクトリ、投稿ディレクトリ直下の固定ファイル名 (`index.html` / `info.json` / `info.txt`) と同名のアセットは `downloadZip` が拒否する。同じパスがファイルとディレクトリの両方になり、展開できない ZIP になるため。
