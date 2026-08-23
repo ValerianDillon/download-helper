@@ -7,6 +7,14 @@ export function assetKeyToString(key) {
 export function normalizeExtension(extension) {
   return extension.toLowerCase();
 }
+function summarizeAsset(file) {
+  return {
+    key: file.key,
+    name: file.name,
+    extension: normalizeExtension(file.extension),
+    metadata: { ...file.metadata }
+  };
+}
 export function joinHtmlFragments(parts, separator) {
   const joined = [];
   parts.forEach((part, index) => {
@@ -198,6 +206,17 @@ export class DownloadObject {
       }
     }
     return { postIds, extensions, includeCover: true };
+  }
+  listPosts() {
+    return this.downloadObj.posts.map((post) => ({
+      postId: post.postId,
+      name: post.name,
+      tags: [...post.tags],
+      files: post.files.map((file) => summarizeAsset(file)),
+      ...post.cover ? { cover: summarizeAsset(post.cover) } : {},
+      ...post.publishedDatetime !== undefined ? { publishedDatetime: post.publishedDatetime } : {},
+      ...post.postType !== undefined ? { postType: post.postType } : {}
+    }));
   }
   project(selection, options) {
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);

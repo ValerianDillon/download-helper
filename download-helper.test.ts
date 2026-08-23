@@ -11,6 +11,8 @@ import {
   assertZipUint32FieldWithinLimit,
   assetKeyToString,
   type BodyAssetKey,
+  type BodyAssetSummary,
+  type CoverAssetKey,
   clampToZipRange,
   crc32,
   createLegacyArchivePathAllocator,
@@ -26,6 +28,7 @@ import {
   joinHtmlFragments,
   MAX_ZIP_ENTRY_COUNT,
   MAX_ZIP_UINT32_FIELD_VALUE,
+  type PostSummary,
   type ReadonlyPostObj,
   type Selection,
   toDosTimeDate,
@@ -818,6 +821,225 @@ describe('DownloadObject / PostObject の archive path 割り当て', () => {
     expect(json.postCount).toBe(2);
     // fileCount はカバーを含めない (従来の countFile と同じ意味論)
     expect(json.fileCount).toBe(1);
+  });
+});
+
+describe('DownloadObject.listPosts', () => {
+  const utils = new DownloadUtils();
+  const fileKey = (assetId: string): BodyAssetKey => ({ kind: 'file', assetId });
+
+  /**
+   * 2 つの型が同値かを判定する。
+   *
+   * 片方向の `extends` だと、広がり (`AssetSummary` への差し戻し) は検出できるが、
+   * `never` や過剰な絞り込みは通ってしまう。公開型を固定するには同値である必要がある
+   */
+  type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? true : false;
+
+  // 型レベルの契約。実行時の key の値だけを見るテストでは、files や cover の要素型が
+  // AssetSummary へ戻る退行 (= カバーの席に本文アセットの鍵を置ける状態) を検出できない
+  const filesKeyIsBodyKey: Equal<PostSummary['files'][number]['key'], BodyAssetKey> = true;
+  const coverKeyIsCoverKey: Equal<NonNullable<PostSummary['cover']>['key'], CoverAssetKey> = true;
+
+  test('files の key の型は BodyAssetKey と、cover の key の型は CoverAssetKey と同値である', () => {
+    expect([filesKeyIsBodyKey, coverKeyIsCoverKey]).toEqual([true, true]);
+  });
+
+  test('収集順で全投稿の postId・name・tags を返す', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    downloadObject.addPost('p1', 'first').setTags(['tag-1']);
+    downloadObject.addPost('p2', 'second').setTags(['tag-2', 'tag-3']);
+
+    expect(downloadObject.listPosts().map(({ postId, name, tags }) => ({ postId, name, tags }))).toEqual([
+      { postId: 'p1', name: 'first', tags: ['tag-1'] },
+      { postId: 'p2', name: 'second', tags: ['tag-2', 'tag-3'] },
+    ]);
+  });
+
+  test('投稿とアセットの形は宣言したフィールドだけで、url や archive path を含まない', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('p1', 'post');
+    post.setInfo('{"postId":"p1"}');
+    post.setTags(['tag-1']);
+    post.setCover('cover', 'png', 'cover-url');
+    const file = post.addFile({ key: imageKey('i1'), name: 'image', extension: 'png', url: 'image-url' });
+    post.setHtml(post.getImageLinkTag(file));
+
+    // 部分的に射影して比較すると、url や info が増えても通ってしまう。丸ごと突き合わせる
+    expect(downloadObject.listPosts()).toEqual([
+      {
+        postId: 'p1',
+        name: 'post',
+        tags: ['tag-1'],
+        files: [{ key: { kind: 'image', assetId: 'i1' }, name: 'image', extension: '.png', metadata: {} }],
+        cover: { key: { kind: 'cover' }, name: 'cover', extension: '.png', metadata: {} },
+      },
+    ]);
+  });
+
+  test('archive path の採番を走らせない', () => {
+    // allocator を呼んで結果を捨てる実装でも他のテストは通る。呼ばれたら落ちる allocator で塞ぐ
+    const refuse = (): never => {
+      throw new Error('listPosts が allocator を呼んだ');
+    };
+    const downloadObject = new DownloadObject('creator', utils, {
+      allocatePostDirectoryNames: refuse,
+      allocateAssetPaths: refuse,
+    });
+    const post = downloadObject.addPost('p1', 'post');
+    post.setCover('cover', 'png', 'cover-url');
+    post.addFile({ key: imageKey('i1'), name: 'image', extension: 'png', url: 'image-url' });
+
+    expect(() => downloadObject.listPosts()).not.toThrow();
+  });
+
+  test('設定した publishedDatetime と postType を投稿サマリーに保持する', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('p1', 'post');
+    post.setPublishedDatetime('2026-08-23T00:00:00.000Z');
+    post.setPostType('article');
+
+    const [summary] = downloadObject.listPosts();
+    expect(summary.publishedDatetime).toBe('2026-08-23T00:00:00.000Z');
+    expect(summary.postType).toBe('article');
+  });
+
+  test('未設定の publishedDatetime と postType はプロパティを持たない', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    downloadObject.addPost('p1', 'post');
+
+    const [summary] = downloadObject.listPosts();
+    expect('publishedDatetime' in summary).toBe(false);
+    expect('postType' in summary).toBe(false);
+  });
+
+  test.each([
+    ['JPG', '.jpg'],
+    ['', ''],
+  ])('拡張子 %s を正規化して %s として返す', (extension, expected) => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('p1', 'post');
+    post.addFile({ key: imageKey('i1'), name: 'image', extension, url: 'image-url' });
+
+    expect(downloadObject.listPosts()[0].files[0].extension).toBe(expected);
+  });
+
+  test('setCover のカバーを files から分離し未設定時は cover プロパティを持たない', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const withCover = downloadObject.addPost('p1', 'with-cover');
+    withCover.setCover('cover', 'JPG', 'cover-url');
+    withCover.addFile({ key: imageKey('i1'), name: 'body', extension: 'png', url: 'body-url' });
+    downloadObject.addPost('p2', 'without-cover');
+
+    const [covered, uncovered] = downloadObject.listPosts();
+    expect(covered.files).toHaveLength(1);
+    expect(covered.cover).toEqual({
+      key: { kind: 'cover' },
+      name: 'cover',
+      extension: '.jpg',
+      metadata: {},
+    });
+    expect(uncovered.files).toEqual([]);
+    expect('cover' in uncovered).toBe(false);
+  });
+
+  test('addFile のメタデータを保持し省略時は空オブジェクトを返す', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('p1', 'post');
+    post.addFile({
+      key: imageKey('i1'),
+      name: 'image',
+      extension: 'png',
+      url: 'image-url',
+      metadata: { size: 42, width: 640, height: 480 },
+    });
+    post.addFile({ key: fileKey('f1'), name: 'file', extension: 'zip', url: 'file-url' });
+
+    const [summary] = downloadObject.listPosts();
+    expect(summary.files[0].metadata).toEqual({ size: 42, width: 640, height: 480 });
+    expect(summary.files[1].metadata).toEqual({});
+  });
+
+  test('返した metadata を変更しても次回の listPosts に影響しない', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('p1', 'post');
+    post.addFile({
+      key: imageKey('i1'),
+      name: 'image',
+      extension: 'png',
+      url: 'image-url',
+      metadata: { width: 640, height: 480 },
+    });
+
+    const first = downloadObject.listPosts();
+    Object.assign(first[0].files[0].metadata, { width: 1 });
+
+    expect(downloadObject.listPosts()[0].files[0].metadata).toEqual({ width: 640, height: 480 });
+  });
+
+  test('返した files 配列への追加が project の出力を変更しない', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('p1', 'post');
+    post.addFile({ key: imageKey('i1'), name: 'image', extension: 'png', url: 'image-url' });
+
+    const before = JSON.stringify(downloadObject.project(downloadObject.selectAll(), { now: FIXED_NOW }));
+    const summaries = downloadObject.listPosts();
+    const files = summaries[0].files as unknown as BodyAssetSummary[];
+    files.push(files[0]);
+    const after = JSON.stringify(downloadObject.project(downloadObject.selectAll(), { now: FIXED_NOW }));
+
+    expect(after).toBe(before);
+  });
+
+  test.each([0, 1])('listPosts の %i 番目の投稿オブジェクトを呼び出しごとに作り直す', (index) => {
+    const downloadObject = new DownloadObject('creator', utils);
+    downloadObject.addPost('p1', 'first');
+    downloadObject.addPost('p2', 'second');
+
+    const first = downloadObject.listPosts();
+    const second = downloadObject.listPosts();
+    expect(first).not.toBe(second);
+    expect(first[index]).not.toBe(second[index]);
+  });
+
+  test('tags・files・アセット・cover も呼び出しごとに作り直し、key だけ共有する', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('p1', 'post');
+    post.setTags(['tag-1']);
+    const cover = post.setCover('cover', 'png', 'cover-url');
+    post.addFile({ key: imageKey('i1'), name: 'image', extension: 'png', url: 'image-url' });
+
+    const [first] = downloadObject.listPosts();
+    const [second] = downloadObject.listPosts();
+    // 内部表現と分離した summary をキャッシュして返す退行を、ここで塞ぐ
+    expect(first.tags).not.toBe(second.tags);
+    expect(first.files).not.toBe(second.files);
+    expect(first.files[0]).not.toBe(second.files[0]);
+    expect(first.files[0].metadata).not.toBe(second.files[0].metadata);
+    expect(first.cover).not.toBe(second.cover);
+    expect(first.cover?.metadata).not.toBe(second.cover?.metadata);
+    expect(first.files[0].key).toBe(second.files[0].key);
+    // 呼び出し間で同じであるだけでは足りない。別途キャッシュした鍵を返す実装でも通るので、
+    // 内部の FileObj.key そのものを返していることまで確かめる
+    expect(first.cover?.key).toBe(cover.getKey() as CoverAssetKey);
+    expect(second.cover?.key).toBe(cover.getKey() as CoverAssetKey);
+    expect(Object.isFrozen(first.cover?.key)).toBe(true);
+  });
+
+  test('files の key は addFile の getKey と同一で凍結されている', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+    const post = downloadObject.addPost('p1', 'post');
+    const file = post.addFile({ key: imageKey('i1'), name: 'image', extension: 'png', url: 'image-url' });
+
+    const summary = downloadObject.listPosts()[0].files[0];
+    expect(summary.key).toBe(file.getKey() as BodyAssetKey);
+    expect(Object.isFrozen(summary.key)).toBe(true);
+  });
+
+  test('投稿がないと空配列を返す', () => {
+    const downloadObject = new DownloadObject('creator', utils);
+
+    expect(downloadObject.listPosts()).toEqual([]);
   });
 });
 

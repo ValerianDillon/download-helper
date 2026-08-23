@@ -60,6 +60,20 @@ finalize では衝突を検出しない。legacy 自身が作れる衝突を例�
 - root の `tags` は選択後の投稿に残っているものだけを出す。`setTags` の並び (支援額タグを先頭に置く) は保つ
 - 「絞り込まずに全部落とす」も projection を経た結果として表す (`selectAll()`)。ZIP 入力の経路を 1 本にするため、`stringify()` は `project(selectAll())` に委譲する
 
+### 選択 UI 向けの読み取りビュー (Issue #49)
+
+`DownloadObject.listPosts()` が収集済みの投稿を `PostSummary[]` として返す。
+利用側が `Selection` を組み立てるための提示に使う。
+
+- 内部表現の複製を返す。`PostObj` / `FileObj` をそのまま返すと、`readonly` を外した参照から収集結果を書き換えられ、`project()` の出力が UI の提示と食い違う。`key` だけは `freezeAssetKey` 済みなので共有する
+- `html` / `info` / `url` は含めない。選択の提示に使わない値を公開 API に載せると利用側が収集結果をもう一部保持することになる (`info` は投稿 1 件分の情報ファイルの中身そのものなので特に大きい)
+- `extension` は `normalizeExtension` を通した形。`Selection.extensions` とそのまま突き合わせられる
+- カバーは `files` に混ぜず `cover` に分ける。拡張子の選択は `files` にだけ効き、カバーは `includeCover` だけで決まるという `Selection` の意味論に合わせる
+- archive path は返さず、allocator も呼ばない。含めると選択が変わるたびに採番を走らせることになる
+
+サイズを `DownloadManifest` に足す形は採らない。
+ZIP に書き出すスキーマの変更になるうえ、選択画面は ZIP 生成の前に出るので manifest では間に合わない。
+
 ### 除外されたアセットの描画
 
 カードごとプレースホルダーに差し替える。カードを消すと、後からアーカイブを見たときに元の投稿に何が含まれていたかが失われる。画像・動画・音声のカードは `src` でも参照するので、リンクを無効化するだけでは実在しないファイルを読みに行くカードが残る。
