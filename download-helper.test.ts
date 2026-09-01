@@ -348,6 +348,10 @@ describe('DownloadObject snapshot', () => {
   test.each([
     ['schemaVersion', (value: Record<string, unknown>) => (value.schemaVersion = 2)],
     [
+      'javascript creator URL',
+      (value: Record<string, unknown>) => (value.url = 'javascript:fetch("https://evil.test")'),
+    ],
+    [
       '本文アセットの cover key',
       (value: Record<string, unknown>) =>
         ((value.posts as Array<{ files: Array<{ key: unknown }> }>)[0].files[0].key = { kind: 'cover' }),

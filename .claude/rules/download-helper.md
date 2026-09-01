@@ -70,6 +70,7 @@ archive path は保持せず、復元時に現在の利用側が `ArchivePathAll
 差分ダウンロードの凍結名は利用側の履歴が所有する情報であり、収集結果へ混ぜない。
 
 外部 JSON を受ける `fromSnapshot()` は、配列の hole、型、metadata の非負整数、本文アセット key の重複、HTML カードと参照先 key の一致、カード key が投稿のアセットとして存在することを検証する。
+ルート HTML の creator link に入る URL は `#main` または有効な HTTP(S) URL に制限する。
 snapshot の HTML 文字列は collector と helper が生成する静的なタグ・属性・URL scheme の部分集合に制限し、event handler や script を ZIP 内の HTML へ持ち込ませない。
 返した snapshot と復元後の内部表現は参照を共有しない。
 

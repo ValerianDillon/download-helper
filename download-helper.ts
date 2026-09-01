@@ -1142,6 +1142,19 @@ function snapshotString(value: unknown, path: string): string {
   return value;
 }
 
+/** ルート HTML の creator link に入る URL を実行可能な scheme にしない。 */
+function snapshotRootUrl(value: unknown, path: string): string {
+  const url = snapshotString(value, path);
+  if (url === '#main') return url;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return url;
+  } catch {
+    // 下の共通エラーへ畳む。
+  }
+  throw new Error(`DownloadObject snapshot の ${path} が安全な HTTP(S) URL または #main ではありません`);
+}
+
 function snapshotOptionalString(value: unknown, path: string): string | undefined {
   return value === undefined ? undefined : snapshotString(value, path);
 }
@@ -1431,7 +1444,7 @@ function decodeDownloadObjectSnapshot(value: unknown): DownloadObjectSnapshot {
   return {
     schemaVersion: 1,
     id: snapshotString(root.id, 'id'),
-    url: snapshotString(root.url, 'url'),
+    url: snapshotRootUrl(root.url, 'url'),
     tags,
     posts,
   };

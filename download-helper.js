@@ -408,6 +408,17 @@ function snapshotString(value, path) {
     throw new Error(`DownloadObject snapshot の ${path} が string ではありません`);
   return value;
 }
+function snapshotRootUrl(value, path) {
+  const url = snapshotString(value, path);
+  if (url === "#main")
+    return url;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:")
+      return url;
+  } catch {}
+  throw new Error(`DownloadObject snapshot の ${path} が安全な HTTP(S) URL または #main ではありません`);
+}
 function snapshotOptionalString(value, path) {
   return value === undefined ? undefined : snapshotString(value, path);
 }
@@ -692,7 +703,7 @@ function decodeDownloadObjectSnapshot(value) {
   return {
     schemaVersion: 1,
     id: snapshotString(root.id, "id"),
-    url: snapshotString(root.url, "url"),
+    url: snapshotRootUrl(root.url, "url"),
     tags,
     posts
   };
