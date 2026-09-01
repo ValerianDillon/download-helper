@@ -220,6 +220,56 @@ export class DownloadObject {
       ...post.postType !== undefined ? { postType: post.postType } : {}
     }));
   }
+  exportSnapshot() {
+    return {
+      schemaVersion: 1,
+      id: this.downloadObj.id,
+      url: this.url,
+      tags: this.tags === undefined ? null : [...this.tags],
+      posts: this.downloadObj.posts.map((post) => ({
+        postId: post.postId,
+        name: post.name,
+        info: post.info,
+        files: post.files.map((file) => cloneBodyFile(file)),
+        html: post.html.map((fragment) => cloneHtmlFragment(fragment)),
+        tags: [...post.tags],
+        ...post.cover ? { cover: cloneCoverFile(post.cover) } : {},
+        ...post.publishedDatetime !== undefined ? { publishedDatetime: post.publishedDatetime } : {},
+        ...post.updatedDatetime !== undefined ? { updatedDatetime: post.updatedDatetime } : {},
+        ...post.postType !== undefined ? { postType: post.postType } : {}
+      }))
+    };
+  }
+  static fromSnapshot(value, utils, allocator) {
+    let snapshot;
+    try {
+      snapshot = decodeDownloadObjectSnapshot(value);
+    } catch (error) {
+      throw new Error(`DownloadObject snapshot を復元できません: ${error instanceof Error ? error.message : String(error)}`, {
+        cause: error
+      });
+    }
+    const result = new DownloadObject(snapshot.id, utils, allocator);
+    result.url = snapshot.url;
+    result.tags = snapshot.tags === null ? undefined : [...snapshot.tags];
+    for (const source of snapshot.posts) {
+      const post = {
+        postId: source.postId,
+        name: source.name,
+        info: source.info,
+        files: source.files.map((file) => cloneBodyFile(file)),
+        html: source.html.map((fragment) => freezeFragment(fragment)),
+        tags: [...source.tags],
+        ...source.cover ? { cover: cloneCoverFile(source.cover) } : {},
+        ...source.publishedDatetime !== undefined ? { publishedDatetime: source.publishedDatetime } : {},
+        ...source.updatedDatetime !== undefined ? { updatedDatetime: source.updatedDatetime } : {},
+        ...source.postType !== undefined ? { postType: source.postType } : {}
+      };
+      result.downloadObj.posts.push(post);
+      result.orderedPosts.push(new PostObject(post, utils));
+    }
+    return result;
+  }
   project(selection, options) {
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
     assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
@@ -322,6 +372,162 @@ function freezeFragment(fragment) {
   return Object.freeze({
     assetCard: Object.freeze({ key: freezeAssetKey(assetCard.key), body: Object.freeze(body) })
   });
+}
+function cloneMetadata(metadata) {
+  return { ...metadata };
+}
+function cloneBodyFile(file) {
+  return {
+    key: freezeAssetKey(file.key),
+    name: file.name,
+    extension: file.extension,
+    url: file.url,
+    metadata: cloneMetadata(file.metadata)
+  };
+}
+function cloneCoverFile(file) {
+  return {
+    key: freezeAssetKey(file.key),
+    name: file.name,
+    extension: file.extension,
+    url: file.url,
+    metadata: cloneMetadata(file.metadata)
+  };
+}
+function cloneHtmlFragment(fragment) {
+  return freezeFragment(fragment);
+}
+function snapshotRecord(value, path) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`DownloadObject snapshot の ${path} が object ではありません`);
+  }
+  return value;
+}
+function snapshotString(value, path) {
+  if (typeof value !== "string")
+    throw new Error(`DownloadObject snapshot の ${path} が string ではありません`);
+  return value;
+}
+function snapshotOptionalString(value, path) {
+  return value === undefined ? undefined : snapshotString(value, path);
+}
+function decodeSnapshotArray(value, path, decode) {
+  if (!Array.isArray(value))
+    throw new Error(`DownloadObject snapshot の ${path} が array ではありません`);
+  const result = [];
+  for (let index = 0;index < value.length; index++) {
+    if (!(index in value))
+      throw new Error(`DownloadObject snapshot の ${path}[${index}] が欠落しています`);
+    result.push(decode(value[index], `${path}[${index}]`));
+  }
+  return result;
+}
+function snapshotStringArray(value, path) {
+  return decodeSnapshotArray(value, path, snapshotString);
+}
+function snapshotMetadata(value, path) {
+  const record = snapshotRecord(value, path);
+  const result = {};
+  for (const key of ["size", "width", "height"]) {
+    const item = record[key];
+    if (item === undefined)
+      continue;
+    if (typeof item !== "number" || !Number.isSafeInteger(item) || item < 0) {
+      throw new Error(`DownloadObject snapshot の ${path}.${key} が非負の安全な整数ではありません`);
+    }
+    result[key] = item;
+  }
+  return result;
+}
+function snapshotBodyKey(value, path) {
+  const record = snapshotRecord(value, path);
+  if (record.kind !== "image" && record.kind !== "file") {
+    throw new Error(`DownloadObject snapshot の ${path}.kind が image/file ではありません`);
+  }
+  const assetId = snapshotString(record.assetId, `${path}.assetId`);
+  if (assetId === "")
+    throw new Error(`DownloadObject snapshot の ${path}.assetId が空です`);
+  return freezeAssetKey({ kind: record.kind, assetId });
+}
+function snapshotAssetKey(value, path) {
+  const record = snapshotRecord(value, path);
+  return record.kind === "cover" ? freezeAssetKey({ kind: "cover" }) : snapshotBodyKey(record, path);
+}
+function snapshotBodyFile(value, path) {
+  const record = snapshotRecord(value, path);
+  return {
+    key: snapshotBodyKey(record.key, `${path}.key`),
+    name: snapshotString(record.name, `${path}.name`),
+    extension: snapshotString(record.extension, `${path}.extension`),
+    url: snapshotString(record.url, `${path}.url`),
+    metadata: snapshotMetadata(record.metadata, `${path}.metadata`)
+  };
+}
+function snapshotCoverFile(value, path) {
+  const record = snapshotRecord(value, path);
+  const key = snapshotRecord(record.key, `${path}.key`);
+  if (key.kind !== "cover")
+    throw new Error(`DownloadObject snapshot の ${path}.key.kind が cover ではありません`);
+  return {
+    key: freezeAssetKey({ kind: "cover" }),
+    name: snapshotString(record.name, `${path}.name`),
+    extension: snapshotString(record.extension, `${path}.extension`),
+    url: snapshotString(record.url, `${path}.url`),
+    metadata: snapshotMetadata(record.metadata, `${path}.metadata`)
+  };
+}
+function snapshotHtmlFragment(value, path) {
+  if (typeof value === "string")
+    return value;
+  const record = snapshotRecord(value, path);
+  const card = snapshotRecord(record.assetCard, `${path}.assetCard`);
+  const key = snapshotAssetKey(card.key, `${path}.assetCard.key`);
+  const body = decodeSnapshotArray(card.body, `${path}.assetCard.body`, (item, itemPath) => {
+    if (typeof item === "string")
+      return item;
+    const ref = snapshotRecord(item, itemPath);
+    return { assetRef: snapshotAssetKey(ref.assetRef, `${itemPath}.assetRef`) };
+  });
+  return freezeFragment({ assetCard: { key, body } });
+}
+function decodeDownloadObjectSnapshot(value) {
+  const root = snapshotRecord(value, "root");
+  if (root.schemaVersion !== 1)
+    throw new Error("DownloadObject snapshot の schemaVersion が 1 ではありません");
+  const tags = root.tags === null ? null : snapshotStringArray(root.tags, "tags");
+  const posts = decodeSnapshotArray(root.posts, "posts", (item, path) => {
+    const post = snapshotRecord(item, path);
+    const files = decodeSnapshotArray(post.files, `${path}.files`, snapshotBodyFile);
+    const seen = new Set;
+    for (const file of files) {
+      const identity = assetKeyToString(file.key);
+      if (seen.has(identity))
+        throw new Error(`DownloadObject snapshot の ${path}.files に重複した ${identity} があります`);
+      seen.add(identity);
+    }
+    const publishedDatetime = snapshotOptionalString(post.publishedDatetime, `${path}.publishedDatetime`);
+    const updatedDatetime = snapshotOptionalString(post.updatedDatetime, `${path}.updatedDatetime`);
+    const postType = snapshotOptionalString(post.postType, `${path}.postType`);
+    return {
+      postId: snapshotString(post.postId, `${path}.postId`),
+      name: snapshotString(post.name, `${path}.name`),
+      info: snapshotString(post.info, `${path}.info`),
+      files,
+      html: decodeSnapshotArray(post.html, `${path}.html`, snapshotHtmlFragment),
+      tags: snapshotStringArray(post.tags, `${path}.tags`),
+      ...post.cover === undefined ? {} : { cover: snapshotCoverFile(post.cover, `${path}.cover`) },
+      ...publishedDatetime === undefined ? {} : { publishedDatetime },
+      ...updatedDatetime === undefined ? {} : { updatedDatetime },
+      ...postType === undefined ? {} : { postType }
+    };
+  });
+  return {
+    schemaVersion: 1,
+    id: snapshotString(root.id, "id"),
+    url: snapshotString(root.url, "url"),
+    tags,
+    posts
+  };
 }
 function card(fileObject, body) {
   return [{ assetCard: { key: fileObject.getKey(), body } }];

@@ -36,6 +36,32 @@ export type PostObj = {
     postType?: string;
 };
 /**
+ * 収集済みの DownloadObject を、選択前の状態で持ち運ぶための JSON 形式。
+ *
+ * `DownloadJsonObj` は選択後の完成形なので、そこから添付を外しても HTML のアセット参照を
+ * 作り直せない。この snapshot は `HtmlFragment` と `AssetKey` を保持し、import 後も通常の
+ * `listPosts()` / `project()` を使えるようにする。
+ */
+export type DownloadObjectSnapshot = {
+    readonly schemaVersion: 1;
+    readonly id: string;
+    readonly url: string;
+    /** `setTags` が呼ばれていなければ null。空配列とは区別する。 */
+    readonly tags: readonly string[] | null;
+    readonly posts: readonly {
+        readonly postId: string;
+        readonly name: string;
+        readonly info: string;
+        readonly files: readonly Readonly<BodyFileObj>[];
+        readonly html: readonly HtmlFragment[];
+        readonly tags: readonly string[];
+        readonly cover?: Readonly<CoverFileObj>;
+        readonly publishedDatetime?: string;
+        readonly updatedDatetime?: string;
+        readonly postType?: string;
+    }[];
+};
+/**
  * 本文中のアセットの種別
  *
  * FANBOX が返すどのコレクション由来か (images / imageMap か、files / fileMap か) を表す。
@@ -588,6 +614,23 @@ export declare class DownloadObject {
      * 採番を走らせることになる)。
      */
     listPosts(): PostSummary[];
+    /**
+     * 選択前の収集結果を、JSON 直列化できる独立した snapshot として返す。
+     *
+     * 返した値を変更してもこの DownloadObject は変わらない。URL を含むため、利用側は
+     * FANBOX の投稿情報と同じ機密性を持つファイルとして扱う必要がある。
+     */
+    exportSnapshot(): DownloadObjectSnapshot;
+    /**
+     * `exportSnapshot()` の JSON 往復結果から、選択可能な DownloadObject を復元する。
+     *
+     * 外部ファイルを受け取る入口なので、型だけでなくアセット identity、HTML 内参照、metadata を
+     * 検証する。archive path の規則は snapshot に含めず、現在の利用側が allocator を渡す。
+     * @param value `JSON.parse` した snapshot
+     * @param utils 復元後に使うユーティリティ
+     * @param allocator 現在の archive path 割り当て器
+     */
+    static fromSnapshot(value: unknown, utils: DownloadUtils, allocator?: ArchivePathAllocator): DownloadObject;
     /**
      * 選択条件からダウンロード対象を導出する。
      *

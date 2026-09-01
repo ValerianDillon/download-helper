@@ -281,6 +281,98 @@ describe('DownloadUtils', () => {
   });
 });
 
+describe('DownloadObject snapshot', () => {
+  function createCollectedObject(): DownloadObject {
+    const utils = new DownloadUtils();
+    const object = new DownloadObject('creator', utils);
+    object.setUrl('https://creator.fanbox.cc/');
+    object.setTags(['支援額: 500円', 'tag']);
+    const post = object.addPost('post-1', '投稿タイトル');
+    post.setInfo(JSON.stringify({ id: 'post-1', title: '投稿タイトル' }));
+    post.setTags(['tag']);
+    post.setPublishedDatetime('2025-01-02T03:04:05+09:00');
+    post.setUpdatedDatetime('2025-02-03T04:05:06+09:00');
+    post.setPostType('article');
+    const image = post.addFile({
+      key: { kind: 'image', assetId: 'image-1' },
+      name: '画像',
+      extension: 'png',
+      url: 'https://downloads.fanbox.cc/image.png',
+      metadata: { width: 640, height: 480 },
+    });
+    const file = post.addFile({
+      key: { kind: 'file', assetId: 'file-1' },
+      name: '資料',
+      extension: 'zip',
+      url: 'https://downloads.fanbox.cc/file.zip',
+      metadata: { size: 1234 },
+    });
+    post.setCover('カバー', 'jpg', 'https://downloads.fanbox.cc/cover.jpg');
+    post.setHtml(['<p>本文</p>', ...post.getAutoAssignedLinkTag(image), ...post.getAutoAssignedLinkTag(file)]);
+    return object;
+  }
+
+  test('JSON 往復後も listPosts と任意選択の project が一致する', () => {
+    const source = createCollectedObject();
+    const restored = DownloadObject.fromSnapshot(
+      JSON.parse(JSON.stringify(source.exportSnapshot())),
+      new DownloadUtils(),
+    );
+    const selection: Selection = {
+      postIds: new Set(['post-1']),
+      extensions: new Set(['.png']),
+      includeCover: false,
+      includeBody: true,
+    };
+    const options = { now: new Date('2026-01-02T03:04:05Z') };
+
+    expect(restored.listPosts()).toEqual(source.listPosts());
+    expect(restored.project(selection, options)).toEqual(source.project(selection, options));
+    expect(restored.project(selection, options).posts[0].htmlText).toContain('選択条件により除外しました');
+  });
+
+  test('export した値を変更しても元の DownloadObject は変わらない', () => {
+    const source = createCollectedObject();
+    const before = source.listPosts();
+    const snapshot = source.exportSnapshot() as unknown as {
+      tags: string[];
+      posts: Array<{ name: string; files: Array<{ metadata: { width?: number } }> }>;
+    };
+    snapshot.tags[0] = 'changed';
+    snapshot.posts[0].name = 'changed';
+    snapshot.posts[0].files[0].metadata.width = 1;
+
+    expect(source.listPosts()).toEqual(before);
+  });
+
+  test.each([
+    ['schemaVersion', (value: Record<string, unknown>) => (value.schemaVersion = 2)],
+    [
+      '本文アセットの cover key',
+      (value: Record<string, unknown>) =>
+        ((value.posts as Array<{ files: Array<{ key: unknown }> }>)[0].files[0].key = { kind: 'cover' }),
+    ],
+    [
+      'カードと異なる参照先',
+      (value: Record<string, unknown>) => {
+        const posts = value.posts as Array<{ html: Array<string | { assetCard: { body: Array<unknown> } }> }>;
+        const card = posts[0].html.find((fragment) => typeof fragment !== 'string');
+        if (typeof card !== 'string' && card !== undefined)
+          card.assetCard.body[1] = { assetRef: { kind: 'file', assetId: 'file-1' } };
+      },
+    ],
+    [
+      '負の metadata',
+      (value: Record<string, unknown>) =>
+        ((value.posts as Array<{ files: Array<{ metadata: { width: number } }> }>)[0].files[0].metadata.width = -1),
+    ],
+  ])('%s を含む外部 snapshot を拒否する', (_label, mutate) => {
+    const value = JSON.parse(JSON.stringify(createCollectedObject().exportSnapshot())) as Record<string, unknown>;
+    mutate(value);
+    expect(() => DownloadObject.fromSnapshot(value, new DownloadUtils())).toThrow('DownloadObject snapshot');
+  });
+});
+
 /** テスト用の最小 manifest (projection が付ける印) */
 /** JSON の投稿と 1 対 1 で対応する manifest を後付けする */
 const withManifest = (obj: Omit<DownloadJsonObj, 'manifest'>): DownloadJsonObj => ({

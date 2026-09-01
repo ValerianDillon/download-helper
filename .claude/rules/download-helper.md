@@ -57,6 +57,21 @@ finalize では衝突を検出しない。legacy 自身が作れる衝突を例�
 サイズを `DownloadManifest` に足す形は採らない。
 ZIP に書き出すスキーマの変更になるうえ、選択画面は ZIP 生成の前に出るので manifest では間に合わない。
 
+## 収集結果の import/export
+
+`DownloadObject.exportSnapshot()` は、選択前の収集結果を `DownloadObjectSnapshot` として返す。
+`DownloadObject.fromSnapshot()` は JSON 往復後の値を検証し、通常どおり `listPosts()` と `project()` を使える `DownloadObject` に戻す。
+
+`DownloadJsonObj` を import 元にはしない。
+これは選択後の完成形であり、除外済みアセットの `AssetKey` と HTML 断片を持たないため、別の選択条件へ安全に導出し直せない。
+
+snapshot は URL、投稿情報、HTML 断片、metadata、アセット identity を保持する。
+archive path は保持せず、復元時に現在の利用側が `ArchivePathAllocator` を渡す。
+差分ダウンロードの凍結名は利用側の履歴が所有する情報であり、収集結果へ混ぜない。
+
+外部 JSON を受ける `fromSnapshot()` は、配列の hole、型、metadata の非負整数、本文アセット key の重複、HTML カードと参照先 key の一致を検証する。
+返した snapshot と復元後の内部表現は参照を共有しない。
+
 ## 除外されたアセットの描画
 
 カードごとプレースホルダーに差し替える。カードを消すと、後からアーカイブを見たときに元の投稿に何が含まれていたかが失われる。画像・動画・音声のカードは `src` でも参照するので、リンクを無効化するだけでは実在しないファイルを読みに行くカードが残る。
