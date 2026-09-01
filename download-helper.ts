@@ -1,4 +1,4 @@
-import { Uint8ArrayReader, ZipWriter as ZipJsWriter } from '@zip.js/zip.js';
+import { ZipWriter as ZipJsWriter } from '@zip.js/zip.js/lib/zip-core-writer.js';
 
 /**
  * ダウンロード用のObject
@@ -2423,10 +2423,20 @@ class Zip64StreamWriter {
   }
 
   async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
-    await this.writer.add(name, new Uint8ArrayReader(data), {
-      level: 0,
-      ...zipDateOptions(date),
+    const readable = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(data);
+        controller.close();
+      },
     });
+    await this.writer.add(
+      name,
+      { readable, size: data.length },
+      {
+        level: 0,
+        ...zipDateOptions(date),
+      },
+    );
   }
 
   async addDirectory(name: string, date?: Date): Promise<void> {

@@ -1,4 +1,4 @@
-import { Uint8ArrayReader, ZipWriter as ZipJsWriter } from "@zip.js/zip.js";
+import { ZipWriter as ZipJsWriter } from "@zip.js/zip.js/lib/zip-core-writer.js";
 function freezeAssetKey(key) {
   return Object.freeze(key.kind === "cover" ? { kind: "cover" } : { kind: key.kind, assetId: key.assetId });
 }
@@ -1157,7 +1157,13 @@ class Zip64StreamWriter {
     });
   }
   async addFile(name, data, date) {
-    await this.writer.add(name, new Uint8ArrayReader(data), {
+    const readable = new ReadableStream({
+      start(controller) {
+        controller.enqueue(data);
+        controller.close();
+      }
+    });
+    await this.writer.add(name, { readable, size: data.length }, {
       level: 0,
       ...zipDateOptions(date)
     });
