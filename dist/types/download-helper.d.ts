@@ -31,6 +31,7 @@ export type PostObj = {
     tags: string[];
     cover?: CoverFileObj;
     publishedDatetime?: string;
+    updatedDatetime?: string;
     /** FANBOX の投稿タイプ。収集結果の絞り込み条件として利用側が読む (この層では使わない) */
     postType?: string;
 };
@@ -163,6 +164,8 @@ export type Selection = {
     readonly extensions: ReadonlySet<string>;
     /** カバーを含めるか */
     readonly includeCover: boolean;
+    /** 投稿本文の HTML を含めるか */
+    readonly includeBody?: boolean;
 };
 /**
  * 拡張子を `Selection` と突き合わせられる形に正規化する。
@@ -213,6 +216,7 @@ export type PostSummary = {
     readonly files: readonly BodyAssetSummary[];
     readonly cover?: CoverAssetSummary;
     readonly publishedDatetime?: string;
+    readonly updatedDatetime?: string;
     readonly postType?: string;
 };
 /**
@@ -279,6 +283,7 @@ export type DownloadManifest = {
         readonly postIds: readonly string[];
         readonly extensions: readonly string[];
         readonly includeCover: boolean;
+        readonly includeBody: boolean;
     };
     /** 選択された投稿。収集順。含めた / 除外したアセットをこの下に持つ */
     readonly posts: readonly ManifestPost[];
@@ -305,10 +310,12 @@ export declare function joinHtmlFragments(parts: readonly HtmlFragment[][], sepa
  */
 export type DownloadJsonObj = {
     posts: {
+        postId: string;
         originalName: string;
         encodedName: string;
         informationText: string;
         htmlText: string;
+        bodyIncluded: boolean;
         files: {
             url: string;
             originalName: string;
@@ -320,6 +327,8 @@ export type DownloadJsonObj = {
             name: string;
         };
         publishedDatetime?: string;
+        updatedDatetime?: string;
+        postType?: string;
     }[];
     id: string;
     url: string;
@@ -472,6 +481,7 @@ export type ReadonlyPostObj = {
     readonly tags: readonly string[];
     readonly cover?: Readonly<CoverFileObj>;
     readonly publishedDatetime?: string;
+    readonly updatedDatetime?: string;
     readonly postType?: string;
 };
 /**
@@ -623,6 +633,7 @@ export declare class PostObject {
     setHtml(html: HtmlFragment[]): void;
     setTags(tags: string[]): void;
     setPublishedDatetime(iso: string): void;
+    setUpdatedDatetime(iso: string): void;
     /**
      * FANBOX の投稿タイプを保持する。この層では使わず、利用側の絞り込み条件のために持つ
      * @param type 投稿タイプ
@@ -657,7 +668,7 @@ export declare class PostObject {
      * @param allocator 投稿内アセットの割り当て器
      * @param includedKeys 出力に含めるアセット (assetKeyToString)
      */
-    projectPost(directoryName: string, allocator: ArchivePathAllocator, includedKeys: ReadonlySet<string>): ProjectedPost;
+    projectPost(directoryName: string, allocator: ArchivePathAllocator, includedKeys: ReadonlySet<string>, includeBody: boolean): ProjectedPost;
     /**
      * allocator にこの投稿のアセットを割り当てさせ、契約を満たしていることを確かめる
      * @param allocator 投稿内アセットの割り当て器
@@ -1029,8 +1040,10 @@ export declare class ZipWriter {
 export type PostWritePlan = {
     /** 投稿ディレクトリ名 (ZIP ルート直下) */
     readonly directory: string;
-    /** 情報ファイル名 (`createInformationFile` の名前を `encodeFileName` に通したもの) */
-    readonly informationFileName: string;
+    /** 投稿メタデータの固定ファイル名 (`post.json`) */
+    readonly metadataFileName: string;
+    /** 投稿本文の index.html を書くか */
+    readonly bodyIncluded: boolean;
     /** カバーの archive 名。カバーが無ければ undefined */
     readonly coverName?: string;
     /** 添付の archive 名。`json.posts[].files` と同じ並び */
@@ -1131,7 +1144,7 @@ export declare class DownloadHelper {
     private readonly utils;
     /**
      * @param utils ダウンロード用ユーティリティ。
-     *   **`encodeFileName` と `createInformationFile` が返す名前は決定的でなければならない**
+     *   **`encodeFileName` が返す名前は決定的でなければならない**
      *   (同じ引数には同じ名前を返し、副作用を持たず、有効な入力で例外を投げない)。
      *   利用側が自分で picker を開く経路では `preflight` が 2 回走る (利用側の事前実行と `downloadZip`
      *   冒頭の実行)。呼び出しごとに違う名前を返す実装を渡すと 2 回の結果が食い違い、事前検証を通った

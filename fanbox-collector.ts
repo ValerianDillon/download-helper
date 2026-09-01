@@ -169,7 +169,8 @@ type UrlEmbedInfo =
 /** articleタイプのBlock構成要素。*Id は decode 時に文字列を必須にしている */
 type ImageBlock = { type: 'image'; imageId: string };
 type FileBlock = { type: 'file'; fileId: string };
-type TextBlock = { type: 'p' | 'header'; text: string };
+type InlineLink = { offset: number; length: number; url: string };
+type TextBlock = { type: 'p' | 'header'; text: string; links: InlineLink[] };
 type EmbedBlock = { type: 'embed'; embedId: string };
 type UrlEmbedBlock = { type: 'url_embed'; urlEmbedId: string };
 /**
@@ -425,8 +426,11 @@ function decodeBlock(value: unknown): Block | undefined {
   const id = (key: string): string | undefined => (typeof value[key] === 'string' ? (value[key] as string) : undefined);
   switch (value.type) {
     case 'p':
-    case 'header':
-      return typeof value.text === 'string' ? { type: value.type, text: value.text } : undefined;
+    case 'header': {
+      if (typeof value.text !== 'string') return undefined;
+      const links = decodeInlineLinks(value.links, value.text.length);
+      return links === undefined ? undefined : { type: value.type, text: value.text, links };
+    }
     case 'image': {
       const imageId = id('imageId');
       return imageId === undefined ? undefined : { type: 'image', imageId };
@@ -446,6 +450,50 @@ function decodeBlock(value: unknown): Block | undefined {
     default:
       return { type: 'unknown', originalType: value.type };
   }
+}
+
+/** FANBOX の文字リンクを検証し、本文中の出現順に正規化する。 */
+function decodeInlineLinks(value: unknown, textLength: number): InlineLink[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return undefined;
+  const links: InlineLink[] = [];
+  for (const item of value) {
+    if (
+      !isRecord(item) ||
+      !Number.isSafeInteger(item.offset) ||
+      !Number.isSafeInteger(item.length) ||
+      (item.offset as number) < 0 ||
+      (item.length as number) <= 0 ||
+      typeof item.url !== 'string'
+    ) {
+      return undefined;
+    }
+    const offset = item.offset as number;
+    const length = item.length as number;
+    if (offset + length > textLength) return undefined;
+    links.push({ offset, length, url: item.url });
+  }
+  links.sort((a, b) => a.offset - b.offset);
+  for (let index = 1; index < links.length; index++) {
+    const previous = links[index - 1];
+    if (previous.offset + previous.length > links[index].offset) return undefined;
+  }
+  return links;
+}
+
+/** 文字列をエスケープしつつ FANBOX の範囲リンクを a 要素として復元する。 */
+function renderInlineLinks(block: TextBlock): string {
+  let cursor = 0;
+  const html: string[] = [];
+  for (const link of block.links) {
+    html.push(DownloadManage.utils.escapeHtml(block.text.slice(cursor, link.offset)));
+    const label = DownloadManage.utils.escapeHtml(block.text.slice(link.offset, link.offset + link.length));
+    const url = DownloadManage.utils.escapeHtml(link.url);
+    html.push(`<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+    cursor = link.offset + link.length;
+  }
+  html.push(DownloadManage.utils.escapeHtml(block.text.slice(cursor)));
+  return html.join('');
 }
 
 /**
@@ -759,6 +807,10 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
   if (typeof publishedDatetime === 'string' && publishedDatetime.length > 0) {
     postObject.setPublishedDatetime(publishedDatetime);
   }
+  const updatedDatetime = post.metadata.updatedDatetime;
+  if (typeof updatedDatetime === 'string' && updatedDatetime.length > 0) {
+    postObject.setUpdatedDatetime(updatedDatetime);
+  }
   postObject.setTags([downloadManage.getTagByFee(post.feeRequired), ...post.tags]);
   downloadManage.addFee(post.feeRequired);
   downloadManage.addTags(...post.tags);
@@ -822,9 +874,9 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
         post.body.blocks.map((it): HtmlFragment[] => {
           switch (it.type) {
             case 'p':
-              return [`<span>${DownloadManage.utils.escapeHtml(it.text)}</span>`];
+              return [`<span>${renderInlineLinks(it)}</span>`];
             case 'header':
-              return [`<h2><span>${DownloadManage.utils.escapeHtml(it.text)}</span></h2>`];
+              return [`<h2><span>${renderInlineLinks(it)}</span></h2>`];
             case 'file': {
               if (cntFile >= files.length) return [];
               return postObject.getAutoAssignedLinkTag(files[cntFile++]);

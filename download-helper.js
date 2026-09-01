@@ -1,3 +1,4 @@
+import { Uint8ArrayReader, ZipWriter as ZipJsWriter } from "@zip.js/zip.js";
 function freezeAssetKey(key) {
   return Object.freeze(key.kind === "cover" ? { kind: "cover" } : { kind: key.kind, assetId: key.assetId });
 }
@@ -205,7 +206,7 @@ export class DownloadObject {
         extensions.add(normalizeExtension(file.extension));
       }
     }
-    return { postIds, extensions, includeCover: true };
+    return { postIds, extensions, includeCover: true, includeBody: true };
   }
   listPosts() {
     return this.downloadObj.posts.map((post) => ({
@@ -215,12 +216,14 @@ export class DownloadObject {
       files: post.files.map((file) => summarizeAsset(file)),
       ...post.cover ? { cover: summarizeAsset(post.cover) } : {},
       ...post.publishedDatetime !== undefined ? { publishedDatetime: post.publishedDatetime } : {},
+      ...post.updatedDatetime !== undefined ? { updatedDatetime: post.updatedDatetime } : {},
       ...post.postType !== undefined ? { postType: post.postType } : {}
     }));
   }
   project(selection, options) {
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
     assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
+    const includeBody = selection.includeBody !== false;
     const posts = [];
     const manifestPosts = [];
     const excludedPosts = [];
@@ -241,7 +244,7 @@ export class DownloadObject {
       if (postObj.cover && selection.includeCover) {
         includedKeys.add("cover");
       }
-      const projected = this.orderedPosts[index].projectPost(directoryNames[index], this.allocator, includedKeys);
+      const projected = this.orderedPosts[index].projectPost(directoryNames[index], this.allocator, includedKeys, includeBody);
       posts.push(projected.json);
       for (const tag of postObj.tags) {
         presentTags.add(tag);
@@ -277,7 +280,8 @@ export class DownloadObject {
         selection: {
           postIds: [...selection.postIds].sort(),
           extensions: [...selection.extensions].sort(),
-          includeCover: selection.includeCover
+          includeCover: selection.includeCover,
+          includeBody
         },
         posts: manifestPosts,
         excludedPosts
@@ -341,6 +345,9 @@ export class PostObject {
   }
   setPublishedDatetime(iso) {
     this.postObj.publishedDatetime = iso;
+  }
+  setUpdatedDatetime(iso) {
+    this.postObj.updatedDatetime = iso;
   }
   setPostType(type) {
     this.postObj.postType = type;
@@ -449,7 +456,7 @@ export class PostObject {
 </div></a>`
     ]);
   }
-  projectPost(directoryName, allocator, includedKeys) {
+  projectPost(directoryName, allocator, includedKeys, includeBody) {
     const { allocation, fileByKey, assetByKey } = this.allocateAssets(allocator);
     const pathByKey = new Map;
     for (const { key, archiveName } of allocation.files) {
@@ -461,17 +468,21 @@ export class PostObject {
     const cover = this.postObj.cover && includedKeys.has("cover") ? { url: this.postObj.cover.url, name: allocation.coverArchiveName } : undefined;
     return {
       json: {
+        postId: this.postObj.postId,
         originalName: this.postObj.name,
         encodedName: directoryName,
         informationText: this.postObj.info,
         htmlText: this.resolveHtml(pathByKey, includedKeys, assetByKey),
+        bodyIncluded: includeBody,
         files: allocation.files.filter(({ key }) => includedKeys.has(assetKeyToString(key))).map(({ key, archiveName }) => {
           const file = fileByKey.get(assetKeyToString(key));
           return { url: file.url, originalName: file.name, encodedName: archiveName };
         }),
         tags: [...this.postObj.tags],
         cover,
-        publishedDatetime: this.postObj.publishedDatetime
+        publishedDatetime: this.postObj.publishedDatetime,
+        updatedDatetime: this.postObj.updatedDatetime,
+        postType: this.postObj.postType
       },
       archiveNames: pathByKey
     };
@@ -922,14 +933,51 @@ export class ZipWriter {
     } catch {}
   }
 }
+
+class Zip64StreamWriter {
+  writable;
+  writer;
+  constructor(writable) {
+    this.writable = writable;
+    const stream = new WritableStream({
+      write: (chunk) => writable.write(chunk),
+      close: () => writable.close(),
+      abort: (reason) => writable.abort(reason)
+    });
+    this.writer = new ZipJsWriter(stream, {
+      extendedTimestamp: true,
+      level: 0,
+      useWebWorkers: false
+    });
+  }
+  async addFile(name, data, date) {
+    await this.writer.add(name, new Uint8ArrayReader(data), {
+      level: 0,
+      ...zipDateOptions(date)
+    });
+  }
+  async addDirectory(name, date) {
+    const directoryName = name.endsWith("/") ? name : `${name}/`;
+    await this.writer.add(directoryName, undefined, {
+      directory: true,
+      ...zipDateOptions(date)
+    });
+  }
+  async close() {
+    await this.writer.close();
+  }
+  async abort(reason) {
+    await this.writable.abort(reason);
+  }
+}
+function zipDateOptions(date) {
+  return date !== undefined && Number.isFinite(date.getTime()) ? { lastModDate: date } : { rawLastModDate: 0, extendedTimestamp: false };
+}
 function assertZipLimitsFromInput(plan) {
   const encoder = new TextEncoder;
   const byteLength = (value) => encoder.encode(value).length;
   const idBytes = byteLength(plan.encodedId);
   const separator = 1;
-  let entryCount = 0;
-  let localBytesLowerBound = 0;
-  let centralBytesLowerBound = 0;
   const assertNameLength = (nameBytes, describe) => {
     if (nameBytes > 65535) {
       throw new Error(`downloadZip: エントリ名が長すぎます (UTF-8 ${nameBytes} bytes, 上限 65535 bytes): ${JSON.stringify(describe())}`);
@@ -937,9 +985,6 @@ function assertZipLimitsFromInput(plan) {
   };
   const account = (nameBytes, describe) => {
     assertNameLength(nameBytes, describe);
-    entryCount++;
-    localBytesLowerBound += ZIP_LOCAL_HEADER_FIXED_BYTES + nameBytes;
-    centralBytesLowerBound += ZIP_CENTRAL_HEADER_FIXED_BYTES + nameBytes;
   };
   account(idBytes + separator, () => `${plan.encodedId}/`);
   account(idBytes + separator + byteLength("index.html"), () => `${plan.encodedId}/index.html`);
@@ -948,8 +993,10 @@ function assertZipLimitsFromInput(plan) {
     const dirBytes = idBytes + separator + byteLength(post.directory);
     const dir = () => `${plan.encodedId}/${post.directory}`;
     account(dirBytes + separator, () => `${dir()}/`);
-    account(dirBytes + separator + byteLength(post.informationFileName), () => `${dir()}/${post.informationFileName}`);
-    account(dirBytes + separator + byteLength("index.html"), () => `${dir()}/index.html`);
+    account(dirBytes + separator + byteLength(post.metadataFileName), () => `${dir()}/${post.metadataFileName}`);
+    if (post.bodyIncluded) {
+      account(dirBytes + separator + byteLength("index.html"), () => `${dir()}/index.html`);
+    }
     if (post.coverName !== undefined) {
       const coverName = post.coverName;
       assertNameLength(dirBytes + separator + byteLength(coverName), () => `${dir()}/${coverName}`);
@@ -958,11 +1005,6 @@ function assertZipLimitsFromInput(plan) {
       assertNameLength(dirBytes + separator + byteLength(fileName), () => `${dir()}/${fileName}`);
     }
   }
-  if (entryCount > MAX_ZIP_ENTRY_COUNT) {
-    throw new Error(`downloadZip: エントリ数が上限を超えます (最低 ${entryCount} 件、上限 ${MAX_ZIP_ENTRY_COUNT} 件)`);
-  }
-  assertZipUint32FieldWithinLimit(localBytesLowerBound, "preflight で見積もった central directory offset の下限");
-  assertZipUint32FieldWithinLimit(centralBytesLowerBound, "preflight で見積もった central directory size の下限");
 }
 function isValidPathSegment(value) {
   if (typeof value !== "string" || value.length === 0)
@@ -1000,7 +1042,7 @@ function isDownloadManifest(value, downloadObj) {
   if (typeof creatorId !== "string" || creatorId !== downloadObj.id)
     return false;
   const selection = m.selection;
-  if (typeof selection !== "object" || selection === null || !isStringArray(selection.postIds) || !isStringArray(selection.extensions) || typeof selection.includeCover !== "boolean") {
+  if (typeof selection !== "object" || selection === null || !isStringArray(selection.postIds) || !isStringArray(selection.extensions) || typeof selection.includeCover !== "boolean" || typeof selection.includeBody !== "boolean") {
     return false;
   }
   if (!isDenseArray(m.posts) || !isDenseArray(m.excludedPosts))
@@ -1033,7 +1075,11 @@ function isDownloadManifest(value, downloadObj) {
       return false;
     const p = post;
     const jsonPost = jsonPosts[index];
+    if (p.postId !== jsonPost?.postId)
+      return false;
     if (p.archiveDirectory !== jsonPost?.encodedName)
+      return false;
+    if (jsonPost?.bodyIncluded !== selection.includeBody)
       return false;
     if (!isManifestAssetArray(p.included, true) || !isManifestAssetArray(p.excluded, false))
       return false;
@@ -1162,7 +1208,8 @@ function isManifestAssetArray(value, requireArchiveName) {
   return true;
 }
 const RESERVED_ROOT_ENTRY_NAMES = ["index.html", "download-manifest.json"];
-const RESERVED_POST_ENTRY_NAMES = ["index.html", "info.json", "info.txt"];
+const POST_METADATA_FILE_NAME = "post.json";
+const RESERVED_POST_ENTRY_NAMES = ["index.html", POST_METADATA_FILE_NAME];
 function assertNotReservedPostEntryName(name, field) {
   if (RESERVED_POST_ENTRY_NAMES.includes(normalizeForReservedComparison(name))) {
     throw new Error(`downloadZip: ${field} が投稿ディレクトリの予約名と衝突しています (${name})`);
@@ -1184,7 +1231,8 @@ function snapshotManifest(value) {
     selection: selectionRecord ? {
       postIds: snapshotArray(selectionRecord.postIds, (it) => it),
       extensions: snapshotArray(selectionRecord.extensions, (it) => it),
-      includeCover: selectionRecord.includeCover
+      includeCover: selectionRecord.includeCover,
+      includeBody: selectionRecord.includeBody
     } : selection,
     posts: snapshotArray(m.posts, snapshotManifestPost),
     excludedPosts: snapshotArray(m.excludedPosts, (it) => snapshotFields(it, ["postId"]))
@@ -1237,7 +1285,8 @@ function toCanonicalManifest(manifest) {
     selection: {
       postIds: copyArray(manifest.selection.postIds, (it) => it),
       extensions: copyArray(manifest.selection.extensions, (it) => it),
-      includeCover: manifest.selection.includeCover
+      includeCover: manifest.selection.includeCover,
+      includeBody: manifest.selection.includeBody
     },
     posts: copyArray(manifest.posts, (post) => ({
       postId: post.postId,
@@ -1247,6 +1296,30 @@ function toCanonicalManifest(manifest) {
     })),
     excludedPosts: copyArray(manifest.excludedPosts, (it) => ({ postId: it.postId }))
   };
+}
+function createPostMetadata(downloadObj, post, manifestPost) {
+  return JSON.stringify({
+    schemaVersion: 1,
+    postId: post.postId,
+    creatorId: downloadObj.id,
+    title: post.originalName,
+    url: `https://www.fanbox.cc/@${downloadObj.id}/posts/${post.postId}`,
+    publishedDatetime: post.publishedDatetime ?? null,
+    updatedDatetime: post.updatedDatetime ?? null,
+    postType: post.postType ?? null,
+    tags: [...post.tags],
+    body: {
+      included: post.bodyIncluded,
+      storedFilename: post.bodyIncluded ? "index.html" : null
+    },
+    assets: manifestPost.included.map((asset) => ({
+      kind: asset.kind,
+      ...asset.kind === "cover" ? {} : { assetId: asset.assetId },
+      originalFilename: `${asset.originalName}${asset.extension}`,
+      extension: asset.extension,
+      storedFilename: asset.archiveName
+    }))
+  }, null, 2);
 }
 function copyArray(source, project) {
   const copied = [];
@@ -1395,7 +1468,7 @@ export class DownloadHelper {
     const utils = this.utils;
     const handle = options?.handle ?? await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
     const writable = await handle.createWritable();
-    const zip = new ZipWriter(writable);
+    const zip = new Zip64StreamWriter(writable);
     try {
       const fetchFile = options?.fetchFile ?? ((url, name) => utils.fetchWithLimit({ url, name }, 1));
       const enqueue = async (fileBits, path, date) => {
@@ -1451,9 +1524,10 @@ export class DownloadHelper {
           log(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
           const postDate = parsePublishedDate(post.publishedDatetime);
           await zip.addDirectory(`${encodedId}/${plan.directory}/`, postDate);
-          const informationFile = utils.createInformationFile(post.informationText);
-          await enqueue(informationFile.content, `${plan.directory}/${plan.informationFileName}`, postDate);
-          await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${plan.directory}/index.html`, postDate);
+          await enqueue([createPostMetadata(downloadObj, post, manifest.posts[postIndex])], `${plan.directory}/${plan.metadataFileName}`, postDate);
+          if (post.bodyIncluded) {
+            await enqueue([this.createHtmlFromBody(post.originalName, post.htmlText)], `${plan.directory}/index.html`, postDate);
+          }
           if (post.cover && plan.coverName !== undefined) {
             const coverName = plan.coverName;
             log(`download ${coverName}`);
@@ -1560,24 +1634,25 @@ export class DownloadHelper {
       if (post.cover !== undefined) {
         assertNotReservedPostEntryName(post.cover.name, "post.cover.name");
       }
-      const informationFileName = this.utils.encodeFileName(this.utils.createInformationFile(post.informationText).name);
-      if (!isValidPathSegment(informationFileName)) {
-        throw new Error(`downloadZip: 情報ファイル名が不正な値です (${JSON.stringify(informationFileName)})`);
+      const metadataFileName = POST_METADATA_FILE_NAME;
+      if (!isValidPathSegment(metadataFileName)) {
+        throw new Error(`downloadZip: 投稿メタデータ名が不正な値です (${JSON.stringify(metadataFileName)})`);
       }
-      const normalizedInformationFileName = normalizeForReservedComparison(informationFileName);
+      const normalizedMetadataFileName = normalizeForReservedComparison(metadataFileName);
       const siblingNames = [
         "index.html",
         ...post.cover !== undefined ? [post.cover.name] : [],
         ...post.files.map((file) => file.encodedName)
       ];
       for (const sibling of siblingNames) {
-        if (normalizeForReservedComparison(sibling) === normalizedInformationFileName) {
-          throw new Error(`downloadZip: 情報ファイル名が同じ投稿の ${sibling} と衝突しています (${informationFileName})`);
+        if (normalizeForReservedComparison(sibling) === normalizedMetadataFileName) {
+          throw new Error(`downloadZip: 投稿メタデータ名が同じ投稿の ${sibling} と衝突しています (${metadataFileName})`);
         }
       }
       posts.push({
         directory: post.encodedName,
-        informationFileName,
+        metadataFileName,
+        bodyIncluded: post.bodyIncluded,
         ...post.cover !== undefined ? { coverName: post.cover.name } : {},
         fileNames: post.files.map((file) => file.encodedName)
       });
@@ -1619,6 +1694,12 @@ export class DownloadHelper {
       }
       const p = it;
       switch (true) {
+        case typeof p.postId !== "string":
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にpostIdが文字列でないものが含まれる)");
+          return true;
+        case typeof p.bodyIncluded !== "boolean":
+          console.error("ダウンロード用オブジェクトの型が不正(postsの値にbodyIncludedがbooleanでないものが含まれる)");
+          return true;
         case typeof p.informationText !== "string":
           console.error("ダウンロード用オブジェクトの型が不正(postsの値にinformationTextが文字列でないものが含まれる)", p.informationText, t.posts);
           return true;
@@ -1660,6 +1741,10 @@ export class DownloadHelper {
         console.error("ダウンロード用オブジェクトの型が不正(postsの値にpublishedDatetimeが文字列でないものが含まれる)", p.publishedDatetime, t.posts);
         return true;
       }
+      if (p.updatedDatetime !== undefined && typeof p.updatedDatetime !== "string")
+        return true;
+      if (p.postType !== undefined && typeof p.postType !== "string")
+        return true;
       const cover = p.cover;
       if (cover !== undefined) {
         if (typeof cover !== "object" || cover === null) {
@@ -1721,7 +1806,7 @@ export class DownloadHelper {
 </ul></div>
 </div></nav>
 
-` + downloadObj.posts.map((post) => `<div class="post-item" data-tags="${this.utils.escapeHtml(JSON.stringify(post.tags))}">
+` + downloadObj.posts.filter((post) => post.bodyIncluded).map((post) => `<div class="post-item" data-tags="${this.utils.escapeHtml(JSON.stringify(post.tags))}">
 ` + `<a class="hl" href="./${this.utils.encodeURI(post.encodedName)}/index.html"><div class="root card">
 ` + this.createCoverHtmlFromPost(post) + `<div class="card-body"><h5 class="card-title">${this.utils.escapeHtml(post.originalName)}</h5></div>
 </div></a><br>

@@ -1,3 +1,5 @@
+import { Uint8ArrayReader, ZipWriter as ZipJsWriter } from '@zip.js/zip.js';
+
 /**
  * ダウンロード用のObject
  *
@@ -29,6 +31,7 @@ export type PostObj = {
   tags: string[];
   cover?: CoverFileObj;
   publishedDatetime?: string;
+  updatedDatetime?: string;
   /** FANBOX の投稿タイプ。収集結果の絞り込み条件として利用側が読む (この層では使わない) */
   postType?: string;
 };
@@ -178,6 +181,8 @@ export type Selection = {
   readonly extensions: ReadonlySet<string>;
   /** カバーを含めるか */
   readonly includeCover: boolean;
+  /** 投稿本文の HTML を含めるか */
+  readonly includeBody?: boolean;
 };
 
 /**
@@ -235,6 +240,7 @@ export type PostSummary = {
   readonly files: readonly BodyAssetSummary[];
   readonly cover?: CoverAssetSummary;
   readonly publishedDatetime?: string;
+  readonly updatedDatetime?: string;
   readonly postType?: string;
 };
 
@@ -315,6 +321,7 @@ export type DownloadManifest = {
     readonly postIds: readonly string[];
     readonly extensions: readonly string[];
     readonly includeCover: boolean;
+    readonly includeBody: boolean;
   };
   /** 選択された投稿。収集順。含めた / 除外したアセットをこの下に持つ */
   readonly posts: readonly ManifestPost[];
@@ -348,14 +355,18 @@ export function joinHtmlFragments(parts: readonly HtmlFragment[][], separator: s
  */
 export type DownloadJsonObj = {
   posts: {
+    postId: string;
     originalName: string;
     encodedName: string;
     informationText: string;
     htmlText: string;
+    bodyIncluded: boolean;
     files: { url: string; originalName: string; encodedName: string }[];
     tags: string[];
     cover?: { url: string; name: string };
     publishedDatetime?: string;
+    updatedDatetime?: string;
+    postType?: string;
   }[];
   id: string;
   url: string;
@@ -609,6 +620,7 @@ export type ReadonlyPostObj = {
   readonly tags: readonly string[];
   readonly cover?: Readonly<CoverFileObj>;
   readonly publishedDatetime?: string;
+  readonly updatedDatetime?: string;
   readonly postType?: string;
 };
 
@@ -821,7 +833,7 @@ export class DownloadObject {
         extensions.add(normalizeExtension(file.extension));
       }
     }
-    return { postIds, extensions, includeCover: true };
+    return { postIds, extensions, includeCover: true, includeBody: true };
   }
 
   /**
@@ -842,6 +854,7 @@ export class DownloadObject {
       files: post.files.map((file) => summarizeAsset(file)),
       ...(post.cover ? { cover: summarizeAsset(post.cover) } : {}),
       ...(post.publishedDatetime !== undefined ? { publishedDatetime: post.publishedDatetime } : {}),
+      ...(post.updatedDatetime !== undefined ? { updatedDatetime: post.updatedDatetime } : {}),
       ...(post.postType !== undefined ? { postType: post.postType } : {}),
     }));
   }
@@ -860,6 +873,7 @@ export class DownloadObject {
     // 全投稿を渡して一度に割り当てる
     const directoryNames = this.allocator.allocatePostDirectoryNames(this.downloadObj.posts);
     assertPostDirectoryNames(directoryNames, this.downloadObj.posts.length, this.utils);
+    const includeBody = selection.includeBody !== false;
 
     const posts: DownloadJsonObj['posts'] = [];
     const manifestPosts: ManifestPost[] = [];
@@ -888,7 +902,12 @@ export class DownloadObject {
         includedKeys.add('cover');
       }
 
-      const projected = this.orderedPosts[index].projectPost(directoryNames[index], this.allocator, includedKeys);
+      const projected = this.orderedPosts[index].projectPost(
+        directoryNames[index],
+        this.allocator,
+        includedKeys,
+        includeBody,
+      );
       posts.push(projected.json);
       for (const tag of postObj.tags) {
         presentTags.add(tag);
@@ -929,6 +948,7 @@ export class DownloadObject {
           postIds: [...selection.postIds].sort(),
           extensions: [...selection.extensions].sort(),
           includeCover: selection.includeCover,
+          includeBody,
         },
         posts: manifestPosts,
         excludedPosts,
@@ -1037,6 +1057,10 @@ export class PostObject {
 
   setPublishedDatetime(iso: string) {
     this.postObj.publishedDatetime = iso;
+  }
+
+  setUpdatedDatetime(iso: string) {
+    this.postObj.updatedDatetime = iso;
   }
 
   /**
@@ -1181,6 +1205,7 @@ export class PostObject {
     directoryName: string,
     allocator: ArchivePathAllocator,
     includedKeys: ReadonlySet<string>,
+    includeBody: boolean,
   ): ProjectedPost {
     const { allocation, fileByKey, assetByKey } = this.allocateAssets(allocator);
     const pathByKey = new Map<string, string>();
@@ -1196,10 +1221,12 @@ export class PostObject {
         : undefined;
     return {
       json: {
+        postId: this.postObj.postId,
         originalName: this.postObj.name,
         encodedName: directoryName,
         informationText: this.postObj.info,
         htmlText: this.resolveHtml(pathByKey, includedKeys, assetByKey),
+        bodyIncluded: includeBody,
         // URL と元ファイル名は投稿が持つ値から取る。allocator が決めるのは名前と並び順だけ
         files: allocation.files
           .filter(({ key }) => includedKeys.has(assetKeyToString(key)))
@@ -1212,6 +1239,8 @@ export class PostObject {
         tags: [...this.postObj.tags],
         cover,
         publishedDatetime: this.postObj.publishedDatetime,
+        updatedDatetime: this.postObj.updatedDatetime,
+        postType: this.postObj.postType,
       },
       archiveNames: pathByKey,
     };
@@ -2110,6 +2139,61 @@ export class ZipWriter {
 }
 
 /**
+ * 実際のダウンロードで使う ZIP64 対応 writer。
+ *
+ * 公開済みの `ZipWriter` はバイト列と失敗条件を固定したテスト互換のために残す。
+ * ZIP 生成経路では、4 GiB を超えた時点で ZIP64 へ自動移行できる zip.js を使う。
+ * archive path の検証と衝突検査は、この writer へ到達する前の `preflight` が引き続き担う。
+ */
+class Zip64StreamWriter {
+  private readonly writer: ZipJsWriter<unknown>;
+
+  constructor(private readonly writable: FileSystemWritableFileStream) {
+    const stream = new WritableStream<Uint8Array>({
+      write: (chunk) => writable.write(chunk as Uint8Array<ArrayBuffer>),
+      close: () => writable.close(),
+      abort: (reason) => writable.abort(reason),
+    });
+    this.writer = new ZipJsWriter(stream, {
+      extendedTimestamp: true,
+      level: 0,
+      useWebWorkers: false,
+    });
+  }
+
+  async addFile(name: string, data: Uint8Array, date?: Date): Promise<void> {
+    await this.writer.add(name, new Uint8ArrayReader(data), {
+      level: 0,
+      ...zipDateOptions(date),
+    });
+  }
+
+  async addDirectory(name: string, date?: Date): Promise<void> {
+    const directoryName = name.endsWith('/') ? name : `${name}/`;
+    await this.writer.add(directoryName, undefined, {
+      directory: true,
+      ...zipDateOptions(date),
+    });
+  }
+
+  async close(): Promise<void> {
+    await this.writer.close();
+  }
+
+  async abort(reason?: unknown): Promise<void> {
+    await this.writable.abort(reason);
+  }
+}
+
+function zipDateOptions(
+  date: Date | undefined,
+): { lastModDate: Date } | { rawLastModDate: 0; extendedTimestamp: false } {
+  return date !== undefined && Number.isFinite(date.getTime())
+    ? { lastModDate: date }
+    : { rawLastModDate: 0, extendedTimestamp: false };
+}
+
+/**
  * ZIP の上限のうち、入力の構造と archive 名から超過が確定するものを検出する。
  *
  * `ZipWriter` はエントリ名の UTF-8 バイト長・エントリ数・central directory の offset / size を
@@ -2118,7 +2202,7 @@ export class ZipWriter {
  *
  * 数えるのは**中断せずに完走した場合に必ず書かれるエントリ**である。ルートの 3 件
  * (ディレクトリ / `index.html` / `download-manifest.json`) と、投稿ごとの 3 件
- * (ディレクトリ / 情報ファイル / `index.html`)。カバーと添付は取得に失敗すれば書かれないので
+ * (ディレクトリ / `post.json` / 本文選択時の `index.html`)。カバーと添付は取得に失敗すれば書かれないので
  * 数えない。上限側で数えて弾くと、一部の取得が失敗すれば収まるダウンロードまで拒否することになる。
  *
  * offset と size は**名前と固定ヘッダだけで積んだ下限**で見る。extra field と本体のバイト数は
@@ -2137,10 +2221,6 @@ function assertZipLimitsFromInput(plan: PreflightResult): void {
   const idBytes = byteLength(plan.encodedId);
   const separator = 1;
 
-  let entryCount = 0;
-  let localBytesLowerBound = 0;
-  let centralBytesLowerBound = 0;
-
   const assertNameLength = (nameBytes: number, describe: () => string) => {
     if (nameBytes > 0xffff) {
       throw new Error(
@@ -2151,9 +2231,6 @@ function assertZipLimitsFromInput(plan: PreflightResult): void {
 
   const account = (nameBytes: number, describe: () => string) => {
     assertNameLength(nameBytes, describe);
-    entryCount++;
-    localBytesLowerBound += ZIP_LOCAL_HEADER_FIXED_BYTES + nameBytes;
-    centralBytesLowerBound += ZIP_CENTRAL_HEADER_FIXED_BYTES + nameBytes;
   };
 
   account(idBytes + separator, () => `${plan.encodedId}/`);
@@ -2163,8 +2240,10 @@ function assertZipLimitsFromInput(plan: PreflightResult): void {
     const dirBytes = idBytes + separator + byteLength(post.directory);
     const dir = () => `${plan.encodedId}/${post.directory}`;
     account(dirBytes + separator, () => `${dir()}/`);
-    account(dirBytes + separator + byteLength(post.informationFileName), () => `${dir()}/${post.informationFileName}`);
-    account(dirBytes + separator + byteLength('index.html'), () => `${dir()}/index.html`);
+    account(dirBytes + separator + byteLength(post.metadataFileName), () => `${dir()}/${post.metadataFileName}`);
+    if (post.bodyIncluded) {
+      account(dirBytes + separator + byteLength('index.html'), () => `${dir()}/index.html`);
+    }
     // カバーと添付は取得に失敗すれば書かれないので件数とバイト数には積まない。長さだけ検査する
     if (post.coverName !== undefined) {
       const coverName = post.coverName;
@@ -2174,14 +2253,6 @@ function assertZipLimitsFromInput(plan: PreflightResult): void {
       assertNameLength(dirBytes + separator + byteLength(fileName), () => `${dir()}/${fileName}`);
     }
   }
-
-  if (entryCount > MAX_ZIP_ENTRY_COUNT) {
-    throw new Error(`downloadZip: エントリ数が上限を超えます (最低 ${entryCount} 件、上限 ${MAX_ZIP_ENTRY_COUNT} 件)`);
-  }
-  // 判定は ZipWriter が使うのと同じ関数に委ねる。ここで比較を書き直すと、0xFFFFFFFF 自体を
-  // ZIP64 の sentinel として拒否する境界 (>=) と食い違い、ちょうど上限の入力だけが picker 後に落ちる
-  assertZipUint32FieldWithinLimit(localBytesLowerBound, 'preflight で見積もった central directory offset の下限');
-  assertZipUint32FieldWithinLimit(centralBytesLowerBound, 'preflight で見積もった central directory size の下限');
 }
 
 /**
@@ -2196,8 +2267,10 @@ function assertZipLimitsFromInput(plan: PreflightResult): void {
 export type PostWritePlan = {
   /** 投稿ディレクトリ名 (ZIP ルート直下) */
   readonly directory: string;
-  /** 情報ファイル名 (`createInformationFile` の名前を `encodeFileName` に通したもの) */
-  readonly informationFileName: string;
+  /** 投稿メタデータの固定ファイル名 (`post.json`) */
+  readonly metadataFileName: string;
+  /** 投稿本文の index.html を書くか */
+  readonly bodyIncluded: boolean;
   /** カバーの archive 名。カバーが無ければ undefined */
   readonly coverName?: string;
   /** 添付の archive 名。`json.posts[].files` と同じ並び */
@@ -2393,7 +2466,8 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
     selection === null ||
     !isStringArray(selection.postIds) ||
     !isStringArray(selection.extensions) ||
-    typeof selection.includeCover !== 'boolean'
+    typeof selection.includeCover !== 'boolean' ||
+    typeof selection.includeBody !== 'boolean'
   ) {
     return false;
   }
@@ -2429,7 +2503,9 @@ function isDownloadManifest(value: unknown, downloadObj: Record<string, unknown>
     if (!isRecordWithStringKeys(post, ['postId', 'archiveDirectory'])) return false;
     const p = post as Record<string, unknown>;
     const jsonPost = jsonPosts[index];
+    if (p.postId !== jsonPost?.postId) return false;
     if (p.archiveDirectory !== jsonPost?.encodedName) return false;
+    if (jsonPost?.bodyIncluded !== selection.includeBody) return false;
     if (!isManifestAssetArray(p.included, true) || !isManifestAssetArray(p.excluded, false)) return false;
     // 出力に載っている投稿は選択されていなければならない
     if (!selectedPostIds.has(p.postId as string)) return false;
@@ -2606,17 +2682,17 @@ const RESERVED_ROOT_ENTRY_NAMES = ['index.html', 'download-manifest.json'];
 /**
  * 投稿ディレクトリ直下に必ず書かれるファイル名。アセットの archive 名として使えない。
  *
- * `info.json` / `info.txt` は `createInformationFile` が情報テキストの内容で選ぶので、
- * どちらも予約する。ライブラリが生成するファイルとの衝突であり、legacy allocator の
- * アセット同士の衝突 (直さないと決めたもの) とは別の問題である
+ * `post.json` は投稿メタデータ、`index.html` は本文の固定名として予約する。
+ * ライブラリが生成するファイルとの衝突であり、legacy allocator のアセット同士の衝突とは別の問題である。
  * @internal
  */
-const RESERVED_POST_ENTRY_NAMES = ['index.html', 'info.json', 'info.txt'];
+const POST_METADATA_FILE_NAME = 'post.json';
+const RESERVED_POST_ENTRY_NAMES = ['index.html', POST_METADATA_FILE_NAME];
 
 /**
  * 投稿ディレクトリ直下の固定ファイルと衝突する名前を弾く。
  *
- * 同じパスに 2 つのエントリが入り、展開実装によって投稿 HTML か情報ファイルか
+ * 同じパスに 2 つのエントリが入り、展開実装によって投稿 HTML か投稿メタデータか
  * アセットのいずれかが失われる
  * @param name 検証対象の archive 名
  * @param field エラーメッセージに含めるフィールド名
@@ -2666,6 +2742,7 @@ function snapshotManifest(value: unknown): unknown {
           postIds: snapshotArray(selectionRecord.postIds, (it) => it),
           extensions: snapshotArray(selectionRecord.extensions, (it) => it),
           includeCover: selectionRecord.includeCover,
+          includeBody: selectionRecord.includeBody,
         }
       : selection,
     posts: snapshotArray(m.posts, snapshotManifestPost),
@@ -2750,6 +2827,7 @@ function toCanonicalManifest(manifest: DownloadManifest): DownloadManifest {
       postIds: copyArray(manifest.selection.postIds, (it) => it),
       extensions: copyArray(manifest.selection.extensions, (it) => it),
       includeCover: manifest.selection.includeCover,
+      includeBody: manifest.selection.includeBody,
     },
     posts: copyArray(manifest.posts, (post) => ({
       postId: post.postId,
@@ -2759,6 +2837,40 @@ function toCanonicalManifest(manifest: DownloadManifest): DownloadManifest {
     })),
     excludedPosts: copyArray(manifest.excludedPosts, (it) => ({ postId: it.postId })),
   };
+}
+
+/** 投稿ディレクトリへ書く、保存物と対応したメタデータを作る。 */
+function createPostMetadata(
+  downloadObj: DownloadJsonObj,
+  post: DownloadJsonObj['posts'][number],
+  manifestPost: DownloadManifest['posts'][number],
+): string {
+  return JSON.stringify(
+    {
+      schemaVersion: 1,
+      postId: post.postId,
+      creatorId: downloadObj.id,
+      title: post.originalName,
+      url: `https://www.fanbox.cc/@${downloadObj.id}/posts/${post.postId}`,
+      publishedDatetime: post.publishedDatetime ?? null,
+      updatedDatetime: post.updatedDatetime ?? null,
+      postType: post.postType ?? null,
+      tags: [...post.tags],
+      body: {
+        included: post.bodyIncluded,
+        storedFilename: post.bodyIncluded ? 'index.html' : null,
+      },
+      assets: manifestPost.included.map((asset) => ({
+        kind: asset.kind,
+        ...(asset.kind === 'cover' ? {} : { assetId: asset.assetId }),
+        originalFilename: `${asset.originalName}${asset.extension}`,
+        extension: asset.extension,
+        storedFilename: asset.archiveName,
+      })),
+    },
+    null,
+    2,
+  );
 }
 
 /**
@@ -2807,7 +2919,7 @@ export class DownloadHelper {
 
   /**
    * @param utils ダウンロード用ユーティリティ。
-   *   **`encodeFileName` と `createInformationFile` が返す名前は決定的でなければならない**
+   *   **`encodeFileName` が返す名前は決定的でなければならない**
    *   (同じ引数には同じ名前を返し、副作用を持たず、有効な入力で例外を投げない)。
    *   利用側が自分で picker を開く経路では `preflight` が 2 回走る (利用側の事前実行と `downloadZip`
    *   冒頭の実行)。呼び出しごとに違う名前を返す実装を渡すと 2 回の結果が食い違い、事前検証を通った
@@ -2981,7 +3093,7 @@ export class DownloadHelper {
 
     const handle = options?.handle ?? (await showSaveFilePicker({ suggestedName: `${encodedId}.zip` }));
     const writable = await handle.createWritable();
-    const zip = new ZipWriter(writable);
+    const zip = new Zip64StreamWriter(writable);
 
     // createWritable() 以降の ZIP 生成処理全体を try/catch で囲む。fetchFile / log / progress / remainTime は
     // 呼び出し側が渡すコールバックであり、これらが例外を投げても writable が未 close のまま残らないようにする
@@ -3063,14 +3175,19 @@ export class DownloadHelper {
         const postDate = parsePublishedDate(post.publishedDatetime);
         // 投稿ディレクトリ (配下ファイルより前に書く)
         await zip.addDirectory(`${encodedId}/${plan.directory}/`, postDate);
-        // 投稿情報+html
-        const informationFile = utils.createInformationFile(post.informationText);
-        await enqueue(informationFile.content, `${plan.directory}/${plan.informationFileName}`, postDate);
+        // 投稿メタデータは本文を選ばなかった場合も保存する。
         await enqueue(
-          [this.createHtmlFromBody(post.originalName, post.htmlText)],
-          `${plan.directory}/index.html`,
+          [createPostMetadata(downloadObj, post, manifest.posts[postIndex])],
+          `${plan.directory}/${plan.metadataFileName}`,
           postDate,
         );
+        if (post.bodyIncluded) {
+          await enqueue(
+            [this.createHtmlFromBody(post.originalName, post.htmlText)],
+            `${plan.directory}/index.html`,
+            postDate,
+          );
+        }
         // カバー画像
         if (post.cover && plan.coverName !== undefined) {
           const coverName = plan.coverName;
@@ -3221,29 +3338,24 @@ export class DownloadHelper {
       if (post.cover !== undefined) {
         assertNotReservedPostEntryName(post.cover.name, 'post.cover.name');
       }
-      // 情報ファイル名は DownloadUtils が決めるので、アセット名と同じようにここで検証する。
-      // constructor で差し替えられる以上、'info.json' / 'info.txt' 以外が返る可能性は型では塞げない。
-      // 予約名の検査 (assertNotReservedPostEntryName) は掛けない。この名前自身が予約されている側なので必ず落ちる
-      const informationFileName = this.utils.encodeFileName(
-        this.utils.createInformationFile(post.informationText).name,
-      );
-      if (!isValidPathSegment(informationFileName)) {
-        throw new Error(`downloadZip: 情報ファイル名が不正な値です (${JSON.stringify(informationFileName)})`);
+      const metadataFileName = POST_METADATA_FILE_NAME;
+      if (!isValidPathSegment(metadataFileName)) {
+        throw new Error(`downloadZip: 投稿メタデータ名が不正な値です (${JSON.stringify(metadataFileName)})`);
       }
       // 投稿ディレクトリ直下の他の名前と衝突すると、同じパスに 2 エントリ入ってどちらかが失われる。
-      // アセット名が 'info.json' などに寄る向きは assertNotReservedPostEntryName が既に塞いでいるので、
-      // ここでは情報ファイル名が他へ寄る向きだけを見る。
+      // アセット名が 'post.json' に寄る向きは assertNotReservedPostEntryName が既に塞いでいるので、
+      // ここでは投稿メタデータ名が他へ寄る向きだけを見る。
       // アセット同士の衝突は legacy allocator が作りうるものとして許容しているのでここでは扱わない
-      const normalizedInformationFileName = normalizeForReservedComparison(informationFileName);
+      const normalizedMetadataFileName = normalizeForReservedComparison(metadataFileName);
       const siblingNames = [
         'index.html',
         ...(post.cover !== undefined ? [post.cover.name] : []),
         ...post.files.map((file) => file.encodedName),
       ];
       for (const sibling of siblingNames) {
-        if (normalizeForReservedComparison(sibling) === normalizedInformationFileName) {
+        if (normalizeForReservedComparison(sibling) === normalizedMetadataFileName) {
           throw new Error(
-            `downloadZip: 情報ファイル名が同じ投稿の ${sibling} と衝突しています (${informationFileName})`,
+            `downloadZip: 投稿メタデータ名が同じ投稿の ${sibling} と衝突しています (${metadataFileName})`,
           );
         }
       }
@@ -3251,7 +3363,8 @@ export class DownloadHelper {
       // 検証した名前と実際に書く名前が別々に決まることになる
       posts.push({
         directory: post.encodedName,
-        informationFileName,
+        metadataFileName,
+        bodyIncluded: post.bodyIncluded,
         ...(post.cover !== undefined ? { coverName: post.cover.name } : {}),
         fileNames: post.files.map((file) => file.encodedName),
       });
@@ -3299,6 +3412,12 @@ export class DownloadHelper {
       }
       const p = it as Record<string, unknown>;
       switch (true) {
+        case typeof p.postId !== 'string':
+          console.error('ダウンロード用オブジェクトの型が不正(postsの値にpostIdが文字列でないものが含まれる)');
+          return true;
+        case typeof p.bodyIncluded !== 'boolean':
+          console.error('ダウンロード用オブジェクトの型が不正(postsの値にbodyIncludedがbooleanでないものが含まれる)');
+          return true;
         case typeof p.informationText !== 'string':
           console.error(
             'ダウンロード用オブジェクトの型が不正(postsの値にinformationTextが文字列でないものが含まれる)',
@@ -3382,6 +3501,8 @@ export class DownloadHelper {
         );
         return true;
       }
+      if (p.updatedDatetime !== undefined && typeof p.updatedDatetime !== 'string') return true;
+      if (p.postType !== undefined && typeof p.postType !== 'string') return true;
       // cover検証 (filesとは独立して検証)
       const cover = p.cover as Record<string, unknown> | null | undefined;
       if (cover !== undefined) {
@@ -3464,6 +3585,7 @@ export class DownloadHelper {
       tagCheckboxes +
       `</ul>\n</li>\n</ul></div>\n</div></nav>\n\n` +
       downloadObj.posts
+        .filter((post) => post.bodyIncluded)
         .map(
           (post) =>
             `<div class="post-item" data-tags="${this.utils.escapeHtml(JSON.stringify(post.tags))}">\n` +

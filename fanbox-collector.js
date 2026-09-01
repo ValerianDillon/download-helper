@@ -104,8 +104,12 @@ function decodeBlock(value) {
   const id = (key) => typeof value[key] === "string" ? value[key] : undefined;
   switch (value.type) {
     case "p":
-    case "header":
-      return typeof value.text === "string" ? { type: value.type, text: value.text } : undefined;
+    case "header": {
+      if (typeof value.text !== "string")
+        return;
+      const links = decodeInlineLinks(value.links, value.text.length);
+      return links === undefined ? undefined : { type: value.type, text: value.text, links };
+    }
     case "image": {
       const imageId = id("imageId");
       return imageId === undefined ? undefined : { type: "image", imageId };
@@ -125,6 +129,43 @@ function decodeBlock(value) {
     default:
       return { type: "unknown", originalType: value.type };
   }
+}
+function decodeInlineLinks(value, textLength) {
+  if (value === undefined)
+    return [];
+  if (!Array.isArray(value))
+    return;
+  const links = [];
+  for (const item of value) {
+    if (!isRecord(item) || !Number.isSafeInteger(item.offset) || !Number.isSafeInteger(item.length) || item.offset < 0 || item.length <= 0 || typeof item.url !== "string") {
+      return;
+    }
+    const offset = item.offset;
+    const length = item.length;
+    if (offset + length > textLength)
+      return;
+    links.push({ offset, length, url: item.url });
+  }
+  links.sort((a, b) => a.offset - b.offset);
+  for (let index = 1;index < links.length; index++) {
+    const previous = links[index - 1];
+    if (previous.offset + previous.length > links[index].offset)
+      return;
+  }
+  return links;
+}
+function renderInlineLinks(block) {
+  let cursor = 0;
+  const html = [];
+  for (const link of block.links) {
+    html.push(DownloadManage.utils.escapeHtml(block.text.slice(cursor, link.offset)));
+    const label = DownloadManage.utils.escapeHtml(block.text.slice(link.offset, link.offset + link.length));
+    const url = DownloadManage.utils.escapeHtml(link.url);
+    html.push(`<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+    cursor = link.offset + link.length;
+  }
+  html.push(DownloadManage.utils.escapeHtml(block.text.slice(cursor)));
+  return html.join("");
 }
 function decodeUrlEmbedInfo(value) {
   if (!isRecord(value) || typeof value.type !== "string")
@@ -352,6 +393,10 @@ ${postType}@${postInfo.id} missing: ${decoded.missing.join(", ")}`);
   if (typeof publishedDatetime === "string" && publishedDatetime.length > 0) {
     postObject.setPublishedDatetime(publishedDatetime);
   }
+  const updatedDatetime = post.metadata.updatedDatetime;
+  if (typeof updatedDatetime === "string" && updatedDatetime.length > 0) {
+    postObject.setUpdatedDatetime(updatedDatetime);
+  }
   postObject.setTags([downloadManage.getTagByFee(post.feeRequired), ...post.tags]);
   downloadManage.addFee(post.feeRequired);
   downloadManage.addTags(...post.tags);
@@ -405,9 +450,9 @@ ${postType}@${postInfo.id} missing: ${decoded.missing.join(", ")}`);
       const body = joinHtmlFragments(post.body.blocks.map((it) => {
         switch (it.type) {
           case "p":
-            return [`<span>${DownloadManage.utils.escapeHtml(it.text)}</span>`];
+            return [`<span>${renderInlineLinks(it)}</span>`];
           case "header":
-            return [`<h2><span>${DownloadManage.utils.escapeHtml(it.text)}</span></h2>`];
+            return [`<h2><span>${renderInlineLinks(it)}</span></h2>`];
           case "file": {
             if (cntFile >= files.length)
               return [];

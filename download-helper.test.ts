@@ -292,7 +292,7 @@ const testManifest = (posts: DownloadJsonObj['posts'] = []): DownloadManifest =>
   // manifest は JSON の投稿・アセットと 1 対 1 で対応し、記録した選択条件とも矛盾しない
   // ものだけが検証を通る
   const manifestPosts = posts.map((post, i) => ({
-    postId: `p${i + 1}`,
+    postId: post.postId,
     archiveDirectory: post.encodedName,
     included: [
       ...post.files.map((file, j) => ({
@@ -317,6 +317,7 @@ const testManifest = (posts: DownloadJsonObj['posts'] = []): DownloadManifest =>
       // 添付は extension を '' として作っているので、選択集合にも '' を入れる
       extensions: [''],
       includeCover: true,
+      includeBody: posts.every((post) => post.bodyIncluded),
     },
     posts: manifestPosts,
     excludedPosts: [],
@@ -1085,6 +1086,7 @@ describe('projection', () => {
     // 拡張子は正規化されるので .JPG は .jpg になる
     expect([...selection.extensions].sort()).toEqual(['.jpg', '.pdf', '.png']);
     expect(selection.includeCover).toBe(true);
+    expect(selection.includeBody).toBe(true);
   });
 
   test('入力を変更しない', () => {
@@ -1159,6 +1161,17 @@ describe('projection', () => {
     expect(json.posts[0].cover).toBeUndefined();
   });
 
+  test('投稿本文を外すと本文を保存対象外として manifest に記録する', () => {
+    const json = project(build(), {
+      postIds: new Set(['p1']),
+      extensions: new Set(['.png']),
+      includeCover: false,
+      includeBody: false,
+    });
+    expect(json.posts[0].bodyIncluded).toBe(false);
+    expect(json.manifest.selection.includeBody).toBe(false);
+  });
+
   test('postCount は選択投稿数、fileCount は選択された post.files の数 (カバーを含めない)', () => {
     const json = project(build(), { postIds: new Set(['p1']), extensions: new Set(['.pdf']), includeCover: true });
     expect(json.postCount).toBe(1);
@@ -1212,7 +1225,7 @@ describe('projection', () => {
       expect(m.schemaVersion).toBe(1);
       expect(m.creatorId).toBe('creator');
       expect(m.generatedAt).toBe('2026-08-23T00:00:00.000Z');
-      expect(m.selection).toEqual({ postIds: ['p1'], extensions: ['.png'], includeCover: false });
+      expect(m.selection).toEqual({ postIds: ['p1'], extensions: ['.png'], includeCover: false, includeBody: true });
       expect(m.posts).toHaveLength(1);
       expect(m.posts[0].postId).toBe('p1');
       expect(m.posts[0].archiveDirectory).toBe('post_3');
@@ -1324,10 +1337,12 @@ describe('isDownloadJsonObj', () => {
     withManifest({
       posts: [
         {
+          postId: 'p1',
           originalName: 'post1',
           encodedName: 'post1',
           informationText: '{}',
           htmlText: '<p>hello</p>',
+          bodyIncluded: true,
           files: [
             {
               url: 'https://example.com/file.png',
@@ -1641,13 +1656,13 @@ describe('isDownloadJsonObj', () => {
         const base = createValidObj();
         return withManifest({
           ...base,
-          posts: [base.posts[0], { ...base.posts[0], encodedName: 'post2' }],
+          posts: [base.posts[0], { ...base.posts[0], postId: 'p2', encodedName: 'post2' }],
           postCount: 2,
           fileCount: 2,
         });
       };
 
-      test('投稿間で postId を入れ替えても通る', () => {
+      test('投稿間で postId を入れ替えると拒否する', () => {
         const base = twoPosts();
         const [first, second] = base.manifest.posts;
         expect(second).toBeDefined();
@@ -1656,7 +1671,7 @@ describe('isDownloadJsonObj', () => {
           { ...second, postId: first.postId },
         ];
         expect(posts[0].postId).not.toBe(first.postId);
-        expect(helper.isDownloadJsonObj({ ...base, manifest: { ...base.manifest, posts } })).toBe(true);
+        expect(helper.isDownloadJsonObj({ ...base, manifest: { ...base.manifest, posts } })).toBe(false);
       });
 
       test('included アセットの assetId を変えても通る', () => {
@@ -3363,7 +3378,14 @@ describe('DownloadHelper.downloadZip', () => {
     return new DataView(buf.buffer, buf.byteOffset).getUint16(offset, true);
   }
 
-  type CdEntry = { name: string; externalAttr: number; dosTime: number; dosDate: number; localHeaderOffset: number };
+  type CdEntry = {
+    name: string;
+    externalAttr: number;
+    dosTime: number;
+    dosDate: number;
+    compressedSize: number;
+    localHeaderOffset: number;
+  };
 
   /**
    * central directory の走査結果。
@@ -3393,6 +3415,7 @@ describe('DownloadHelper.downloadZip', () => {
         externalAttr: readUint32(buf, pos + 38),
         dosTime: readUint16(buf, pos + 12),
         dosDate: readUint16(buf, pos + 14),
+        compressedSize: readUint32(buf, pos + 20),
         localHeaderOffset: readUint32(buf, pos + 42),
       });
       pos += 46 + nameLen + extraLen + commentLen;
@@ -3404,6 +3427,17 @@ describe('DownloadHelper.downloadZip', () => {
     return { entries, byName };
   }
 
+  /** 無圧縮で格納されたエントリの内容を UTF-8 文字列として読む。 */
+  function readStoredTextEntry(buf: Uint8Array, name: string): string {
+    const entry = parseCentralDirectory(buf).byName.get(name);
+    expect(entry).toBeDefined();
+    if (entry === undefined) throw new Error(`テスト対象の ZIP エントリがありません: ${name}`);
+    const nameLength = readUint16(buf, entry.localHeaderOffset + 26);
+    const extraLength = readUint16(buf, entry.localHeaderOffset + 28);
+    const start = entry.localHeaderOffset + 30 + nameLength + extraLength;
+    return new TextDecoder().decode(buf.slice(start, start + entry.compressedSize));
+  }
+
   /**
    * 有効な最小 DownloadJsonObj (投稿 2 件) を生成するヘルパー
    */
@@ -3411,19 +3445,23 @@ describe('DownloadHelper.downloadZip', () => {
     return withManifest({
       posts: [
         {
+          postId: 'p1',
           originalName: 'post1',
           encodedName: 'post1',
           informationText: '{}',
           htmlText: '<p>hello</p>',
+          bodyIncluded: true,
           files: [{ url: 'https://example.com/a.png', originalName: 'a.png', encodedName: 'a.png' }],
           tags: [],
           publishedDatetime: '2024-01-01T00:00:00Z',
         },
         {
+          postId: 'p2',
           originalName: 'post2',
           encodedName: 'post2',
           informationText: '{}',
           htmlText: '<p>world</p>',
+          bodyIncluded: true,
           files: [{ url: 'https://example.com/b.png', originalName: 'b.png', encodedName: 'b.png' }],
           tags: [],
           publishedDatetime: '2024-06-15T00:00:00Z',
@@ -3789,8 +3827,8 @@ describe('DownloadHelper.downloadZip', () => {
     // 同名のアセットがあると同じパスに 2 エントリ入り、どちらかが失われる
     test.each([
       'index.html',
-      'info.json',
-      'INFO.TXT',
+      'post.json',
+      'POST.JSON',
     ])('アセット名が投稿内の予約名 %s と衝突する → 例外', async (reserved) => {
       const base = createValidObj();
       const post = base.posts[0];
@@ -3957,19 +3995,23 @@ describe('DownloadHelper.downloadZip', () => {
       return withManifest({
         posts: [
           {
+            postId: 'p1',
             originalName: 'post1',
             encodedName: 'post1',
             informationText: '{}',
             htmlText: '<p>1</p>',
+            bodyIncluded: true,
             files: [{ url: 'https://example.com/p1-file.png', originalName: 'file.png', encodedName: 'file.png' }],
             tags: [],
             cover: { url: 'https://example.com/p1-cover.png', name: 'cover.png' },
           },
           {
+            postId: 'p2',
             originalName: 'post2',
             encodedName: 'post2',
             informationText: '{}',
             htmlText: '<p>2</p>',
+            bodyIncluded: true,
             files: [{ url: 'https://example.com/p2-file.png', originalName: 'file.png', encodedName: 'file.png' }],
             tags: [],
             cover: { url: 'https://example.com/p2-cover.png', name: 'cover.png' },
@@ -4158,10 +4200,12 @@ describe('DownloadHelper.downloadZip', () => {
       const obj: DownloadJsonObj = withManifest({
         posts: [
           {
+            postId: 'p1',
             originalName: 'post1',
             encodedName: 'post1',
             informationText: '{}',
             htmlText: '<p>1</p>',
+            bodyIncluded: true,
             files: [
               { url: 'https://example.com/p1-file1.png', originalName: 'file1.png', encodedName: 'file1.png' },
               { url: 'https://example.com/p1-file2.png', originalName: 'file2.png', encodedName: 'file2.png' },
@@ -4427,85 +4471,61 @@ describe('DownloadHelper.downloadZip', () => {
       expect(names).toContain('creator-id/');
     });
 
-    /**
-     * archive path に使う情報ファイル名は、検証を通った値をそのまま書くことを固定する。
-     *
-     * `downloadZip` は本文を得るために `createInformationFile` を書き込み時にも呼ぶが、
-     * その戻り値の `name` は archive path に使わない (使うと preflight が長さと衝突を検査したのとは
-     * 別の名前で書くことになる)。観測手段は `encodedId` のテストと同じで、契約外の utils を注入する。
-     */
-    test('検証を通った情報ファイル名を書き出しに使う', async () => {
-      // 変動させるのは createInformationFile 自身にする。encodeFileName だけを変動させると、
-      // 書き込み時の informationFile.name を素通しで archive path に使う退行を検出できない
-      // (その退行では常に 'info.json' が返るため)
-      class DriftingInfoUtils extends DownloadUtils {
-        private reads = 0;
-        override createInformationFile(informationText: string): { name: string; content: BlobPart[] } {
-          this.reads += 1;
-          // preflight で投稿数ぶん呼ばれ、書き込み時にもう一巡する
-          return { name: this.reads <= 2 ? 'info.json' : '..', content: [informationText] };
-        }
-      }
-      const drifting = new DownloadHelper(new DriftingInfoUtils());
-
-      const buf = await runDownloadZip(createValidObj(), undefined, drifting);
-
-      const names = parseCentralDirectory(buf).entries.map((entry) => entry.name);
-      expect(names).not.toContain('creator-id/post2/..');
-      expect(names).toContain('creator-id/post2/info.json');
-    });
-
-    // DownloadUtils は constructor で差し替えられるので、情報ファイル名も入力として検証する。
-    // 同じパスに 2 エントリ入るとどちらかが失われるので、投稿ディレクトリ直下の他の名前との衝突も見る
-    test.each([
-      ['パスセグメントとして不正', '..', '情報ファイル名が不正な値です'],
-      ['index.html と衝突', 'INDEX.HTML', '情報ファイル名が同じ投稿の index.html と衝突しています'],
-      ['添付名と衝突', 'A.PNG', '情報ファイル名が同じ投稿の a.png と衝突しています'],
-    ])('情報ファイル名が %s なら picker より前に落ちる', (_label, informationFileName, message) => {
-      class CustomNameUtils extends DownloadUtils {
-        override createInformationFile(informationText: string): { name: string; content: BlobPart[] } {
-          return { name: informationFileName, content: [informationText] };
-        }
-      }
-      const custom = new DownloadHelper(new CustomNameUtils());
-
-      expect(() => custom.preflight(createValidObj())).toThrow(message);
-    });
-
-    test('情報ファイル名がカバー名と衝突しても picker より前に落ちる', () => {
-      class CustomNameUtils extends DownloadUtils {
-        override createInformationFile(informationText: string): { name: string; content: BlobPart[] } {
-          return { name: 'cover.png', content: [informationText] };
-        }
-      }
-      const custom = new DownloadHelper(new CustomNameUtils());
+    test('投稿メタデータを固定名 post.json で書き出す', async () => {
       const base = createValidObj();
       const obj = withManifest({
         ...base,
-        posts: [{ ...base.posts[0], cover: { url: 'https://example.com/c.png', name: 'cover.png' } }, base.posts[1]],
+        posts: [
+          {
+            ...base.posts[0],
+            updatedDatetime: '2024-01-02T00:00:00Z',
+            postType: 'article',
+          },
+          base.posts[1],
+        ],
       });
-
-      expect(() => custom.preflight(obj)).toThrow('情報ファイル名が同じ投稿の cover.png と衝突しています');
+      const buf = await runDownloadZip(obj);
+      const names = parseCentralDirectory(buf).entries.map((entry) => entry.name);
+      expect(names).toContain('creator-id/post1/post.json');
+      expect(names).not.toContain('creator-id/post1/info.json');
+      expect(JSON.parse(readStoredTextEntry(buf, 'creator-id/post1/post.json'))).toEqual({
+        schemaVersion: 1,
+        postId: 'p1',
+        creatorId: 'creator-id',
+        title: 'post1',
+        url: 'https://www.fanbox.cc/@creator-id/posts/p1',
+        publishedDatetime: '2024-01-01T00:00:00Z',
+        updatedDatetime: '2024-01-02T00:00:00Z',
+        postType: 'article',
+        tags: [],
+        body: { included: true, storedFilename: 'index.html' },
+        assets: [
+          {
+            kind: 'file',
+            assetId: 'f1-1',
+            originalFilename: 'a.png',
+            extension: '',
+            storedFilename: 'a.png',
+          },
+        ],
+      });
     });
 
-    // extra field と本体のバイト数は加算方向にしか効かないので、名前だけで積んだ下限が上限を
-    // 超えるなら実際の書き込みでも必ず超える
-    test('必ず書かれるエントリだけで central directory の上限を超える入力を弾く', () => {
+    test('投稿本文を選ばなくても post.json を保存し、投稿の index.html は書かない', async () => {
       const base = createValidObj();
-      const id = 'a'.repeat(65500);
-      // 3 + 3N 件、1 件あたり 46 + 名前長 bytes。N=21843 で 65532 件 (エントリ数の上限内) に対し
-      // central directory は 4.29 GiB を超える
-      const posts = Array.from({ length: 21843 }, (_unused, index) => ({
-        ...base.posts[0],
-        originalName: `post${index}`,
-        encodedName: `post${index}`,
-        files: [],
-      }));
-      const obj = withManifest({ ...base, id, posts, postCount: posts.length, fileCount: 0 });
-
-      expect(() => helper.preflight({ ...obj, manifest: { ...obj.manifest, creatorId: id } })).toThrow(
-        'preflight で見積もった central directory',
-      );
+      const obj = withManifest({
+        ...base,
+        posts: base.posts.map((post) => ({ ...post, bodyIncluded: false })),
+      });
+      const buf = await runDownloadZip(obj);
+      const names = parseCentralDirectory(buf).entries.map((entry) => entry.name);
+      expect(names).toContain('creator-id/post1/post.json');
+      expect(names).not.toContain('creator-id/post1/index.html');
+      expect(JSON.parse(readStoredTextEntry(buf, 'creator-id/post1/post.json')).body).toEqual({
+        included: false,
+        storedFilename: null,
+      });
+      expect(readStoredTextEntry(buf, 'creator-id/index.html')).not.toContain('./post1/index.html');
     });
 
     // manifest の不整合は isDownloadJsonObj が先に弾くので、専用の文言には到達しない。
@@ -4595,7 +4615,7 @@ describe('DownloadHelper.downloadZip', () => {
           return withManifest({
             ...base,
             posts: [
-              { ...base.posts[0], cover: { url: 'https://example.com/c.png', name: 'info.json' } },
+              { ...base.posts[0], cover: { url: 'https://example.com/c.png', name: 'post.json' } },
               base.posts[1],
             ],
           });
@@ -4628,21 +4648,6 @@ describe('DownloadHelper.downloadZip', () => {
           return { ...base, id, manifest: { ...base.manifest, creatorId: id } } as DownloadJsonObj;
         },
         'エントリ名が長すぎます',
-      ],
-      [
-        'アセットなしでもエントリ数の下限が上限を超える',
-        () => {
-          const base = createValidObj();
-          // ルート 3 件 + 投稿ごと 3 件。21844 投稿で 3 + 65532 = 65535 件となり上限 (65534) を超える
-          const posts = Array.from({ length: 21844 }, (_unused, index) => ({
-            ...base.posts[0],
-            originalName: `post${index}`,
-            encodedName: `post${index}`,
-            files: [],
-          }));
-          return withManifest({ ...base, posts, postCount: posts.length, fileCount: 0 });
-        },
-        'エントリ数が上限を超えます',
       ],
       [
         'アセット名が投稿ディレクトリの予約名と衝突',

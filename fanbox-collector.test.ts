@@ -247,6 +247,43 @@ describe('addByPostInfo - 本文の検証', () => {
     expect((result as { missing: string[] }).missing).toContain('body.blocks');
   });
 
+  test('article の文字リンク範囲が本文外なら invalid を返す', () => {
+    const m = createManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'article',
+        body: articleBody({
+          blocks: [{ type: 'p', text: 'abc', links: [{ offset: 2, length: 2, url: 'https://example.com' }] }],
+        }),
+      }),
+    );
+    expect((result as { missing: string[] }).missing).toContain('body.blocks');
+  });
+
+  test('article の文字リンク範囲が重なるなら invalid を返す', () => {
+    const m = createManage();
+    const result = addByPostInfo(
+      m,
+      candidate({
+        type: 'article',
+        body: articleBody({
+          blocks: [
+            {
+              type: 'p',
+              text: 'abcdef',
+              links: [
+                { offset: 1, length: 3, url: 'https://first.example' },
+                { offset: 3, length: 2, url: 'https://second.example' },
+              ],
+            },
+          ],
+        }),
+      }),
+    );
+    expect((result as { missing: string[] }).missing).toContain('body.blocks');
+  });
+
   test('urlEmbedMap の要素が null なら invalid を返す (type を読めないため)', () => {
     const m = createManage();
     const result = addByPostInfo(m, candidate({ type: 'article', body: articleBody({ urlEmbedMap: { ue1: null } }) }));
@@ -590,6 +627,12 @@ describe('addByPostInfo - 付随メタデータ', () => {
     expect(firstPost(m).publishedDatetime).toBe('2024-05-01T12:34:56Z');
   });
 
+  test('updatedDatetime が posts に含まれる', () => {
+    const m = createManage();
+    addByPostInfo(m, candidate({ updatedDatetime: '2024-05-02T00:00:00Z' }));
+    expect(firstPost(m).updatedDatetime).toBe('2024-05-02T00:00:00Z');
+  });
+
   test('空文字 publishedDatetime → setPublishedDatetime を呼ばず例外なし', () => {
     const m = createManage();
     expect(() => addByPostInfo(m, candidate({ publishedDatetime: '' }))).not.toThrow();
@@ -907,6 +950,36 @@ describe('addByPostInfo - 内部表現に保持する情報', () => {
 describe('addByPostInfo - HTML とファイルパスの整合', () => {
   /** htmlText 内の href="./..." を列挙する */
   const hrefsOf = (htmlText: string): string[] => [...htmlText.matchAll(/href="\.\/([^"]*)"/g)].map((it) => it[1]);
+
+  test('article の文字リンクを p と header の a 要素として保持する', () => {
+    const m = createManage();
+    addByPostInfo(
+      m,
+      candidate({
+        type: 'article',
+        body: articleBody({
+          blocks: [
+            {
+              type: 'header',
+              text: '先頭リンク末尾',
+              links: [{ offset: 2, length: 3, url: 'https://example.com/?a=1&b=2' }],
+            },
+            {
+              type: 'p',
+              text: '😀 click <done>',
+              links: [{ offset: 3, length: 5, url: 'https://second.example/path' }],
+            },
+          ],
+        }),
+      }),
+    );
+    expect(firstPost(m).htmlText).toContain(
+      '<h2><span>先頭<a href="https://example.com/?a=1&amp;b=2" target="_blank" rel="noopener noreferrer">リンク</a>末尾</span></h2>',
+    );
+    expect(firstPost(m).htmlText).toContain(
+      '<span>😀 <a href="https://second.example/path" target="_blank" rel="noopener noreferrer">click</a> &lt;done&gt;</span>',
+    );
+  });
 
   test('同名アセットが複数あっても HTML の参照は割り当て名と一致する', () => {
     const m = createManage();
