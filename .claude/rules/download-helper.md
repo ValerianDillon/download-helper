@@ -69,7 +69,8 @@ snapshot は URL、投稿情報、HTML 断片、metadata、アセット identity
 archive path は保持せず、復元時に現在の利用側が `ArchivePathAllocator` を渡す。
 差分ダウンロードの凍結名は利用側の履歴が所有する情報であり、収集結果へ混ぜない。
 
-外部 JSON を受ける `fromSnapshot()` は、配列の hole、型、metadata の非負整数、本文アセット key の重複、HTML カードと参照先 key の一致を検証する。
+外部 JSON を受ける `fromSnapshot()` は、配列の hole、型、metadata の非負整数、本文アセット key の重複、HTML カードと参照先 key の一致、カード key が投稿のアセットとして存在することを検証する。
+snapshot の HTML 文字列は collector と helper が生成する静的なタグ・属性・URL scheme の部分集合に制限し、event handler や script を ZIP 内の HTML へ持ち込ませない。
 返した snapshot と復元後の内部表現は参照を共有しない。
 
 ## 除外されたアセットの描画
@@ -78,7 +79,7 @@ archive path は保持せず、復元時に現在の利用側が `ArchivePathAll
 
 **アセットへの参照はカードの中にしか置けない。** カードの外に置けると、カードごと差し替えても参照だけが残る。参照先はそのカードの `key` に限り、`setHtml` が検証する。
 
-投稿が持たないアセットを参照するカードは finalize で例外にする。プレースホルダーで描くと「選択条件で外した」のか「登録し忘れた」のか区別できなくなる。
+投稿が持たないアセットを参照するカードは、通常の収集結果では finalize、外部 snapshot では import 時に例外にする。プレースホルダーで描くと「選択条件で外した」のか「登録し忘れた」のか区別できなくなる。
 
 ## download-manifest.json
 

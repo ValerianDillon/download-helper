@@ -366,6 +366,32 @@ describe('DownloadObject snapshot', () => {
       (value: Record<string, unknown>) =>
         ((value.posts as Array<{ files: Array<{ metadata: { width: number } }> }>)[0].files[0].metadata.width = -1),
     ],
+    [
+      'event handler 付き HTML',
+      (value: Record<string, unknown>) =>
+        ((value.posts as Array<{ html: unknown[] }>)[0].html = [
+          '<img class="card-img-top" src="./x" onerror="alert(1)"/>',
+        ]),
+    ],
+    [
+      'javascript URL',
+      (value: Record<string, unknown>) =>
+        ((value.posts as Array<{ html: unknown[] }>)[0].html = ['<a href="javascript:alert(1)">x</a>']),
+    ],
+    [
+      '投稿に存在しないカード key',
+      (value: Record<string, unknown>) => {
+        const missing = { kind: 'image', assetId: 'missing' };
+        (value.posts as Array<{ html: unknown[] }>)[0].html = [
+          {
+            assetCard: {
+              key: missing,
+              body: ['<a class="hl" href="', { assetRef: missing }, '">x</a>'],
+            },
+          },
+        ];
+      },
+    ],
   ])('%s を含む外部 snapshot を拒否する', (_label, mutate) => {
     const value = JSON.parse(JSON.stringify(createCollectedObject().exportSnapshot())) as Record<string, unknown>;
     mutate(value);

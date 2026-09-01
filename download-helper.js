@@ -476,6 +476,169 @@ function snapshotCoverFile(value, path) {
     metadata: snapshotMetadata(record.metadata, `${path}.metadata`)
   };
 }
+const SNAPSHOT_HTML_VOID_TAGS = new Set(["br", "img", "path"]);
+const SNAPSHOT_HTML_SELF_CLOSING_TAGS = new Set(["audio", "br", "img", "path", "video"]);
+const SNAPSHOT_HTML_CLASSES = new Map([
+  ["a", new Set(["hl"])],
+  ["div", new Set(["card-header", "post card", "post card text-center"])],
+  ["p", new Set(["pt-2"])],
+  ["img", new Set(["card-img-top"])],
+  ["audio", new Set(["card-img-top"])],
+  ["video", new Set(["card-img-top"])],
+  ["svg", new Set(["bi bi-box-arrow-up-left", "bi bi-download"])]
+]);
+const SNAPSHOT_HTML_ALLOWED_ATTRIBUTES = new Map([
+  ["a", new Set(["class", "download", "href", "rel", "target"])],
+  ["div", new Set(["class"])],
+  ["p", new Set(["class"])],
+  ["img", new Set(["alt", "class", "src"])],
+  ["audio", new Set(["class", "controls", "src"])],
+  ["video", new Set(["class", "controls", "src"])],
+  ["svg", new Set(["class", "fill", "height", "viewbox", "width", "xmlns"])],
+  ["path", new Set(["d", "fill-rule"])],
+  ["span", new Set],
+  ["h2", new Set],
+  ["h5", new Set],
+  ["br", new Set]
+]);
+function assertSafeSnapshotHtmlAttribute(tag, name, value, path) {
+  const allowed = SNAPSHOT_HTML_ALLOWED_ATTRIBUTES.get(tag);
+  if (!allowed?.has(name)) {
+    throw new Error(`DownloadObject snapshot の ${path} に許可されていない HTML 属性 ${name} があります`);
+  }
+  if (name === "controls") {
+    if (value !== undefined) {
+      throw new Error(`DownloadObject snapshot の ${path} の controls 属性に値があります`);
+    }
+    return;
+  }
+  if (value === undefined) {
+    throw new Error(`DownloadObject snapshot の ${path} の ${name} 属性に値がありません`);
+  }
+  switch (name) {
+    case "class":
+      if (!SNAPSHOT_HTML_CLASSES.get(tag)?.has(value)) {
+        throw new Error(`DownloadObject snapshot の ${path} に許可されていない class があります`);
+      }
+      break;
+    case "href":
+    case "src":
+      if (!/^(?:https?:\/\/|\.\/|#)/i.test(value)) {
+        throw new Error(`DownloadObject snapshot の ${path} に安全でない ${name} があります`);
+      }
+      break;
+    case "target":
+      if (value !== "_blank")
+        throw new Error(`DownloadObject snapshot の ${path} の target が _blank ではありません`);
+      break;
+    case "rel":
+      if (value !== "noopener noreferrer") {
+        throw new Error(`DownloadObject snapshot の ${path} の rel が noopener noreferrer ではありません`);
+      }
+      break;
+    case "xmlns":
+      if (value !== "http://www.w3.org/2000/svg") {
+        throw new Error(`DownloadObject snapshot の ${path} の xmlns が SVG 名前空間ではありません`);
+      }
+      break;
+    case "width":
+    case "height":
+      if (value !== "16")
+        throw new Error(`DownloadObject snapshot の ${path} の ${name} が 16 ではありません`);
+      break;
+    case "fill":
+      if (value !== "currentColor") {
+        throw new Error(`DownloadObject snapshot の ${path} の fill が currentColor ではありません`);
+      }
+      break;
+    case "viewbox":
+      if (value !== "0 0 16 16") {
+        throw new Error(`DownloadObject snapshot の ${path} の viewBox が 0 0 16 16 ではありません`);
+      }
+      break;
+    case "fill-rule":
+      if (value !== "evenodd") {
+        throw new Error(`DownloadObject snapshot の ${path} の fill-rule が evenodd ではありません`);
+      }
+      break;
+    case "d":
+      if (!/^[A-Za-z0-9., +-]*$/.test(value)) {
+        throw new Error(`DownloadObject snapshot の ${path} の SVG path data が不正です`);
+      }
+      break;
+  }
+}
+function assertSafeSnapshotHtml(html, path) {
+  const stack = [];
+  let cursor = 0;
+  while (cursor < html.length) {
+    const start = html.indexOf("<", cursor);
+    if (start === -1)
+      break;
+    const end = html.indexOf(">", start + 1);
+    if (end === -1)
+      throw new Error(`DownloadObject snapshot の ${path} に閉じていない HTML タグがあります`);
+    const token = html.slice(start, end + 1);
+    const closing = token.match(/^<\/([A-Za-z][A-Za-z0-9]*)\s*>$/);
+    if (closing) {
+      const tag = closing[1].toLowerCase();
+      if (!SNAPSHOT_HTML_ALLOWED_ATTRIBUTES.has(tag) || stack.pop() !== tag) {
+        throw new Error(`DownloadObject snapshot の ${path} の HTML タグ対応が不正です`);
+      }
+      cursor = end + 1;
+      continue;
+    }
+    const opening = token.match(/^<([A-Za-z][A-Za-z0-9]*)([\s\S]*?)(\/?)>$/);
+    if (!opening)
+      throw new Error(`DownloadObject snapshot の ${path} に不正な HTML タグがあります`);
+    const tag = opening[1].toLowerCase();
+    if (!SNAPSHOT_HTML_ALLOWED_ATTRIBUTES.has(tag)) {
+      throw new Error(`DownloadObject snapshot の ${path} に許可されていない HTML タグ ${tag} があります`);
+    }
+    const attributes = opening[2];
+    const seenAttributes = new Set;
+    const attributePattern = /\s+([A-Za-z_:][A-Za-z0-9_.:-]*)(?:="([^"]*)")?/gy;
+    let attributeCursor = 0;
+    while (attributeCursor < attributes.length) {
+      if (/^\s*$/.test(attributes.slice(attributeCursor))) {
+        attributeCursor = attributes.length;
+        break;
+      }
+      attributePattern.lastIndex = attributeCursor;
+      const attribute = attributePattern.exec(attributes);
+      if (!attribute)
+        throw new Error(`DownloadObject snapshot の ${path} に不正な HTML 属性があります`);
+      const name = attribute[1].toLowerCase();
+      if (seenAttributes.has(name)) {
+        throw new Error(`DownloadObject snapshot の ${path} に重複した HTML 属性 ${name} があります`);
+      }
+      seenAttributes.add(name);
+      assertSafeSnapshotHtmlAttribute(tag, name, attribute[2], path);
+      attributeCursor = attributePattern.lastIndex;
+    }
+    const selfClosing = opening[3] === "/";
+    if (selfClosing && !SNAPSHOT_HTML_SELF_CLOSING_TAGS.has(tag)) {
+      throw new Error(`DownloadObject snapshot の ${path} の ${tag} は自己終了できません`);
+    }
+    if (!selfClosing && !SNAPSHOT_HTML_VOID_TAGS.has(tag))
+      stack.push(tag);
+    cursor = end + 1;
+  }
+  if (stack.length > 0)
+    throw new Error(`DownloadObject snapshot の ${path} に閉じていない HTML タグがあります`);
+}
+function assertSnapshotHtmlContracts(html, assetKeys, path) {
+  const rendered = html.flatMap((fragment) => {
+    if (typeof fragment === "string")
+      return [fragment];
+    const identity = assetKeyToString(fragment.assetCard.key);
+    if (!assetKeys.has(identity)) {
+      throw new Error(`DownloadObject snapshot の ${path} が投稿に存在しないアセット ${identity} を参照しています`);
+    }
+    return fragment.assetCard.body.map((part) => typeof part === "string" ? part : "./snapshot-asset");
+  }).join("");
+  assertSafeSnapshotHtml(rendered, path);
+}
 function snapshotHtmlFragment(value, path) {
   if (typeof value === "string")
     return value;
@@ -505,6 +668,11 @@ function decodeDownloadObjectSnapshot(value) {
         throw new Error(`DownloadObject snapshot の ${path}.files に重複した ${identity} があります`);
       seen.add(identity);
     }
+    const cover = post.cover === undefined ? undefined : snapshotCoverFile(post.cover, `${path}.cover`);
+    if (cover !== undefined)
+      seen.add(assetKeyToString(cover.key));
+    const html = decodeSnapshotArray(post.html, `${path}.html`, snapshotHtmlFragment);
+    assertSnapshotHtmlContracts(html, seen, `${path}.html`);
     const publishedDatetime = snapshotOptionalString(post.publishedDatetime, `${path}.publishedDatetime`);
     const updatedDatetime = snapshotOptionalString(post.updatedDatetime, `${path}.updatedDatetime`);
     const postType = snapshotOptionalString(post.postType, `${path}.postType`);
@@ -513,9 +681,9 @@ function decodeDownloadObjectSnapshot(value) {
       name: snapshotString(post.name, `${path}.name`),
       info: snapshotString(post.info, `${path}.info`),
       files,
-      html: decodeSnapshotArray(post.html, `${path}.html`, snapshotHtmlFragment),
+      html,
       tags: snapshotStringArray(post.tags, `${path}.tags`),
-      ...post.cover === undefined ? {} : { cover: snapshotCoverFile(post.cover, `${path}.cover`) },
+      ...cover === undefined ? {} : { cover },
       ...publishedDatetime === undefined ? {} : { publishedDatetime },
       ...updatedDatetime === undefined ? {} : { updatedDatetime },
       ...postType === undefined ? {} : { postType }
