@@ -46,7 +46,7 @@ Codexはファイルを編集する前に、各ruleのYAML frontmatterにある 
 ## Git 運用
 
 - コミットの author/committer は ValerianDillon であること
-- **`gh pr create` は fork 元 (furubarug/download-helper) をデフォルトのベースリポジトリにする。** 必ず `--repo ValerianDillon/download-helper --base main` を指定する
+- `gh` の既定リポジトリは `gh repo set-default ValerianDillon/download-helper` で固定してある (設定が無いと fork 元 furubarug/download-helper へ解決される)。クローンし直したら再設定する。`gh pr create` には `--base main` を指定する
 
 ## リリース手順
 

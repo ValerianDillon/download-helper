@@ -14,7 +14,6 @@ archive path (ZIP 内の名前) を決めるのは `ArchivePathAllocator` だけ
 
 - `PostObj.html` は文字列ではなく `HtmlFragment[]`。リンクタグ生成はパス文字列を埋め込まず、アセットへの参照を持つ断片を返す
 - 断片から archive path への解決は finalize の時点で行う。したがって HTML 内の参照と `DownloadJsonObj` の `files[].encodedName` / `cover.name` は定義上ずれない
-- 従来この 2 つが一致していたのは `addByPostInfo` の呼び出し順序に依存していたためで、契約としては書かれていなかった
 - 従来の採番規則は `createLegacyArchivePathAllocator` として保持し、`DownloadObject` / `DownloadManage` の任意引数で差し替えられる
 
 allocator が満たすべき契約と、finalize が検出できる範囲は `ArchivePathAllocator` の JSDoc が SoT。決定性と入力の非変更は戻り値だけでは判定できないので検出しない。
@@ -177,7 +176,7 @@ legacy allocator が投稿内で archive 名を衝突させうる以上、これ
 
 既存の件数フィールドは残す。対象単位の結果から導けるが、利用側が既に読んでいる。
 
-必須フィールドの追加なので、`DownloadZipResult` を**構築している**利用側 (モックや fixture) は型エラーになる。読むだけの利用側と実行時の互換性には影響しないが、公開型なのでメジャーで出す。
+`DownloadZipResult` は公開型なので、必須フィールドの追加は**構築している**利用側 (モックや fixture) を型エラーにする。読むだけの利用側と実行時の互換性には影響しなくても、メジャーで出す。
 
 # ZIP のパス衝突
 
