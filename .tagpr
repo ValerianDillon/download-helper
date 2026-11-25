@@ -1,0 +1,9 @@
+# tagpr の設定 (git config 形式)。項目は https://github.com/Songmu/tagpr#configuration-reference
+# vPrefix を明示するのは、省くと tagpr が既存のタグから推定した値をこのファイルへ書き戻し、release の PR に version 以外の差分が混ざるため。
+# 利用側は git のタグで参照するので、CHANGELOG と GitHub Release は作らない。
+[tagpr]
+	releaseBranch = main
+	versionFile = package.json
+	vPrefix = true
+	changelog = false
+	release = false

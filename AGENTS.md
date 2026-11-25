@@ -50,8 +50,11 @@ Codexはファイルを編集する前に、各ruleのYAML frontmatterにある 
 
 ## リリース手順
 
-破壊的変更を含む PR をマージしたら、別 PR で version を上げる。
+main に push されるたびに、tagpr (`.github/workflows/tagpr.yml`、設定は `.tagpr`) が未リリースの変更をまとめた release の PR (題は `Release for vX.Y.Z`) を作るか更新する。
+release の PR は `package.json` の `version` だけを変える。CHANGELOG と GitHub Release は作らない。
 
-1. `package.json` の `version` を更新し、`release: vX.Y.Z` というタイトルで PR を出す
-2. マージ後に `git tag vX.Y.Z && git push origin vX.Y.Z`
+1. release の PR の version を決める。tagpr は merge の時点の release の PR の `package.json` の値でタグを打つ。提案は既定で patch なので、破壊的変更を含むなら release の PR の branch で `package.json` の `version` を直接直す。`tagpr:minor` か `tagpr:major` のラベルは、次に main へ push されて release の PR が作り直されるときに提案へ反映され、付けただけでは merge の時の version は変わらない
+2. release の PR を merge すると、tagpr が merge の後の main に `vX.Y.Z` のタグを打つ
 3. 利用側 2 リポジトリの `package.json` の tag 参照を更新する
+
+release の PR は `GITHUB_TOKEN` で作られるので、その PR の CI は書き込み権限のある人が承認するまで走らない。
