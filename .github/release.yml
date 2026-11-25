@@ -1,0 +1,6 @@
+# tagpr は .github/release.yml が無いと初回にこの内容で作り、release の PR に含める。
+# CHANGELOG も GitHub Release も作らない設定 (.tagpr) なので使われないが、release の PR を version の変更だけにするために先に置く。
+changelog:
+  exclude:
+    labels:
+      - tagpr
